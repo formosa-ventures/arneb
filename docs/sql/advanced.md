@@ -230,7 +230,11 @@ ORDER BY COUNT(*) DESC;
 `GROUP BY ROLLUP(a, b)` adds subtotal rows: it groups by `(a, b)`, then by
 `(a)`, then over all rows, with the rolled-up keys set to NULL.
 `GROUPING(x)` is 1 on rows where `x` was rolled up and 0 otherwise, which
-tells a subtotal's NULL apart from a NULL key value.
+tells a subtotal's NULL apart from a NULL key value. With several arguments,
+`GROUPING(x, y)` is Trino's bit set: one bit per argument, the first
+argument the most significant, so it equals `GROUPING(x) * 2 + GROUPING(y)`.
+Under a plain `GROUP BY` every key is grouped and `GROUPING` is 0. Each
+argument must be a grouping key.
 
 ```sql
 SELECT
@@ -248,8 +252,6 @@ Limits:
 - `ROLLUP(...)` must be the whole GROUP BY clause: one ROLLUP, not mixed
   with plain keys, and no composite elements such as `ROLLUP((a, b), c)`.
 - `CUBE` and `GROUPING SETS` are not supported.
-- `GROUPING` takes one argument and works only with `ROLLUP`; Trino's
-  multi-argument form and `GROUPING` over a plain GROUP BY are rejected.
 
 ## Aggregate Functions
 

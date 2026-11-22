@@ -282,3 +282,90 @@ async fn order_by_a_selected_qualified_rollup_key_descending() {
         ])
     );
 }
+
+async fn query_error(sql: &str) -> String {
+    let (cm, cr) = setup();
+    let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::new());
+    match arneb_protocol::__private::execute_query(sql, &cm, &cr, None, &pool).await {
+        Ok(_) => panic!("expected an error: {sql}"),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// `GROUPING(a, b)` is Trino's bit set: `GROUPING(a) * 2 + GROUPING(b)`.
+#[tokio::test]
+async fn grouping_with_several_arguments_is_a_bit_set() {
+    let lvl = "grouping(a, b) AS lvl";
+    assert_eq!(
+        rows(&format!(
+            "SELECT a, b, sum(v), {lvl} FROM s GROUP BY ROLLUP(a, b) {ORDER}"
+        ))
+        .await,
+        table(&[
+            &["NULL", "30", "1", "0"],
+            &["1", "10", "5", "0"],
+            &["1", "20", "7", "0"],
+            &["2", "NULL", "4", "0"],
+            &["2", "10", "3", "0"],
+            &["NULL", "NULL", "1", "1"],
+            &["1", "NULL", "12", "1"],
+            &["2", "NULL", "7", "1"],
+            &["NULL", "NULL", "20", "3"],
+        ])
+    );
+}
+
+/// The first argument is the most significant bit, whatever the ROLLUP
+/// order: `GROUPING(b, a)` is 2 on the `(a)` subtotals.
+#[tokio::test]
+async fn grouping_bits_follow_the_argument_order() {
+    assert_eq!(
+        rows(
+            "SELECT DISTINCT grouping(b, a), grouping(a, a, b) FROM s GROUP BY ROLLUP(a, b) \
+             ORDER BY 1"
+        )
+        .await,
+        table(&[&["0", "0"], &["2", "1"], &["3", "7"]])
+    );
+}
+
+/// Under a plain GROUP BY every key is grouped, so `GROUPING` is 0.
+#[tokio::test]
+async fn grouping_under_a_plain_group_by_is_zero() {
+    assert_eq!(
+        rows(
+            "SELECT a, grouping(a), grouping(a, b), sum(v) FROM s GROUP BY a, b \
+             HAVING grouping(b) = 0 AND a = 1 ORDER BY sum(v)"
+        )
+        .await,
+        table(&[&["1", "0", "0", "5"], &["1", "0", "0", "7"]])
+    );
+}
+
+#[tokio::test]
+async fn grouping_of_something_that_is_not_a_grouping_key_is_an_error() {
+    for sql in [
+        "SELECT grouping(v) FROM s GROUP BY ROLLUP(a, b)",
+        "SELECT a, grouping(a, v) FROM s GROUP BY a",
+        "SELECT grouping(a) FROM s",
+        "SELECT count(*), grouping(a) FROM s",
+    ] {
+        let err = query_error(sql).await;
+        assert!(err.contains("not a grouping expression"), "{sql}: {err}");
+    }
+}
+
+/// A ROLLUP with no aggregate still has every level, the grand total
+/// included, even over no rows.
+#[tokio::test]
+async fn rollup_without_aggregates() {
+    assert_eq!(
+        rows("SELECT a, grouping(a) FROM s WHERE a IS NOT NULL GROUP BY ROLLUP(a) ORDER BY 2, 1")
+            .await,
+        table(&[&["1", "0"], &["2", "0"], &["NULL", "1"]])
+    );
+    assert_eq!(
+        rows("SELECT a, grouping(a) FROM s WHERE v > 100 GROUP BY ROLLUP(a)").await,
+        table(&[&["NULL", "1"]])
+    );
+}

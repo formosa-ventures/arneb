@@ -1840,7 +1840,13 @@ impl ExecutionPlan for RollupAggregateExec {
         let input_schema = self.input.schema();
         let mut senders = Vec::with_capacity(key_count + 1);
         let mut levels = Vec::with_capacity(key_count + 1);
+        // With no aggregates the grand total level has nothing to compute:
+        // it is one row, whatever the input (added below).
+        let grand_total_only_row = self.aggr_exprs.is_empty();
         for keep in (0..=key_count).rev() {
+            if keep == 0 && grand_total_only_row {
+                continue;
+            }
             let (sender, receiver) = tokio::sync::mpsc::channel(1);
             senders.push(sender);
             let mut level_schema = self.output_schema[..keep].to_vec();
@@ -1888,6 +1894,14 @@ impl ExecutionPlan for RollupAggregateExec {
             return Err(results.swap_remove(index).unwrap_err());
         }
         produced?;
+        if grand_total_only_row {
+            let one_row = RecordBatch::try_new_with_options(
+                Arc::new(arrow::datatypes::Schema::empty()),
+                Vec::new(),
+                &arrow::array::RecordBatchOptions::new().with_row_count(Some(1)),
+            )?;
+            results.push(Ok((0, vec![one_row])));
+        }
         let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.output_schema);
         let mut output = Vec::new();
         for result in results {

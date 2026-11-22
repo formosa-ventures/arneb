@@ -471,14 +471,14 @@ pub struct QueryRetry {
     /// Most re-runs of one query.
     pub max_retries: u32,
     /// Wait before the first re-run. It doubles for each later one, up to
-    /// [`MAX_RETRY_DELAY`].
+    /// 10 s.
     pub initial_delay: std::time::Duration,
 }
 
 /// Default [`QueryRetry::initial_delay`].
-pub const DEFAULT_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const DEFAULT_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 /// Longest wait between two runs of a query.
-pub const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl QueryRetry {
     /// Up to `max_retries` re-runs with the default delays.
@@ -526,17 +526,24 @@ where
             }
             Err(failed) => failed,
         };
-        let Some(retry) = retry.filter(|r| done < r.max_retries) else {
-            return Err(failed.error);
-        };
         // Retry only a run that one of its own workers failed; the lost
-        // worker is out of `active_workers` until it heartbeats again.
+        // worker is out of the active workers until it heartbeats again.
         let Some(lost) = registry.lost_worker(&failed.worker_ids) else {
             return Err(failed.error);
         };
-        if registry.active_workers().is_empty() {
+        let retry = retry.filter(|r| done < r.max_retries && registry.has_active_workers());
+        let Some(retry) = retry else {
+            // Logged here, once, rather than where the loss is detected: a
+            // loss that is retried logs only the retry below.
+            tracing::warn!(
+                target: "arneb::cluster",
+                worker_id = %lost.worker_id,
+                reason = %lost.reason,
+                retries = done,
+                "failing query: worker lost"
+            );
             return Err(failed.error);
-        }
+        };
         let delay = retry.delay(done);
         done += 1;
         arneb_common::metrics::query_retried();
@@ -594,12 +601,6 @@ async fn watch_workers(
 }
 
 fn lost_worker_error(lost: &arneb_scheduler::LostWorker) -> ExecutionError {
-    tracing::warn!(
-        target: "arneb::cluster",
-        worker_id = %lost.worker_id,
-        reason = %lost.reason,
-        "failing query: worker lost"
-    );
     ExecutionError::InvalidOperation(format!(
         "worker '{}' ({}) lost: {}",
         lost.worker_id, lost.address, lost.reason

@@ -2106,8 +2106,44 @@ pub struct ClusterTlsConfig {
     pub ca_path: Option<PathBuf>,
 }
 
-/// A whole-seconds setting of at least 1: `var` from `env`, else `file`,
-/// else `default`.
+/// What an [`at_least_one`] setting counts, for its error messages.
+#[derive(Clone, Copy)]
+enum Unit {
+    Seconds,
+    Count,
+}
+
+/// A setting of at least 1: `var` from `env`, else `file`, else `default`.
+fn at_least_one<T>(
+    env: &impl Fn(&str) -> Option<String>,
+    var: &str,
+    file: Option<T>,
+    default: T,
+    what: &str,
+    unit: Unit,
+) -> Result<T>
+where
+    T: std::str::FromStr + PartialOrd + From<u8>,
+{
+    let (expected, suffix) = match unit {
+        Unit::Seconds => ("whole seconds", " s"),
+        Unit::Count => ("a count", ""),
+    };
+    let value = match env(var) {
+        Some(v) => v
+            .trim()
+            .parse::<T>()
+            .map_err(|_| anyhow::anyhow!("invalid {var} value '{v}' (expected {expected})"))?,
+        None => file.unwrap_or(default),
+    };
+    anyhow::ensure!(
+        value >= T::from(1),
+        "{var} / {what} must be at least 1{suffix}"
+    );
+    Ok(value)
+}
+
+/// A whole-seconds setting of at least 1 (see [`at_least_one`]).
 fn positive_secs(
     env: &impl Fn(&str) -> Option<String>,
     var: &str,
@@ -2115,15 +2151,7 @@ fn positive_secs(
     default: u64,
     what: &str,
 ) -> Result<u64> {
-    let value = match env(var) {
-        Some(v) => v
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| anyhow::anyhow!("invalid {var} value '{v}' (expected whole seconds)"))?,
-        None => file.unwrap_or(default),
-    };
-    anyhow::ensure!(value >= 1, "{var} / {what} must be at least 1 s");
-    Ok(value)
+    at_least_one(env, var, file, default, what, Unit::Seconds)
 }
 
 impl ClusterConfig {
@@ -2213,18 +2241,14 @@ impl ClusterConfig {
                  (expected 'none' or 'query')"
             ),
         }
-        let attempts = match env("ARNEB_QUERY_RETRY_ATTEMPTS") {
-            Some(v) => v.trim().parse::<u32>().map_err(|_| {
-                anyhow::anyhow!("invalid ARNEB_QUERY_RETRY_ATTEMPTS value '{v}' (expected a count)")
-            })?,
-            None => self
-                .query_retry_attempts
-                .unwrap_or(DEFAULT_QUERY_RETRY_ATTEMPTS),
-        };
-        anyhow::ensure!(
-            attempts >= 1,
-            "ARNEB_QUERY_RETRY_ATTEMPTS / [cluster] query_retry_attempts must be at least 1"
-        );
+        let attempts = at_least_one(
+            &env,
+            "ARNEB_QUERY_RETRY_ATTEMPTS",
+            self.query_retry_attempts,
+            DEFAULT_QUERY_RETRY_ATTEMPTS,
+            "[cluster] query_retry_attempts",
+            Unit::Count,
+        )?;
         Ok(Some(crate::coordinator::QueryRetry::new(attempts)))
     }
 
@@ -4067,15 +4091,26 @@ password = "hunter2"
             .to_string();
         assert!(err.contains("not supported"), "{err}");
         assert!(read("retry_policy = \"always\"", &[]).is_err());
-        assert!(read("retry_policy = \"query\"\nquery_retry_attempts = 0", &[]).is_err());
-        assert!(read(
+        let err = read("retry_policy = \"query\"\nquery_retry_attempts = 0", &[])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "ARNEB_QUERY_RETRY_ATTEMPTS / [cluster] query_retry_attempts must be at least 1"
+        );
+        let err = read(
             "",
             &[
                 ("ARNEB_RETRY_POLICY", "query"),
-                ("ARNEB_QUERY_RETRY_ATTEMPTS", "x")
-            ]
+                ("ARNEB_QUERY_RETRY_ATTEMPTS", "x"),
+            ],
         )
-        .is_err());
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "invalid ARNEB_QUERY_RETRY_ATTEMPTS value 'x' (expected a count)"
+        );
     }
 
     #[test]

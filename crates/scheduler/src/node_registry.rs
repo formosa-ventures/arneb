@@ -122,8 +122,11 @@ pub struct NodeRegistry {
     heartbeat_timeout_secs: u64,
     /// The release this coordinator runs; only workers on it are admitted.
     version: &'static str,
-    /// Last refused version per worker id, so each refusal is logged once.
-    rejected: Arc<Mutex<HashMap<String, String>>>,
+    /// Last refusal per worker id, so each refusal is logged once. A refused
+    /// worker keeps heartbeating, which refreshes its entry; one silent past
+    /// the heartbeat timeout is dropped (see [`Self::expire_silent`]), so
+    /// ids that change per restart do not pile up.
+    rejected: Arc<Mutex<HashMap<String, Rejection>>>,
     /// Address of each worker that deregistered after a drain, so a query
     /// it still ran reports why it is gone. Cleared when the id rejoins.
     departed: Arc<Mutex<HashMap<String, String>>>,
@@ -197,12 +200,14 @@ impl NodeRegistry {
     /// Record that `worker_id` was refused on `version`; true unless it was
     /// already refused on that same version.
     fn first_rejection(&self, worker_id: &str, version: &str) -> bool {
-        let previous = self
-            .rejected
-            .lock()
-            .unwrap()
-            .insert(worker_id.to_owned(), version.to_owned());
-        previous.as_deref() != Some(version)
+        let previous = self.rejected.lock().unwrap().insert(
+            worker_id.to_owned(),
+            Rejection {
+                version: version.to_owned(),
+                at: Instant::now(),
+            },
+        );
+        previous.is_none_or(|p| p.version != version)
     }
 
     /// Register or update an active worker's heartbeat, taking it to run
@@ -427,18 +432,33 @@ impl NodeRegistry {
             .unwrap_or(0)
     }
 
+    /// Whether any worker takes new queries ([`Self::active_workers`] is
+    /// not empty), without listing them.
+    pub fn has_active_workers(&self) -> bool {
+        let mut workers = self.workers.write().unwrap();
+        self.expire_silent(&mut workers);
+        let scheduling = lock(&self.scheduling);
+        let any = schedulable(&workers, &scheduling).next().is_some();
+        any
+    }
+
     /// Whether `worker_id` is registered, alive or not.
     pub fn is_known(&self, worker_id: &str) -> bool {
         self.workers.read().unwrap().contains_key(worker_id)
     }
 
-    /// Mark every worker silent past the heartbeat timeout as dead.
+    /// Mark every worker silent past the heartbeat timeout as dead, and
+    /// forget refusals of workers silent that long.
     fn expire_silent(&self, workers: &mut HashMap<String, WorkerInfo>) {
         let timeout = self.heartbeat_timeout();
         let now = Instant::now();
         for worker in workers.values_mut() {
             expire(worker, now, timeout);
         }
+        self.rejected
+            .lock()
+            .unwrap()
+            .retain(|_, r| now.duration_since(r.at) <= timeout);
     }
 
     /// Every registered worker, alive or not, with liveness re-evaluated
@@ -475,6 +495,13 @@ impl NodeRegistry {
     pub fn remove_worker(&self, worker_id: &str) -> bool {
         self.workers.write().unwrap().remove(worker_id).is_some()
     }
+}
+
+/// A worker refused for running another release.
+struct Rejection {
+    version: String,
+    /// When it was last refused.
+    at: Instant,
 }
 
 /// The workers that take new queries: alive, not draining, not cordoned.
@@ -572,6 +599,49 @@ mod tests {
             .admit("w1".into(), "host1:9090".into(), 256, own, false)
             .unwrap();
         assert!(registry.first_rejection("w1", "9.9.9"));
+    }
+
+    #[test]
+    fn a_refusal_is_forgotten_once_the_worker_is_silent_past_the_timeout() {
+        // Timeout 0: anything not refused just now is silent past it.
+        let registry = NodeRegistry::new(0);
+        assert!(registry.first_rejection("pod-a", "9.9.8"));
+        assert!(registry.first_rejection("pod-b", "9.9.8"));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(registry.alive_workers().is_empty());
+        assert!(registry.rejected.lock().unwrap().is_empty());
+        // A worker that comes back on the same release is logged again.
+        assert!(registry.first_rejection("pod-a", "9.9.8"));
+    }
+
+    #[test]
+    fn a_refused_worker_that_keeps_heartbeating_stays_recorded() {
+        let registry = NodeRegistry::new(30);
+        assert!(registry.first_rejection("w1", "9.9.8"));
+        assert!(registry.alive_workers().is_empty());
+        assert!(!registry.first_rejection("w1", "9.9.8"));
+    }
+
+    #[test]
+    fn has_active_workers_matches_active_workers() {
+        let registry = NodeRegistry::new(30);
+        assert!(!registry.has_active_workers());
+        let own = env!("CARGO_PKG_VERSION");
+        registry
+            .admit("w1".into(), "host1:9090".into(), 256, own, true)
+            .unwrap();
+        // Alive but draining: not active.
+        assert!(!registry.has_active_workers());
+        registry
+            .admit("w1".into(), "host1:9090".into(), 256, own, false)
+            .unwrap();
+        assert!(registry.has_active_workers());
+        registry.set_cordon("w1", Some(CordonMode::Cordon));
+        assert!(!registry.has_active_workers());
+        assert_eq!(
+            registry.has_active_workers(),
+            !registry.active_workers().is_empty()
+        );
     }
 
     #[test]

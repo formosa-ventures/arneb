@@ -50,6 +50,15 @@ pub trait GroupedAccumulator: Send + Sync {
     /// Number of groups for which this accumulator has reserved state.
     fn num_groups(&self) -> usize;
 
+    /// Approximate heap bytes held beyond the fixed per-group state that
+    /// the operator already estimates, for memory accounting. Accumulators
+    /// whose per-group state has a fixed size keep the default 0; one that
+    /// keeps input values must report them. Must be cheap: the aggregate
+    /// operators call it after every batch.
+    fn heap_bytes(&self) -> usize {
+        0
+    }
+
     /// Merge `other`'s state into `self`, mapping each `g` in
     /// `0..other.num_groups()` through `group_remap` (so
     /// `self.state[group_remap[g]] ⊕= other.state[g]`).
@@ -95,6 +104,15 @@ pub trait Accumulator: Send + Sync {
         Err(ExecutionError::InvalidOperation(
             "this accumulator does not support parallel merge".to_string(),
         ))
+    }
+
+    /// Approximate heap bytes the accumulator's state holds, for memory
+    /// accounting against the query's pool. An accumulator whose state
+    /// does not grow with its input keeps the default 0; one that keeps
+    /// input values (`DISTINCT`) reports them. Must be cheap: the
+    /// aggregate operators call it after every update.
+    fn heap_bytes(&self) -> usize {
+        0
     }
 }
 
@@ -2273,6 +2291,8 @@ pub(crate) fn create_grouped_accumulator(
 pub(crate) struct DistinctAccumulator {
     inner: Box<dyn Accumulator>,
     seen: FastHashSet<GroupKey>,
+    /// Running [`GroupKey::entry_bytes`] total of `seen`.
+    seen_bytes: usize,
 }
 
 impl DistinctAccumulator {
@@ -2280,7 +2300,18 @@ impl DistinctAccumulator {
         Self {
             inner,
             seen: FastHashSet::default(),
+            seen_bytes: 0,
         }
+    }
+
+    /// Records `key` as seen; true when it is new.
+    fn insert(&mut self, key: GroupKey) -> bool {
+        let bytes = key.entry_bytes();
+        let new = self.seen.insert(key);
+        if new {
+            self.seen_bytes += bytes;
+        }
+        new
     }
 }
 
@@ -2302,7 +2333,7 @@ impl Accumulator for DistinctAccumulator {
         // had not yet seen so the inner accumulator gets each unique
         // value exactly once across all partitions.
         for k in &other.seen {
-            if self.seen.insert(k.clone()) {
+            if self.insert(k.clone()) {
                 // Inner ingestion happens by way of the GroupKey
                 // scalar values; we re-materialise to a single-row
                 // array per scalar so the inner Accumulator's
@@ -2323,7 +2354,7 @@ impl Accumulator for DistinctAccumulator {
             }
             let scalar = scalar_from_array(values, i)?;
             let key = GroupKey::single(scalar);
-            if self.seen.insert(key) {
+            if self.insert(key) {
                 new_indices.push(i as u32);
             }
         }
@@ -2345,6 +2376,11 @@ impl Accumulator for DistinctAccumulator {
     fn reset(&mut self) {
         self.inner.reset();
         self.seen.clear();
+        self.seen_bytes = 0;
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.seen_bytes + self.inner.heap_bytes()
     }
 }
 

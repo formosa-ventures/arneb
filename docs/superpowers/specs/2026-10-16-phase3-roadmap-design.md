@@ -307,7 +307,8 @@ its own OpenSpec change.
 | v0.1.8 (shipped 2026-10-30) | Correctness fixes (unplanned) | Wrong results from per-partition grace builds (#191) and right-preserved eager aggregation (#206); null-extended outer-join columns now nullable (#203); joins inside a parenthesized `FROM` (#202); no partial cross-fragment domain from copartitioned joins (#198); RustSec dependency bumps (#200, #210) | Tier 1 + CI cluster smoke + kind |
 | v0.2.0 (shipped 2026-11-07) | Headless agent interface | H1–H6 (#215–#220): state store, API tokens and authentication on every route; agent query API; remote MCP; manage API, write privileges and audit log; runtime config; MCP OAuth. Access rules also checked on the connector-resolved name (#221). See `2026-10-30-headless-agent-interface-design.md` | Tier 1 + Tier 2 per change + CI cluster smoke + kind; the headless acceptance scenario has not been run yet |
 | v0.2.1 | Correctness and coverage | TPC-DS 103/103 cell-identical to Trino at SF1 (#224); join, planner and cast fixes (#225/#235, #234, #240, #241, #243, #253, #257, #259); worker heartbeat on its own thread with a 5 s timeout (#242, #252, #254); the headless acceptance scenario on kind in CI (#255); RustSec and dependency bumps (#260, #267, #268, #269) | Tier 1 + CI cluster smoke + kind + headless acceptance on kind |
-| after headless | Client gaps | G6 stage 2b: arrays, `json_build_object`, SQLAlchemy column reflection over pgwire, a Metabase run; `pg_catalog` follow-ups (#189) | Tier 1 + 2 |
+| v0.2.2 | Arrays and cluster failure handling | Arrays, `= ANY` / `<> ALL`, `ARRAY_AGG` and `UNNEST` (G6 2b-1 part 1, #275); `GROUPING` with several arguments (#288); `IN` subqueries in a not-false position (#287); TINYINT/SMALLINT coercion (#292); a failed task fails its query at once (#281); a worker that misses heartbeats is probed before its queries fail (#293); pgwire `CancelRequest` (#278); spilling stops before the disk fills (#280); partial aggregate fused into the join fragment (#282); row-group pruning checks prepared once per file (#295); RustSec bumps (#298, #303) | Tier 1 + CI cluster smoke + kind + headless acceptance on kind |
+| after headless | Client gaps | G6 stage 2b: arrays (shipped in v0.2.2), `json_build_object`, SQLAlchemy column reflection over pgwire, a Metabase run; `pg_catalog` follow-ups (#189) | Tier 1 + 2 |
 | in parallel | Large-scale memory | P1 SF30 validation, `dist-adaptive-partition` SF30 sweep (q18 SF30 still OOMs) | Tier 3 |
 | v0.2.x (later) | Production-ready | Headless acceptance scenario green (done in v0.2.1, #255), scenario 1 checklist green, BI client smoke (G6), `docs/guide/production-checklist.md` | — |
 
@@ -339,6 +340,15 @@ kind cluster in CI on every PR that touches the server, RPC or
 dependencies, and nightly (#255). Left for the production-ready v0.2.x: G6
 stage 2b with the BI client smoke, the P1 SF30 validation (Tier 3), and the
 production checklist (#258 goes on it).
+
+**Status (2026-11-24, v0.2.2):** v0.2.2 ships the engine half of G6
+stage 2b-1: arrays with PostgreSQL's syntax over pgwire, `ARRAY_AGG`,
+`UNNEST` and `= ANY` over arrays and array parameters (#275). On the
+cluster side, a failed task now fails its query at once (#281), and a
+worker that misses heartbeats is probed before its queries fail (#293).
+Left for the production-ready v0.2.x: SQLAlchemy reflection over pgwire
+(#276) and the Metabase run (#277) to finish G6 stage 2b, the P1 SF30
+validation (Tier 3), and the production checklist (#258 goes on it).
 
 **Order:** G1 first, because it makes the soak test and retry results
 unreliable. G4 and G5 before P6 ships, so the chart's rolling upgrade does

@@ -253,9 +253,52 @@ Limits:
   with plain keys, and no composite elements such as `ROLLUP((a, b), c)`.
 - `CUBE` and `GROUPING SETS` are not supported.
 
+## Arrays
+
+Arneb has one-dimensional arrays with PostgreSQL's syntax, so clients that
+read or send arrays over pgwire (SQLAlchemy's reflection, Metabase, ORMs)
+work as they do against PostgreSQL.
+
+| Form | Example | Result |
+|------|---------|--------|
+| `ARRAY[...]` literal | `SELECT ARRAY[1, 2.5]` | `{1,2.5}`: the elements take their common type |
+| Array text cast | `SELECT '{1,NULL,3}'::int[]` | `{1,NULL,3}` |
+| `= ANY` / `<> ALL` | `WHERE x = ANY (ARRAY[1, 2])` | as `x IN (1, 2)`; also over a column, a cast or a bound array parameter |
+| `ARRAY_AGG` | `array_agg(name ORDER BY name DESC)` | the group's values as an array |
+| `UNNEST` | `SELECT unnest(ARRAY[1, 2, 3])` | one row per element |
+| `GENERATE_SUBSCRIPTS` | `SELECT generate_subscripts(ARRAY['a', 'b'], 1)` | one row per index: 1, 2 |
+
+- **Literals.** `ARRAY[]` needs a cast to give it a type
+  (`ARRAY[]::int[]`). Elements may be NULL. An element list of columns is
+  built per row.
+- **Text casts.** `'{...}'::type[]` reads PostgreSQL array text: quoted
+  elements (`'{"a b",c}'`), `NULL`, and backslash escapes. Malformed text is
+  an error, never NULL.
+- **`ANY` / `ALL`.** These follow SQL's three-valued logic: a NULL element
+  that decides the result makes it NULL. A constant array plans as an `IN`
+  list.
+- **`ARRAY_AGG`.** It keeps NULL inputs, returns NULL for no input rows,
+  and takes an `ORDER BY` with several keys, `ASC`/`DESC` and
+  `NULLS FIRST`/`LAST`. The key need not be selected. `ARRAY_AGG(DISTINCT
+  ...)` is not supported. `ORDER BY` inside any other aggregate, `FILTER
+  (WHERE ...)` and `WITHIN GROUP` are refused with an error rather than
+  ignored.
+- **`UNNEST` and `GENERATE_SUBSCRIPTS` in the SELECT list.** Each input row
+  becomes one row per element. Several of these functions in one SELECT
+  list run side by side, the shorter padded with NULL, as in PostgreSQL. A
+  NULL or empty array yields no rows. They work over an aggregate of the
+  same SELECT (`unnest(array_agg(x))`) and inside a derived table. They are
+  refused in WHERE and nested in an expression (`unnest(a) + 1`), and
+  `GENERATE_SUBSCRIPTS` takes only dimension 1.
+- **Not yet:** `UNNEST` in FROM (`CROSS JOIN UNNEST`), `WITH ORDINALITY`,
+  subscripts (`a[1]`), array functions such as `cardinality`, and
+  multi-dimensional arrays.
+
 ## Aggregate Functions
 
-COUNT, SUM, AVG, MIN and MAX, plus Trino's variance family:
+COUNT, SUM, AVG, MIN and MAX; `BOOL_AND` and `BOOL_OR` (NULL inputs are
+skipped, and a group with none left is NULL); `ARRAY_AGG` (see
+[Arrays](#arrays)); and Trino's variance family:
 
 | Function | Result |
 |----------|--------|

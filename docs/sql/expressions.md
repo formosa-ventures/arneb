@@ -127,6 +127,16 @@ SELECT * FROM orders WHERE status IN ('shipped', 'delivered');
 SELECT * FROM users WHERE id IN (SELECT user_id FROM premium_users);
 ```
 
+`expression = ANY (array)` is true when the value equals an element of the
+array, and `expression <> ALL (array)` when it equals none. The array may be
+a literal, a column, a cast or a bound parameter. See
+[Arrays](/sql/advanced#arrays).
+
+```sql
+SELECT * FROM orders WHERE status = ANY (ARRAY['shipped', 'delivered']);
+SELECT * FROM orders WHERE id = ANY ($1);   -- $1 bound as int8[]
+```
+
 ## LIKE
 
 Pattern matching on strings. `%` matches any sequence of characters, `_` matches a single character.

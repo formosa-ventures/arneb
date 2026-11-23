@@ -4472,10 +4472,17 @@ pub(crate) fn scalars_to_array(
     data_type: &ArrowDataType,
 ) -> Result<ArrayRef, ExecutionError> {
     // `ScalarValue` has no 8- or 16-bit integer: TINYINT and SMALLINT
-    // values travel as Int32 and narrow back to the declared type here.
+    // values travel as Int32 and narrow back to the declared type here. A
+    // value out of the type's range is an error, never a silent NULL.
     if matches!(data_type, ArrowDataType::Int8 | ArrowDataType::Int16) {
         let wide = scalars_to_array(values, &ArrowDataType::Int32)?;
-        return Ok(arrow::compute::cast(&wide, data_type)?);
+        let options = arrow::compute::CastOptions {
+            safe: false,
+            ..Default::default()
+        };
+        return Ok(arrow::compute::cast_with_options(
+            &wide, data_type, &options,
+        )?);
     }
     let first_type = values.iter().find(|v| !matches!(v, ScalarValue::Null));
     match first_type {
@@ -4489,19 +4496,7 @@ pub(crate) fn scalars_to_array(
                     _ => None,
                 })
                 .collect();
-            // `ScalarValue` carries TINYINT/SMALLINT values as INTEGER.
-            match data_type {
-                ArrowDataType::Int8 | ArrowDataType::Int16 => {
-                    let options = arrow::compute::CastOptions {
-                        safe: false,
-                        ..Default::default()
-                    };
-                    Ok(arrow::compute::cast_with_options(
-                        &arr, data_type, &options,
-                    )?)
-                }
-                _ => Ok(Arc::new(arr)),
-            }
+            Ok(Arc::new(arr))
         }
         Some(ScalarValue::Int64(_)) => {
             let arr: Int64Array = values

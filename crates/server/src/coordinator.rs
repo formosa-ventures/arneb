@@ -1727,6 +1727,7 @@ mod tests {
             alive: true,
             version: env!("CARGO_PKG_VERSION").to_string(),
             draining: false,
+            suspect: false,
         }
     }
 

@@ -52,8 +52,8 @@ pub use security::{
 pub use task_descriptor::{SourceExchange, TaskDescriptor};
 pub use task_error::{TaskFailure, TaskFailureReport};
 pub use task_submission::{
-    cancel_query, cancel_query_with, notify_dynamic_filter, release_query, report_dynamic_filters,
-    report_task_failure, submit_task, submit_task_with,
+    cancel_query, cancel_query_with, notify_dynamic_filter, ping, ping_with, release_query,
+    report_dynamic_filters, report_task_failure, submit_task, submit_task_with,
 };
 
 /// Test helper: create a FlightServiceServer for integration tests.

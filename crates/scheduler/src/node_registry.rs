@@ -1,6 +1,7 @@
 //! Node registry: tracks known workers in the cluster.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -22,6 +23,10 @@ pub struct WorkerInfo {
     pub version: String,
     /// Shutting down: alive for the queries it runs, but not scheduled.
     pub draining: bool,
+    /// Past its heartbeat deadline and waiting for the coordinator's
+    /// liveness probe (see [`NodeRegistry::enable_liveness_probe`]): not
+    /// scheduled, but its running queries are not failed yet.
+    pub suspect: bool,
 }
 
 /// A worker [`NodeRegistry::lost_worker`] found lost.
@@ -132,7 +137,15 @@ pub struct NodeRegistry {
     departed: Arc<Mutex<HashMap<String, String>>>,
     /// Cordons and in-flight counts. Lock order: `workers`, then this.
     scheduling: Arc<Mutex<Scheduling>>,
+    /// Whether a liveness prober confirms a silent worker before it counts
+    /// as lost (see [`Self::enable_liveness_probe`]).
+    probed: Arc<AtomicBool>,
 }
+
+/// How many heartbeat timeouts a suspect worker may stay silent before it
+/// counts as lost without a probe verdict, in case the prober itself is
+/// stuck. A probe that answers resets the clock.
+const SUSPECT_LIMIT_TIMEOUTS: u32 = 3;
 
 impl NodeRegistry {
     /// Creates an empty registry with the given heartbeat timeout.
@@ -144,7 +157,64 @@ impl NodeRegistry {
             rejected: Arc::new(Mutex::new(HashMap::new())),
             departed: Arc::new(Mutex::new(HashMap::new())),
             scheduling: Arc::new(Mutex::new(Scheduling::default())),
+            probed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// From now on, a worker past its heartbeat deadline is only *suspect*:
+    /// it takes no new queries, but [`Self::lost_worker`] does not report it
+    /// until the prober calls [`Self::probe_failed`] (or it stays silent for
+    /// [`SUSPECT_LIMIT_TIMEOUTS`] timeouts). A late heartbeat can mean a
+    /// coordinator too busy to read it, not a dead worker. Without a prober,
+    /// a silent worker is lost at its deadline.
+    pub fn enable_liveness_probe(&self) {
+        self.probed.store(true, Ordering::Relaxed);
+    }
+
+    /// Id and address of every suspect worker, for the prober.
+    pub fn suspects(&self) -> Vec<(String, String)> {
+        let mut workers = self.workers.write().unwrap();
+        self.expire_silent(&mut workers);
+        workers
+            .values()
+            .filter(|w| w.suspect)
+            .map(|w| (w.worker_id.clone(), w.address.clone()))
+            .collect()
+    }
+
+    /// The prober reached suspect worker `worker_id`: it is alive again,
+    /// as after a heartbeat. No-op unless it is still suspect.
+    pub fn probe_answered(&self, worker_id: &str) {
+        let mut workers = self.workers.write().unwrap();
+        let Some(worker) = workers.get_mut(worker_id).filter(|w| w.suspect) else {
+            return;
+        };
+        tracing::info!(
+            target: "arneb::cluster",
+            worker_id = %worker_id,
+            silent_secs = worker.last_heartbeat.elapsed().as_secs(),
+            "worker answered the liveness probe; keeping it"
+        );
+        worker.last_heartbeat = Instant::now();
+        worker.suspect = false;
+        worker.alive = true;
+    }
+
+    /// The prober could not reach suspect worker `worker_id`: it is lost.
+    /// No-op unless it is still suspect.
+    pub fn probe_failed(&self, worker_id: &str, error: &str) {
+        let mut workers = self.workers.write().unwrap();
+        let Some(worker) = workers.get_mut(worker_id).filter(|w| w.suspect) else {
+            return;
+        };
+        tracing::warn!(
+            target: "arneb::cluster",
+            worker_id = %worker_id,
+            silent_secs = worker.last_heartbeat.elapsed().as_secs(),
+            error,
+            "worker did not answer the liveness probe, marking as dead"
+        );
+        worker.suspect = false;
     }
 
     /// Register or update a worker that reported `version`, if it is this
@@ -243,6 +313,7 @@ impl NodeRegistry {
                 alive: true,
                 version: self.version.to_string(),
                 draining,
+                suspect: false,
             }
         });
         if !entry.alive {
@@ -266,6 +337,7 @@ impl NodeRegistry {
         entry.address = address;
         entry.max_splits = max_splits;
         entry.alive = true;
+        entry.suspect = false;
         entry.draining = draining;
     }
 
@@ -279,6 +351,7 @@ impl NodeRegistry {
     /// deadline is marked dead as a side effect.
     pub fn lost_worker(&self, worker_ids: &[String]) -> Option<LostWorker> {
         let timeout = self.heartbeat_timeout();
+        let probed = self.probed.load(Ordering::Relaxed);
         let now = Instant::now();
         let mut workers = self.workers.write().unwrap();
         for id in worker_ids {
@@ -294,9 +367,18 @@ impl NodeRegistry {
                     reason: reason.to_string(),
                 });
             };
-            expire(worker, now, timeout);
-            if !worker.alive {
-                let silent = now.duration_since(worker.last_heartbeat);
+            expire(worker, now, timeout, probed);
+            let silent = now.duration_since(worker.last_heartbeat);
+            if worker.suspect && silent > timeout * SUSPECT_LIMIT_TIMEOUTS {
+                tracing::warn!(
+                    target: "arneb::cluster",
+                    worker_id = %worker.worker_id,
+                    silent_secs = silent.as_secs(),
+                    "suspect worker got no probe verdict in time, marking as dead"
+                );
+                worker.suspect = false;
+            }
+            if !worker.alive && !worker.suspect {
                 let reason = if silent > timeout {
                     format!("no heartbeat for {} s", silent.as_secs())
                 } else {
@@ -329,6 +411,7 @@ impl NodeRegistry {
             );
         }
         worker.alive = false;
+        worker.suspect = false;
         was_alive
     }
 
@@ -451,9 +534,10 @@ impl NodeRegistry {
     /// forget refusals of workers silent that long.
     fn expire_silent(&self, workers: &mut HashMap<String, WorkerInfo>) {
         let timeout = self.heartbeat_timeout();
+        let probed = self.probed.load(Ordering::Relaxed);
         let now = Instant::now();
         for worker in workers.values_mut() {
-            expire(worker, now, timeout);
+            expire(worker, now, timeout, probed);
         }
         self.rejected
             .lock()
@@ -477,7 +561,12 @@ impl NodeRegistry {
         let timeout = self.heartbeat_timeout();
         let mut workers = self.workers.write().unwrap();
         let worker = workers.get_mut(worker_id)?;
-        expire(worker, Instant::now(), timeout);
+        expire(
+            worker,
+            Instant::now(),
+            timeout,
+            self.probed.load(Ordering::Relaxed),
+        );
         Some(worker.clone())
     }
 
@@ -514,17 +603,24 @@ fn schedulable<'a>(
         .filter(|w| w.alive && !w.draining && !scheduling.cordons.contains_key(&w.worker_id))
 }
 
-/// Mark `worker` dead once it has been silent longer than `timeout`.
-fn expire(worker: &mut WorkerInfo, now: Instant, timeout: std::time::Duration) {
+/// Take `worker` out of scheduling once it has been silent longer than
+/// `timeout`: dead, or with a prober (`probed`) suspect until probed.
+fn expire(worker: &mut WorkerInfo, now: Instant, timeout: std::time::Duration, probed: bool) {
     let silent = now.duration_since(worker.last_heartbeat);
     if worker.alive && silent > timeout {
         tracing::warn!(
             target: "arneb::cluster",
             worker_id = %worker.worker_id,
             silent_secs = silent.as_secs(),
-            "worker heartbeat timeout, marking as dead"
+            "{}",
+            if probed {
+                "worker heartbeat timeout, marking as suspect until probed"
+            } else {
+                "worker heartbeat timeout, marking as dead"
+            }
         );
         worker.alive = false;
+        worker.suspect = probed;
     }
 }
 
@@ -739,6 +835,96 @@ mod tests {
         let fresh = NodeRegistry::new(30);
         fresh.heartbeat("w1".into(), "host1:9090".into(), 256);
         assert!(fresh.lost_worker(&["w1".into()]).is_none());
+    }
+
+    fn silence(registry: &NodeRegistry, id: &str, secs: u64) {
+        registry
+            .workers
+            .write()
+            .unwrap()
+            .get_mut(id)
+            .unwrap()
+            .last_heartbeat = Instant::now() - std::time::Duration::from_secs(secs);
+    }
+
+    fn probed_registry() -> NodeRegistry {
+        let registry = NodeRegistry::new(10);
+        registry.enable_liveness_probe();
+        registry.heartbeat("w1".into(), "host1:9090".into(), 256);
+        registry.heartbeat("w2".into(), "host2:9090".into(), 256);
+        registry
+    }
+
+    #[test]
+    fn with_a_prober_a_silent_worker_is_suspect_not_lost() {
+        let registry = probed_registry();
+        silence(&registry, "w1", 11);
+        assert_eq!(registry.lost_worker(&["w1".into()]), None);
+        assert_eq!(
+            registry.suspects(),
+            vec![("w1".to_string(), "host1:9090".to_string())]
+        );
+        // Suspect: kept out of scheduling.
+        assert_eq!(ids(registry.active_workers()), vec!["w2"]);
+        assert!(registry.worker("w1").unwrap().suspect);
+    }
+
+    #[test]
+    fn an_answered_probe_keeps_the_worker() {
+        let registry = probed_registry();
+        silence(&registry, "w1", 11);
+        assert_eq!(registry.suspects().len(), 1);
+        registry.probe_answered("w1");
+        assert!(registry.suspects().is_empty());
+        assert_eq!(registry.lost_worker(&["w1".into()]), None);
+        assert_eq!(ids(registry.active_workers()), vec!["w1", "w2"]);
+        // A worker that is not suspect is left alone.
+        registry.probe_failed("w2", "late verdict");
+        assert_eq!(registry.lost_worker(&["w2".into()]), None);
+    }
+
+    #[test]
+    fn a_failed_probe_makes_the_worker_lost() {
+        let registry = probed_registry();
+        silence(&registry, "w1", 11);
+        assert_eq!(registry.suspects().len(), 1);
+        registry.probe_failed("w1", "deadline has elapsed");
+        let lost = registry.lost_worker(&["w1".into()]).unwrap();
+        assert!(
+            lost.reason.starts_with("no heartbeat for"),
+            "{}",
+            lost.reason
+        );
+        assert!(registry.suspects().is_empty());
+        // A late answer does not revive it; its next heartbeat does.
+        registry.probe_answered("w1");
+        assert!(registry.lost_worker(&["w1".into()]).is_some());
+        registry.heartbeat("w1".into(), "host1:9090".into(), 256);
+        assert_eq!(registry.lost_worker(&["w1".into()]), None);
+    }
+
+    #[test]
+    fn a_suspect_without_a_verdict_is_lost_after_the_limit() {
+        let registry = probed_registry();
+        silence(&registry, "w1", 11);
+        assert_eq!(registry.lost_worker(&["w1".into()]), None);
+        silence(&registry, "w1", 31);
+        assert!(registry.lost_worker(&["w1".into()]).is_some());
+    }
+
+    #[test]
+    fn a_heartbeat_clears_suspicion_and_a_transport_failure_overrides_it() {
+        let registry = probed_registry();
+        silence(&registry, "w1", 11);
+        silence(&registry, "w2", 11);
+        assert_eq!(registry.suspects().len(), 2);
+        registry.heartbeat("w1".into(), "host1:9090".into(), 256);
+        assert!(!registry.worker("w1").unwrap().suspect);
+        registry.mark_dead("w2", "connection refused");
+        assert_eq!(
+            registry.lost_worker(&["w2".into()]).unwrap().worker_id,
+            "w2"
+        );
     }
 
     #[test]

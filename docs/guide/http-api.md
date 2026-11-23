@@ -617,11 +617,14 @@ Each worker has two states:
 
 The listing holds every registered worker, alive or not, and every id with
 a cordon, including a worker that never came back (`registered: false`).
-Each entry is:
+A worker past its heartbeat deadline that the coordinator is still probing
+is `"alive": false, "suspect": true` (see
+[When a Worker Fails](/guide/distributed#when-a-worker-fails)). Each entry
+is:
 
 ```json
 {"worker_id": "worker-1", "address": "http://10.0.0.5:9091",
- "registered": true, "alive": true, "version": "0.1.7",
+ "registered": true, "alive": true, "suspect": false, "version": "0.1.7",
  "state": "active", "scheduling": "draining", "running_queries": 2,
  "cordoned_since_ms": 1767000000000, "cordoned_by": "root",
  "last_heartbeat_secs_ago": 1}

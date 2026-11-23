@@ -487,6 +487,14 @@ impl FlightService for TrinoFlightService {
                 let stream = futures::stream::once(async { Ok(result) });
                 Ok(Response::new(Box::pin(stream)))
             }
+            // Coordinator liveness probe: answering at all is the reply.
+            "ping" => {
+                let result = arrow_flight::Result {
+                    body: Default::default(),
+                };
+                let stream = futures::stream::once(async { Ok(result) });
+                Ok(Response::new(Box::pin(stream)))
+            }
             "submit_task" => {
                 let descriptor = TaskDescriptor::decode(&action.body)
                     .map_err(|e| Status::invalid_argument(format!("bad task descriptor: {e}")))?;

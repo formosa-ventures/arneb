@@ -140,6 +140,36 @@ pub async fn cancel_query_with(
     query_action(worker_address, "cancel_query", query_id, security).await
 }
 
+/// Coord → worker liveness probe: `Ok` once the worker's Flight server
+/// answers a `ping` action within `timeout`, connecting included.
+pub async fn ping(worker_address: &str, timeout: std::time::Duration) -> Result<(), String> {
+    ping_with(worker_address, timeout, cluster_security()).await
+}
+
+/// [`ping`] with explicit cluster security instead of the installed one.
+pub async fn ping_with(
+    worker_address: &str,
+    timeout: std::time::Duration,
+    security: &ClusterSecurity,
+) -> Result<(), String> {
+    let call = async {
+        let mut client = connect(worker_address, security).await?;
+        let action = Action {
+            r#type: "ping".to_string(),
+            body: Default::default(),
+        };
+        let stream = client
+            .do_action(action)
+            .await
+            .map_err(|e| format!("ping RPC failed: {e}"))?
+            .into_inner();
+        drain_ack(stream, "ping").await
+    };
+    tokio::time::timeout(timeout, call)
+        .await
+        .unwrap_or_else(|_| Err(format!("no answer within {} ms", timeout.as_millis())))
+}
+
 /// Coord → worker: `query_id` finished, so drop its tasks and buffers on
 /// that worker. Idempotent; an unknown query is a no-op ack.
 pub async fn release_query(

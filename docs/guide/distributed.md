@@ -209,7 +209,10 @@ runs again from the start on the remaining workers, like Trino's
   all of a query's runs.
 - Each re-run logs `retrying query after worker loss` on `arneb::cluster`,
   with the lost worker and the error, and counts in
-  `arneb_query_retries_total` on `/metrics`. Startup logs the effective
+  `arneb_query_retries_total` on `/metrics`. A query that fails after a
+  worker loss without a re-run (retry off, re-runs used up, or no worker
+  left) logs `failing query: worker lost` once, with the worker, the reason
+  and the number of re-runs. Startup logs the effective
   policy on `arneb::config`.
 
 A hung worker is detected only after `heartbeat_timeout_secs`, so a re-run

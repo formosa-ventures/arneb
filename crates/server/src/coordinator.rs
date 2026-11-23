@@ -1266,6 +1266,7 @@ fn collect_producers_from_plan(
         | L::Distinct { input, .. }
         | L::Explain { input, .. }
         | L::Window { input, .. }
+        | L::ProjectSet { input, .. }
         | L::AssignUniqueId { input, .. } => {
             collect_producers_from_plan(input, stage_id, task_count, join_task_count, out);
         }
@@ -1307,6 +1308,7 @@ fn collect_consumers_from_plan(plan: &LogicalPlan, stage_id: StageId, out: &mut 
         | L::Distinct { input, .. }
         | L::Explain { input, .. }
         | L::Window { input, .. }
+        | L::ProjectSet { input, .. }
         | L::AssignUniqueId { input, .. } => {
             collect_consumers_from_plan(input, stage_id, out);
         }
@@ -1530,6 +1532,7 @@ fn plan_node_children(plan: &LogicalPlan) -> Vec<&LogicalPlan> {
         | L::PartialAggregate { input, .. }
         | L::FinalAggregate { input, .. }
         | L::Window { input, .. }
+        | L::ProjectSet { input, .. }
         | L::AssignUniqueId { input, .. } => vec![input.as_ref()],
         L::Join { left, right, .. }
         | L::SemiJoin { left, right, .. }

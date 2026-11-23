@@ -682,6 +682,7 @@ impl ExecutionContext {
             | LogicalPlan::PartialAggregate { input, .. }
             | LogicalPlan::FinalAggregate { input, .. }
             | LogicalPlan::Window { input, .. }
+            | LogicalPlan::ProjectSet { input, .. }
             | LogicalPlan::AssignUniqueId { input, .. }
             | LogicalPlan::ScalarSubquery { subplan: input } => {
                 Self::all_scans_have_row_count(input, stats)
@@ -728,6 +729,23 @@ impl ExecutionContext {
             && left_rows > 0.0
             && right_rows > 0.0
             && left_rows * 4.0 < right_rows
+    }
+
+    /// Out-of-line so the recursive future of `resolve_scalar_subqueries`
+    /// does not grow (stack depth) for the rare aggregate `ORDER BY`.
+    async fn resolve_order_by_subqueries(
+        &self,
+        order_by: &[arneb_planner::SortExpr],
+    ) -> Result<Vec<arneb_planner::SortExpr>, ExecutionError> {
+        let mut resolved = Vec::with_capacity(order_by.len());
+        for s in order_by {
+            resolved.push(arneb_planner::SortExpr {
+                expr: self.resolve_scalar_subqueries(&s.expr).await?,
+                asc: s.asc,
+                nulls_first: s.nulls_first,
+            });
+        }
+        Ok(resolved)
     }
 
     /// Pre-evaluate scalar subqueries in a PlanExpr, replacing them with Literal values.
@@ -806,13 +824,21 @@ impl ExecutionContext {
                 name,
                 args,
                 distinct,
+                order_by,
                 span,
             } => {
                 let mut resolved = Vec::with_capacity(args.len());
                 for arg in args {
                     resolved.push(Box::pin(self.resolve_scalar_subqueries(arg)).await?);
                 }
+                let resolved_order_by = match order_by {
+                    None => None,
+                    Some(keys) => Some(Box::new(
+                        Box::pin(self.resolve_order_by_subqueries(keys)).await?,
+                    )),
+                };
                 Ok(PlanExpr::Function {
+                    order_by: resolved_order_by,
                     name: name.clone(),
                     args: resolved,
                     distinct: *distinct,
@@ -1637,6 +1663,20 @@ impl ExecutionContext {
                 )))
             }
 
+            LogicalPlan::ProjectSet {
+                input,
+                srfs,
+                schema,
+            } => {
+                // Stateless per input row: keep multi-partition input.
+                let child = self.convert(input)?;
+                Ok(Arc::new(crate::project_set::ProjectSetExec::new(
+                    child,
+                    srfs.clone(),
+                    schema.clone(),
+                )))
+            }
+
             LogicalPlan::AssignUniqueId { input, id_column } => {
                 // Stateless per-row pass-through: keep multi-partition
                 // input so downstream parallelism survives.
@@ -1802,9 +1842,21 @@ fn collect_column_indices_into(expr: &PlanExpr, out: &mut std::collections::BTre
                 collect_column_indices_into(e, out);
             }
         }
-        E::Function { args, .. } => {
+        E::Array { elements, .. } => {
+            for e in elements {
+                collect_column_indices_into(e, out);
+            }
+        }
+        E::ArrayContains { expr, array, .. } => {
+            collect_column_indices_into(expr, out);
+            collect_column_indices_into(array, out);
+        }
+        E::Function { args, order_by, .. } => {
             for a in args {
                 collect_column_indices_into(a, out);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_column_indices_into(&s.expr, out);
             }
         }
         E::ScalarSubquery { .. } => {
@@ -1882,8 +1934,12 @@ fn rewrite_column_indices(expr: &PlanExpr, mapping: &HashMap<usize, usize>) -> P
             name,
             args,
             distinct,
+            order_by,
             span,
         } => E::Function {
+            order_by: arneb_planner::SortExpr::map_exprs_ref(order_by, &mut |e| {
+                rewrite_column_indices(e, mapping)
+            }),
             name: name.clone(),
             args: args
                 .iter()
@@ -1925,6 +1981,26 @@ fn rewrite_column_indices(expr: &PlanExpr, mapping: &HashMap<usize, usize>) -> P
                 .map(|a| rewrite_column_indices(a, mapping))
                 .collect(),
             negated: *negated,
+            span: *span,
+        },
+        E::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => arneb_planner::map_array_contains_ref(expr, array, *negated, *span, |e| {
+            rewrite_column_indices(e, mapping)
+        }),
+        E::Array {
+            elements,
+            element_type,
+            span,
+        } => E::Array {
+            elements: elements
+                .iter()
+                .map(|a| rewrite_column_indices(a, mapping))
+                .collect(),
+            element_type: element_type.clone(),
             span: *span,
         },
         E::Cast {
@@ -3180,6 +3256,7 @@ mod tests {
                 input: Box::new(revenue_scan(revenue_schema)),
                 group_by: Vec::new(),
                 aggr_exprs: vec![PlanExpr::Function {
+                    order_by: None,
                     name: "MAX".into(),
                     args: vec![PlanExpr::Column {
                         index: 1,
@@ -3483,6 +3560,7 @@ mod tests {
                 group_by: vec![],
                 aggr_exprs: vec![
                     PlanExpr::Function {
+                        order_by: None,
                         name: "SUM".to_string(),
                         args: vec![PlanExpr::Column {
                             index: 0,
@@ -3493,6 +3571,7 @@ mod tests {
                         span: None,
                     },
                     PlanExpr::Function {
+                        order_by: None,
                         name: "SUM".to_string(),
                         args: vec![PlanExpr::Column {
                             index: 1,
@@ -3882,12 +3961,14 @@ mod tests {
             group_by: vec![],
             aggr_exprs: vec![
                 PlanExpr::Function {
+                    order_by: None,
                     name: "COUNT".to_string(),
                     args: vec![],
                     distinct: false,
                     span: None,
                 },
                 PlanExpr::Function {
+                    order_by: None,
                     name: "SUM".to_string(),
                     args: vec![PlanExpr::Column {
                         index: 2,
@@ -4097,6 +4178,7 @@ mod tests {
                     span: None,
                 }],
                 aggr_exprs: vec![PlanExpr::Function {
+                    order_by: None,
                     name: "COUNT".to_string(),
                     args: vec![],
                     distinct: false,
@@ -4696,6 +4778,7 @@ mod tests {
 
         // Test UPPER(name)
         let upper_expr = PlanExpr::Function {
+            order_by: None,
             name: "UPPER".to_string(),
             args: vec![PlanExpr::Column {
                 index: 0,
@@ -4713,6 +4796,7 @@ mod tests {
 
         // Test ABS(value)
         let abs_expr = PlanExpr::Function {
+            order_by: None,
             name: "ABS".to_string(),
             args: vec![PlanExpr::Column {
                 index: 1,

@@ -178,6 +178,11 @@ fn recurse_children(plan: LogicalPlan, alloc: &DynamicFilterIdAllocator) -> Logi
             input: Box::new(rewrite(*input, alloc)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(Box::new(rewrite(*input, alloc)), srfs, schema),
         L::AssignUniqueId { input, id_column } => L::AssignUniqueId {
             input: Box::new(rewrite(*input, alloc)),
             id_column,

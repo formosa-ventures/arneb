@@ -336,6 +336,7 @@ fn all_scans_have_row_count(plan: &LogicalPlan, stats: &crate::cost::CatalogStat
         | LogicalPlan::PartialAggregate { input, .. }
         | LogicalPlan::FinalAggregate { input, .. }
         | LogicalPlan::Window { input, .. }
+        | LogicalPlan::ProjectSet { input, .. }
         | LogicalPlan::AssignUniqueId { input, .. }
         | LogicalPlan::ScalarSubquery { subplan: input } => all_scans_have_row_count(input, stats),
         LogicalPlan::Join { left, right, .. }
@@ -760,8 +761,12 @@ fn remap_expr_for_swapped_join(
             name,
             args,
             distinct,
+            order_by,
             span,
         } => PlanExpr::Function {
+            order_by: crate::plan::SortExpr::map_exprs(order_by, &mut |e| {
+                remap_expr_for_swapped_join(e, old_left_width, old_right_width)
+            }),
             name,
             args: args
                 .into_iter()
@@ -827,6 +832,26 @@ fn remap_expr_for_swapped_join(
                 .map(|item| remap_expr_for_swapped_join(item, old_left_width, old_right_width))
                 .collect(),
             negated,
+            span,
+        },
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains(expr, array, negated, span, |e| {
+            remap_expr_for_swapped_join(e, old_left_width, old_right_width)
+        }),
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => PlanExpr::Array {
+            elements: elements
+                .into_iter()
+                .map(|item| remap_expr_for_swapped_join(item, old_left_width, old_right_width))
+                .collect(),
+            element_type,
             span,
         },
         PlanExpr::Cast {
@@ -1130,6 +1155,15 @@ fn remove_dynamic_filter_consumers_for_join(
             input: Box::new(remove_dynamic_filter_consumers_for_join(*input, producers)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(
+            Box::new(remove_dynamic_filter_consumers_for_join(*input, producers)),
+            srfs,
+            schema,
+        ),
         L::AssignUniqueId { input, id_column } => L::AssignUniqueId {
             input: Box::new(remove_dynamic_filter_consumers_for_join(*input, producers)),
             id_column,
@@ -1775,6 +1809,21 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
     /// Recursively split the plan. Returns (local plan, child fragments).
     fn split(&mut self, plan: LogicalPlan) -> (LogicalPlan, Vec<PlanFragment>) {
         self.split_with_parent_aggregate_projection(plan, None)
+    }
+
+    /// Out of line so the recursive `split` frame stays small.
+    #[inline(never)]
+    fn split_project_set(
+        &mut self,
+        input: LogicalPlan,
+        srfs: Vec<(crate::plan::SrfKind, PlanExpr)>,
+        schema: Vec<ColumnInfo>,
+    ) -> (LogicalPlan, Vec<PlanFragment>) {
+        let (input_plan, frags) = self.split(input);
+        (
+            LogicalPlan::rebuild_project_set(Box::new(input_plan), srfs, schema),
+            frags,
+        )
     }
 
     fn split_join_child(&mut self, plan: LogicalPlan) -> (LogicalPlan, Vec<PlanFragment>) {
@@ -3176,6 +3225,13 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                 (exchange, vec![fragment])
             }
 
+            // Like a plain Projection: evaluated in its input's fragment.
+            LogicalPlan::ProjectSet {
+                input,
+                srfs,
+                schema,
+            } => self.split_project_set(*input, srfs, schema),
+
             LogicalPlan::Window { input, functions } => {
                 let (input_plan, input_frags) = self.split(*input);
                 let window_plan = LogicalPlan::Window {
@@ -3419,6 +3475,13 @@ fn recurse_avg_children(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(rewrite_avg_for_split(*input)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => {
+            LogicalPlan::rebuild_project_set(Box::new(rewrite_avg_for_split(*input)), srfs, schema)
+        }
         L::AssignUniqueId { input, id_column } => L::AssignUniqueId {
             input: Box::new(rewrite_avg_for_split(*input)),
             id_column,
@@ -3622,6 +3685,7 @@ fn rewrite_avg_aggregate(
                 // SUM(x) — BIGINT for integer x, DOUBLE for float x.
                 let sum_idx = n_group + inner_aggr_exprs.len();
                 let sum_expr = PlanExpr::Function {
+                    order_by: None,
                     name: "SUM".into(),
                     args: vec![arg.clone()],
                     distinct: false,
@@ -3638,6 +3702,7 @@ fn rewrite_avg_aggregate(
                 // COUNT(x) — non-null count of the same argument.
                 let count_idx = n_group + inner_aggr_exprs.len();
                 inner_aggr_exprs.push(PlanExpr::Function {
+                    order_by: None,
                     name: "COUNT".into(),
                     args: vec![arg.clone()],
                     distinct: false,
@@ -3849,6 +3914,17 @@ fn replace_first_exchange(
                 replacement,
             )
         }
+        LogicalPlan::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => {
+            let (input, replacement) = replace_first_exchange(*input, target, replacement);
+            (
+                LogicalPlan::rebuild_project_set(Box::new(input), srfs, schema),
+                replacement,
+            )
+        }
         LogicalPlan::AssignUniqueId { input, id_column } => {
             let (input, replacement) = replace_first_exchange(*input, target, replacement);
             (
@@ -3963,6 +4039,7 @@ fn build_final_aggr_expr(
         .map(|c| c.name.clone())
         .unwrap_or_default();
     PlanExpr::Function {
+        order_by: None,
         name: final_name,
         args: vec![PlanExpr::Column {
             index: partial_idx,
@@ -4104,6 +4181,7 @@ mod tests {
             | LogicalPlan::PartialAggregate { input, .. }
             | LogicalPlan::FinalAggregate { input, .. }
             | LogicalPlan::Window { input, .. }
+            | LogicalPlan::ProjectSet { input, .. }
             | LogicalPlan::AssignUniqueId { input, .. } => {
                 count_table_scans_in_plan(input, table_name)
             }
@@ -4343,6 +4421,7 @@ mod tests {
             input: Box::new(lineitem),
             group_by: vec![column(0, "l_suppkey")],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "SUM".into(),
                 args: vec![column(1, "l_extendedprice")],
                 distinct: false,
@@ -4511,6 +4590,7 @@ mod tests {
                 input: Box::new(scan_with_columns("right_table", &["r_payload", "r_id"])),
                 group_by: vec![column(1, "r_id")],
                 aggr_exprs: vec![PlanExpr::Function {
+                    order_by: None,
                     name: "SUM".into(),
                     args: vec![column(0, "r_payload")],
                     distinct: false,
@@ -4946,6 +5026,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "COUNT".into(),
                 args: vec![],
                 distinct: false,
@@ -4994,12 +5075,14 @@ mod tests {
             group_by: vec![column(1, "o_year")],
             aggr_exprs: vec![
                 PlanExpr::Function {
+                    order_by: None,
                     name: "SUM".into(),
                     args: vec![column(3, "volume")],
                     distinct: false,
                     span: None,
                 },
                 PlanExpr::Function {
+                    order_by: None,
                     name: "SUM".into(),
                     args: vec![PlanExpr::CaseExpr {
                         operand: None,
@@ -5110,6 +5193,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "SUM".into(),
                 args: vec![PlanExpr::Column {
                     index: 1,
@@ -5190,6 +5274,7 @@ mod tests {
                 },
             ],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "SUM".into(),
                 args: vec![PlanExpr::Column {
                     index: 2,
@@ -5276,6 +5361,7 @@ mod tests {
                 },
             ],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "SUM".into(),
                 args: vec![PlanExpr::Column {
                     index: 2,
@@ -5366,6 +5452,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "COUNT".into(),
                 args: vec![],
                 distinct: false,
@@ -5397,6 +5484,7 @@ mod tests {
             input: Box::new(scan("t")),
             group_by: vec![],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "COUNT".into(),
                 args: vec![],
                 distinct: false,
@@ -5430,6 +5518,7 @@ mod tests {
             input: Box::new(scan("t")),
             group_by: vec![],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "COUNT".into(),
                 args: vec![PlanExpr::Column {
                     index: 0,
@@ -5501,6 +5590,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "AVG".into(),
                 args: vec![PlanExpr::Column {
                     index: 1,
@@ -5596,6 +5686,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "SUM".into(),
                 args: vec![PlanExpr::Column {
                     index: 1,
@@ -5653,6 +5744,7 @@ mod tests {
             input: Box::new(scan("t")),
             group_by: vec![],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "AVG".into(),
                 args: vec![PlanExpr::Column {
                     index: 0,
@@ -6121,6 +6213,63 @@ mod tests {
             out.extend(collect_fragment_table_consumers(source, table_name));
         }
         out
+    }
+
+    /// Broadcast v2b inlines the probe's scan fragment under the join. A
+    /// ProjectSet between the join and the probe exchange must survive
+    /// that inlining, with the scan beneath it in the worker fragment.
+    #[test]
+    fn inline_broadcast_join_keeps_project_set_over_the_probe_scan() {
+        let col = |index: usize, name: &str| PlanExpr::Column {
+            index,
+            name: name.into(),
+            span: None,
+        };
+        let probe = LogicalPlan::rebuild_project_set(
+            Box::new(scan_with_columns("fact_t", &["f_id", "arr"])),
+            vec![(crate::plan::SrfKind::Unnest, col(1, "arr"))],
+            vec![ColumnInfo {
+                name: "unnest(arr)".into(),
+                data_type: DataType::Int32,
+                nullable: true,
+            }],
+        );
+        let plan = LogicalPlan::Join {
+            left: Box::new(probe),
+            right: Box::new(scan_with_columns("dim_t", &["d_id"])),
+            join_type: ast::JoinType::Inner,
+            condition: crate::plan::JoinCondition::On(PlanExpr::BinaryOp {
+                left: Box::new(col(0, "f_id")),
+                op: ast::BinaryOp::Eq,
+                right: Box::new(col(3, "d_id")),
+                span: None,
+            }),
+            dynamic_filter_ids: Vec::new(),
+        };
+        let mut frag = PlanFragmenter::new()
+            .with_broadcast_threshold(Some(1024))
+            .with_stats(Some(std::sync::Arc::new(
+                stats_for_inline_broadcast_df_regen(),
+            )));
+        let result = frag.fragment(plan);
+
+        assert_eq!(result.source_fragments.len(), 1, "{result:?}");
+        let probe_frag = &result.source_fragments[0];
+        let LogicalPlan::Join { left, .. } = &probe_frag.root else {
+            panic!("expected the join inlined into the probe fragment: {probe_frag:?}");
+        };
+        let LogicalPlan::ProjectSet { input, srfs, .. } = left.as_ref() else {
+            panic!("expected ProjectSet over the probe scan, got {left}");
+        };
+        assert_eq!(srfs.len(), 1);
+        assert!(
+            matches!(input.as_ref(), LogicalPlan::TableScan { table, .. } if table.table == "fact_t"),
+            "{input}"
+        );
+        assert_eq!(
+            probe_frag.source_fragments[0].output_partitioning,
+            PartitioningScheme::Broadcast
+        );
     }
 
     #[test]

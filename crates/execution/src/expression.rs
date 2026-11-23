@@ -74,6 +74,29 @@ pub(crate) fn evaluate(
 
         PlanExpr::Literal { value, .. } => scalar_to_array(value, batch.num_rows()),
 
+        PlanExpr::Array {
+            elements,
+            element_type,
+            ..
+        } => {
+            let arrays = elements
+                .iter()
+                .map(|e| evaluate(e, batch, registry))
+                .collect::<Result<Vec<_>, _>>()?;
+            build_list_array(arrays, element_type, batch.num_rows())
+        }
+
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            ..
+        } => {
+            let value = evaluate(expr, batch, registry)?;
+            let list = evaluate(array, batch, registry)?;
+            array_contains(&value, &list, *negated)
+        }
+
         PlanExpr::BinaryOp {
             left, op, right, ..
         } => {
@@ -103,6 +126,11 @@ pub(crate) fn evaluate(
             expr, data_type, ..
         } => {
             let arr = evaluate(expr, batch, registry)?;
+            if let DataType::List(element) = data_type {
+                if matches!(arr.data_type(), ArrowDataType::Utf8 | ArrowDataType::LargeUtf8) {
+                    return text_to_list(&arr, element);
+                }
+            }
             let arrow_type: ArrowDataType = data_type.clone().into();
             let result = match cast_fractional_to_integer(
                 &arr,
@@ -445,6 +473,16 @@ pub(crate) fn scalar_to_array(
     num_rows: usize,
 ) -> Result<ArrayRef, ExecutionError> {
     match value {
+        ScalarValue::List { element, values } => {
+            let elem_type: ArrowDataType = element.as_ref().clone().into();
+            let values_array = crate::operator::scalars_to_array(values, &elem_type)?;
+            let one = list_from_values(values_array, &elem_type, &[values.len()])?;
+            if num_rows == 1 {
+                return Ok(one);
+            }
+            let indices = arrow::array::UInt32Array::from(vec![0u32; num_rows]);
+            arrow::compute::take(one.as_ref(), &indices, None).map_err(ExecutionError::from)
+        }
         ScalarValue::Null => Ok(Arc::new(NullArray::new(num_rows))),
         ScalarValue::Boolean(v) => Ok(Arc::new(BooleanArray::from(vec![*v; num_rows]))),
         ScalarValue::Int32(v) => Ok(Arc::new(Int32Array::from(vec![*v; num_rows]))),
@@ -505,6 +543,166 @@ pub(crate) fn scalar_to_array(
             "unsupported scalar type for array conversion".to_string(),
         )),
     }
+}
+
+/// Wraps `values` (the concatenated elements) in a `ListArray` whose rows
+/// have the given lengths.
+fn list_from_values(
+    values: ArrayRef,
+    elem_type: &ArrowDataType,
+    lengths: &[usize],
+) -> Result<ArrayRef, ExecutionError> {
+    // Same field shape as `DataType::List` converts to.
+    let field = Arc::new(arrow::datatypes::Field::new(
+        "item",
+        elem_type.clone(),
+        true,
+    ));
+    let offsets = arrow::buffer::OffsetBuffer::from_lengths(lengths.iter().copied());
+    Ok(Arc::new(arrow::array::ListArray::try_new(
+        field, offsets, values, None,
+    )?))
+}
+
+/// Builds one list per row from `arrays`, the element arrays of an
+/// `ARRAY[...]` constructor (each `num_rows` long): row `r` holds
+/// `arrays[0][r], arrays[1][r], ...`.
+fn build_list_array(
+    arrays: Vec<ArrayRef>,
+    element_type: &DataType,
+    num_rows: usize,
+) -> Result<ArrayRef, ExecutionError> {
+    let elem_type: ArrowDataType = element_type.clone().into();
+    let arrays = arrays
+        .into_iter()
+        .map(|a| {
+            if a.data_type() == &elem_type {
+                Ok(a)
+            } else {
+                arrow::compute::cast(&a, &elem_type)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let k = arrays.len();
+    let values = if k == 0 {
+        arrow::array::new_empty_array(&elem_type)
+    } else {
+        let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+        let indices: Vec<(usize, usize)> = (0..num_rows)
+            .flat_map(|r| (0..k).map(move |i| (i, r)))
+            .collect();
+        arrow::compute::interleave(&refs, &indices)?
+    };
+    list_from_values(values, &elem_type, &vec![k; num_rows])
+}
+
+/// `value = ANY (list)` per row, or `value <> ALL (list)` when `negated`,
+/// with SQL's three-valued logic: an empty list is false (`<> ALL`: true)
+/// whatever `value` is, a NULL list is NULL, otherwise a match is true, a
+/// NULL `value` or a NULL element without a match is NULL, and no match is
+/// false.
+fn array_contains(
+    value: &ArrayRef,
+    list: &ArrayRef,
+    negated: bool,
+) -> Result<ArrayRef, ExecutionError> {
+    let rows = value.len();
+    if list.data_type() == &ArrowDataType::Null {
+        return Ok(Arc::new(BooleanArray::new_null(rows)));
+    }
+    let list = list.as_list_opt::<i32>().ok_or_else(|| {
+        ExecutionError::InvalidOperation(format!(
+            "ANY / ALL requires an array operand, got {}",
+            list.data_type()
+        ))
+    })?;
+    let elements = list.values();
+    let offsets = list.value_offsets();
+    // The row each element belongs to, so `value` can be compared with every
+    // element in one kernel call.
+    let mut owner = vec![0u32; elements.len()];
+    for r in 0..rows {
+        for slot in &mut owner[offsets[r] as usize..offsets[r + 1] as usize] {
+            *slot = r as u32;
+        }
+    }
+    let expanded = arrow::compute::take(value.as_ref(), &UInt32Array::from(owner), None)?;
+    let expanded = if expanded.data_type() == elements.data_type() {
+        expanded
+    } else {
+        arrow::compute::cast(&expanded, elements.data_type())?
+    };
+    let equal = compare_op(&expanded, elements, CompareOp::Eq)?;
+    let out: BooleanArray = (0..rows)
+        .map(|r| {
+            if list.is_null(r) {
+                return None;
+            }
+            let (start, end) = (offsets[r] as usize, offsets[r + 1] as usize);
+            let found = if start == end {
+                Some(false)
+            } else if value.is_null(r) {
+                None
+            } else {
+                let mut saw_null = false;
+                let mut hit = false;
+                for i in start..end {
+                    if equal.is_null(i) {
+                        saw_null = true;
+                    } else if equal.value(i) {
+                        hit = true;
+                        break;
+                    }
+                }
+                if hit {
+                    Some(true)
+                } else if saw_null {
+                    None
+                } else {
+                    Some(false)
+                }
+            };
+            found.map(|b| b != negated)
+        })
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// Casts the text of each row (PostgreSQL array syntax, see
+/// [`arneb_common::array_text`]) to a list of `element`. A malformed array
+/// or an element that does not parse as `element` is an error, not NULL.
+fn text_to_list(array: &ArrayRef, element: &DataType) -> Result<ArrayRef, ExecutionError> {
+    let texts = arrow::compute::cast(array, &ArrowDataType::Utf8)?;
+    let texts = texts.as_string::<i32>();
+    let mut flat: Vec<Option<String>> = Vec::new();
+    let mut lengths = Vec::with_capacity(texts.len());
+    let mut valid = Vec::with_capacity(texts.len());
+    for text in texts.iter() {
+        match text {
+            Some(text) => {
+                let parsed = arneb_common::array_text::parse_array_text(text)
+                    .map_err(ExecutionError::InvalidOperation)?;
+                lengths.push(parsed.len());
+                valid.push(true);
+                flat.extend(parsed);
+            }
+            None => {
+                lengths.push(0);
+                valid.push(false);
+            }
+        }
+    }
+    let elem_type: ArrowDataType = element.clone().into();
+    let flat: ArrayRef = Arc::new(StringArray::from(flat));
+    let values = arrow::compute::cast_with_options(&flat, &elem_type, &CHECKED_CAST)?;
+    let field = Arc::new(arrow::datatypes::Field::new("item", elem_type, true));
+    let offsets = arrow::buffer::OffsetBuffer::from_lengths(lengths);
+    Ok(Arc::new(arrow::array::ListArray::try_new(
+        field,
+        offsets,
+        values,
+        Some(arrow::buffer::NullBuffer::from(valid)),
+    )?))
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,9 +1284,21 @@ fn case_referenced_columns(expr: &PlanExpr, referenced: &mut [bool]) {
                 case_referenced_columns(item, referenced);
             }
         }
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                case_referenced_columns(item, referenced);
+            }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            case_referenced_columns(expr, referenced);
+            case_referenced_columns(array, referenced);
+        }
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 case_referenced_columns(arg, referenced);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                case_referenced_columns(&s.expr, referenced);
             }
         }
         PlanExpr::CaseExpr {
@@ -1140,6 +1350,64 @@ fn new_null_array(data_type: &ArrowDataType, len: usize) -> ArrayRef {
 mod tests {
     use super::*;
     use arrow::datatypes::{Field, Schema};
+
+    #[test]
+    fn array_constructor_builds_one_list_per_row() {
+        let batch = make_batch();
+        let col = |index| PlanExpr::Column {
+            index,
+            name: String::new(),
+            span: None,
+        };
+        // ARRAY[a, CAST(b AS INT)] over rows of (Int32, Int64).
+        let expr = PlanExpr::Array {
+            elements: vec![
+                col(0),
+                PlanExpr::Cast {
+                    expr: Box::new(col(1)),
+                    data_type: DataType::Int32,
+                    span: None,
+                },
+            ],
+            element_type: DataType::Int32,
+            span: None,
+        };
+        let out = evaluate(&expr, &batch, None).unwrap();
+        assert_eq!(out.len(), batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let ScalarValue::List { element, values } =
+                crate::operator::extract_scalar(&out, row).unwrap()
+            else {
+                panic!("expected a list");
+            };
+            assert_eq!(*element, DataType::Int32);
+            assert_eq!(values.len(), 2);
+        }
+    }
+
+    #[test]
+    fn list_literal_round_trips_through_arrays() {
+        let v = ScalarValue::List {
+            element: Box::new(DataType::Int64),
+            values: vec![
+                ScalarValue::Int64(7),
+                ScalarValue::Null,
+                ScalarValue::Int64(9),
+            ],
+        };
+        let arr = scalar_to_array(&v, 3).unwrap();
+        assert_eq!(arr.len(), 3);
+        for row in 0..3 {
+            assert_eq!(crate::operator::extract_scalar(&arr, row).unwrap(), v);
+        }
+        let column = crate::operator::scalars_to_array(
+            &[v.clone(), ScalarValue::Null],
+            &arr.data_type().clone(),
+        )
+        .unwrap();
+        assert_eq!(column.len(), 2);
+        assert!(column.is_null(1));
+    }
 
     fn make_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -2054,6 +2322,7 @@ mod tests {
 
     fn func(name: &str, args: Vec<PlanExpr>) -> PlanExpr {
         PlanExpr::Function {
+            order_by: None,
             name: name.to_string(),
             args,
             distinct: false,

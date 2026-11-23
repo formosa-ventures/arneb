@@ -510,6 +510,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             // has the SQL NULL-propagating semantics `||` requires.
             if matches!(op, sp::BinaryOperator::StringConcat) {
                 return Ok(ast::Expr::Function {
+                    order_by: vec![],
                     name: "CONCAT".to_string(),
                     args: vec![ast::FunctionArg::Unnamed(l), ast::FunctionArg::Unnamed(r)],
                     distinct: false,
@@ -553,6 +554,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 if !backslash {
                     let pattern_span = r.span();
                     r = ast::Expr::Function {
+                        order_by: vec![],
                         name: "like_escape".to_string(),
                         args: vec![
                             ast::FunctionArg::Unnamed(r),
@@ -640,8 +642,8 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 "expression: IN {other}"
             ))),
         },
-        // `x = ANY (ARRAY[...])` / `x <> ALL (ARRAY[...])` over literal
-        // arrays are IN lists; Arneb has no array type (pg-catalog-tables).
+        // `x = ANY (ARRAY[...])` / `x <> ALL (ARRAY[...])` over an `ARRAY[...]`
+        // literal are IN lists; any other array operand is `Expr::AnyAll`.
         sp::Expr::AnyOp {
             left,
             compare_op: sp::BinaryOperator::Eq,
@@ -664,6 +666,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 .find(|reg| is_custom_type(&data_type, reg))
             {
                 return Ok(ast::Expr::Function {
+                    order_by: vec![],
                     name: reg.to_string(),
                     args: vec![ast::FunctionArg::Unnamed(e)],
                     distinct: false,
@@ -757,6 +760,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 )?));
             }
             Ok(ast::Expr::Function {
+                order_by: vec![],
                 name: "ROLLUP".to_string(),
                 args,
                 distinct: false,
@@ -770,6 +774,14 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 negated,
                 span,
             })
+        }
+        sp::Expr::Array(arr) => {
+            let elements = arr
+                .elem
+                .into_iter()
+                .map(convert_expr)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ast::Expr::Array { elements, span })
         }
         sp::Expr::Case {
             operand,
@@ -836,6 +848,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 args.push(ast::FunctionArg::Unnamed(convert_expr(*for_e)?));
             }
             Ok(ast::Expr::Function {
+                order_by: vec![],
                 name: "SUBSTRING".to_string(),
                 args,
                 distinct: false,
@@ -859,6 +872,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             };
             let arg = convert_expr(*expr)?;
             Ok(ast::Expr::Function {
+                order_by: vec![],
                 name: "EXTRACT".to_string(),
                 args: vec![
                     ast::FunctionArg::Unnamed(field_literal),
@@ -881,6 +895,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
         }
         // `POSITION(sub IN s)` → `POSITION(sub, s)`.
         sp::Expr::Position { expr, r#in } => Ok(ast::Expr::Function {
+            order_by: vec![],
             name: "POSITION".to_string(),
             args: vec![
                 ast::FunctionArg::Unnamed(convert_expr(*expr)?),
@@ -914,6 +929,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 args.push(ast::FunctionArg::Unnamed(convert_expr(chars.remove(0))?));
             }
             Ok(ast::Expr::Function {
+                order_by: vec![],
                 name: name.to_string(),
                 args,
                 distinct: false,
@@ -937,6 +953,7 @@ fn is_plain_ceil_floor(field: &sp::CeilFloorKind) -> bool {
 /// Build a single-argument scalar function call `name(expr)`.
 fn unary_function_call(name: &str, expr: sp::Expr, span: Span) -> Result<ast::Expr, ParseError> {
     Ok(ast::Expr::Function {
+        order_by: vec![],
         name: name.to_string(),
         args: vec![ast::FunctionArg::Unnamed(convert_expr(expr)?)],
         distinct: false,
@@ -1115,6 +1132,17 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
     };
     let name_upper = name.to_uppercase();
 
+    if func.filter.is_some() {
+        return Err(ParseError::UnsupportedFeature(format!(
+            "FILTER (WHERE ...) on {name}(...)"
+        )));
+    }
+    if !func.within_group.is_empty() {
+        return Err(ParseError::UnsupportedFeature(format!(
+            "WITHIN GROUP on {name}(...)"
+        )));
+    }
+
     // Desugar COALESCE(a, b, ...) → CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ... ELSE last END
     if name_upper == "COALESCE" {
         let raw_args = match func.args {
@@ -1249,8 +1277,8 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
         });
     }
 
-    let (args, is_distinct) = match func.args {
-        sp::FunctionArguments::None => (vec![], false),
+    let (args, is_distinct, agg_order_by) = match func.args {
+        sp::FunctionArguments::None => (vec![], false, vec![]),
         sp::FunctionArguments::Subquery(_) => {
             return Err(ParseError::UnsupportedFeature(
                 "subquery as function argument".to_string(),
@@ -1264,12 +1292,33 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
                 .into_iter()
                 .map(convert_function_arg)
                 .collect::<Result<Vec<_>, _>>()?;
-            (args, distinct_flag)
+            let mut agg_order_by = Vec::new();
+            for clause in arg_list.clauses {
+                match clause {
+                    sp::FunctionArgumentClause::OrderBy(items) => {
+                        agg_order_by = items
+                            .into_iter()
+                            .map(convert_order_by_expr)
+                            .collect::<Result<Vec<_>, _>>()?;
+                    }
+                    other => {
+                        return Err(ParseError::UnsupportedFeature(format!(
+                            "{other} inside {name}(...)"
+                        )));
+                    }
+                }
+            }
+            (args, distinct_flag, agg_order_by)
         }
     };
 
     // Check for window function (OVER clause)
     if let Some(over) = func.over {
+        if !agg_order_by.is_empty() {
+            return Err(ParseError::UnsupportedFeature(format!(
+                "ORDER BY inside {name}(...) in a window function"
+            )));
+        }
         match over {
             sp::WindowType::WindowSpec(spec) => {
                 let rows_frame = match spec.window_frame {
@@ -1345,6 +1394,7 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
         name,
         args,
         distinct: is_distinct,
+        order_by: agg_order_by,
         span,
     })
 }
@@ -1658,7 +1708,8 @@ fn is_custom_type(dt: &sp::DataType, name: &str) -> bool {
     }
 }
 
-/// `left IN (elements)` (or `NOT IN`) for `left = ANY (ARRAY[elements])`.
+/// `left IN (elements)` (or `NOT IN`) for `left = ANY (ARRAY[elements])`;
+/// any other array operand stays an [`ast::Expr::AnyAll`].
 fn array_in_list(
     left: sp::Expr,
     right: sp::Expr,
@@ -1666,9 +1717,16 @@ fn array_in_list(
     span: Span,
 ) -> Result<ast::Expr, ParseError> {
     let sp::Expr::Array(array) = right else {
-        return Err(ParseError::UnsupportedFeature(format!(
-            "ANY / ALL over {right}; only an ARRAY[...] literal is supported"
-        )));
+        return Ok(ast::Expr::AnyAll {
+            expr: Box::new(convert_expr(left)?),
+            op: if negated {
+                ast::AnyAllOp::NotEqAll
+            } else {
+                ast::AnyAllOp::EqAny
+            },
+            array: Box::new(convert_expr(right)?),
+            span,
+        });
     };
     let list = array
         .elem
@@ -1726,6 +1784,16 @@ pub(crate) fn convert_data_type(dt: sp::DataType) -> Result<DataType, ParseError
                     scale: 0,
                 }),
             }
+        }
+        sp::DataType::Array(sp::ArrayElemTypeDef::SquareBracket(element, None))
+        | sp::DataType::Array(sp::ArrayElemTypeDef::Qualified(element, None)) => {
+            let element = convert_data_type(*element)?;
+            if matches!(element, DataType::List(_)) {
+                return Err(ParseError::UnsupportedFeature(
+                    "multidimensional array types".to_string(),
+                ));
+            }
+            Ok(DataType::List(Box::new(element)))
         }
         sp::DataType::Date => Ok(DataType::Date32),
         sp::DataType::Timestamp(_, tz_info) => {

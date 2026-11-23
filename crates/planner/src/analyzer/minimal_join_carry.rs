@@ -855,6 +855,11 @@ where
             input: Box::new(f(*input)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(Box::new(f(*input)), srfs, schema),
         L::AssignUniqueId { input, id_column } => L::AssignUniqueId {
             input: Box::new(f(*input)),
             id_column,
@@ -880,9 +885,12 @@ fn collect_columns(expr: &PlanExpr, out: &mut BTreeSet<usize>) {
         | PlanExpr::IsNull { expr, .. }
         | PlanExpr::IsNotNull { expr, .. }
         | PlanExpr::Cast { expr, .. } => collect_columns(expr, out),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_columns(arg, out);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_columns(&s.expr, out);
             }
         }
         PlanExpr::Between {
@@ -897,6 +905,15 @@ fn collect_columns(expr: &PlanExpr, out: &mut BTreeSet<usize>) {
             for item in list {
                 collect_columns(item, out);
             }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                collect_columns(item, out);
+            }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_columns(expr, out);
+            collect_columns(array, out);
         }
         PlanExpr::CaseExpr {
             operand,
@@ -949,8 +966,12 @@ fn rewrite_expr(expr: &PlanExpr, mapping: &HashMap<usize, usize>) -> PlanExpr {
             name,
             args,
             distinct,
+            order_by,
             span,
         } => PlanExpr::Function {
+            order_by: crate::plan::SortExpr::map_exprs_ref(order_by, &mut |e| {
+                rewrite_expr(e, mapping)
+            }),
             name: name.clone(),
             args: args.iter().map(|e| rewrite_expr(e, mapping)).collect(),
             distinct: *distinct,
@@ -986,6 +1007,23 @@ fn rewrite_expr(expr: &PlanExpr, mapping: &HashMap<usize, usize>) -> PlanExpr {
             expr: Box::new(rewrite_expr(expr, mapping)),
             list: list.iter().map(|e| rewrite_expr(e, mapping)).collect(),
             negated: *negated,
+            span: *span,
+        },
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains_ref(expr, array, *negated, *span, |e| {
+            rewrite_expr(e, mapping)
+        }),
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => PlanExpr::Array {
+            elements: elements.iter().map(|e| rewrite_expr(e, mapping)).collect(),
+            element_type: element_type.clone(),
             span: *span,
         },
         PlanExpr::Cast {
@@ -1142,6 +1180,7 @@ mod tests {
             input: Box::new(join),
             group_by: vec![col_expr(1, "s_name")],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "COUNT".to_string(),
                 args: Vec::new(),
                 distinct: false,

@@ -401,6 +401,13 @@ fn scalar_canonical_bytes(value: &ScalarValue) -> Vec<u8> {
                 None => out.push(0),
             }
         }
+        ScalarValue::List { values, .. } => {
+            out.push(11);
+            out.extend_from_slice(&(values.len() as u64).to_le_bytes());
+            for v in values {
+                out.extend_from_slice(&scalar_canonical_bytes(v));
+            }
+        }
     }
     out
 }

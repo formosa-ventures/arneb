@@ -280,12 +280,14 @@ fn build_supplier_aggregate(
         group_by: vec![col(key_idx, &key_col.name)],
         aggr_exprs: vec![
             PlanExpr::Function {
+                order_by: None,
                 name: "MIN".to_string(),
                 args: vec![col(supp_idx, &supp_col.name)],
                 distinct: false,
                 span: None,
             },
             PlanExpr::Function {
+                order_by: None,
                 name: "MAX".to_string(),
                 args: vec![col(supp_idx, &supp_col.name)],
                 distinct: false,
@@ -378,6 +380,7 @@ fn contains_table(plan: &LogicalPlan, target: &TableReference) -> bool {
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Window { input, .. }
+        | LogicalPlan::ProjectSet { input, .. }
         | LogicalPlan::AssignUniqueId { input, .. }
         | LogicalPlan::Explain { input, .. } => contains_table(input, target),
         LogicalPlan::Join { left, right, .. }
@@ -481,8 +484,10 @@ where
             name,
             args,
             distinct,
+            order_by,
             span,
         } => E::Function {
+            order_by: crate::plan::SortExpr::map_exprs(order_by, &mut |e| walk_columns(e, f)),
             name,
             args: args.into_iter().map(|a| walk_columns(a, f)).collect(),
             distinct,
@@ -518,6 +523,21 @@ where
             expr: Box::new(walk_columns(*expr, f)),
             list: list.into_iter().map(|e| walk_columns(e, f)).collect(),
             negated,
+            span,
+        },
+        E::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains(expr, array, negated, span, |e| walk_columns(e, f)),
+        E::Array {
+            elements,
+            element_type,
+            span,
+        } => E::Array {
+            elements: elements.into_iter().map(|e| walk_columns(e, f)).collect(),
+            element_type,
             span,
         },
         E::Cast {
@@ -597,6 +617,11 @@ where
             input: Box::new(f(*input)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(Box::new(f(*input)), srfs, schema),
         L::AssignUniqueId { input, id_column } => L::AssignUniqueId {
             input: Box::new(f(*input)),
             id_column,

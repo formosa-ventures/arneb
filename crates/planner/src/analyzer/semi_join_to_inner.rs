@@ -152,6 +152,11 @@ fn recurse_children<F: FnMut(LogicalPlan) -> LogicalPlan>(
             input: Box::new(f(*input)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(Box::new(f(*input)), srfs, schema),
         L::AssignUniqueId { input, id_column } => L::AssignUniqueId {
             input: Box::new(f(*input)),
             id_column,
@@ -402,8 +407,10 @@ fn shift_columns(expr: PlanExpr, delta: usize) -> PlanExpr {
             name,
             args,
             distinct,
+            order_by,
             span,
         } => E::Function {
+            order_by: crate::plan::SortExpr::map_exprs(order_by, &mut |e| shift_columns(e, delta)),
             name,
             args: args.into_iter().map(|a| shift_columns(a, delta)).collect(),
             distinct,
@@ -439,6 +446,24 @@ fn shift_columns(expr: PlanExpr, delta: usize) -> PlanExpr {
             expr: Box::new(shift_columns(*expr, delta)),
             list: list.into_iter().map(|e| shift_columns(e, delta)).collect(),
             negated,
+            span,
+        },
+        E::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains(expr, array, negated, span, |e| shift_columns(e, delta)),
+        E::Array {
+            elements,
+            element_type,
+            span,
+        } => E::Array {
+            elements: elements
+                .into_iter()
+                .map(|e| shift_columns(e, delta))
+                .collect(),
+            element_type,
             span,
         },
         E::Cast {
@@ -527,6 +552,7 @@ mod tests {
             input: Box::new(lineitem),
             group_by: vec![col_ref(0, "l_orderkey")],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "SUM".to_string(),
                 args: vec![col_ref(1, "l_quantity")],
                 distinct: false,

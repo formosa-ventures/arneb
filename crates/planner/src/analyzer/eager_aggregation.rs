@@ -235,6 +235,11 @@ fn rewrite(plan: LogicalPlan, stats: &CatalogStats) -> LogicalPlan {
             input: Box::new(rewrite(*input, stats)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(Box::new(rewrite(*input, stats)), srfs, schema),
         L::Explain { input, analyze } => L::Explain {
             input: Box::new(rewrite(*input, stats)),
             analyze,
@@ -780,6 +785,7 @@ fn build_rewrite(
                 AggKind::Max => "MAX",
             };
             PlanExpr::Function {
+                order_by: None,
                 name: name.to_string(),
                 args: vec![PlanExpr::Column {
                     index: idx,
@@ -860,8 +866,12 @@ where
             name,
             args,
             distinct,
+            order_by,
             ..
         } => PlanExpr::Function {
+            order_by: crate::plan::SortExpr::try_map_exprs_ref(order_by, &mut |e| {
+                remap_expr_columns(e, f)
+            })?,
             name: name.clone(),
             args: args
                 .iter()
@@ -892,6 +902,27 @@ where
             negated: *negated,
             span: None,
         },
+        PlanExpr::Array {
+            elements,
+            element_type,
+            ..
+        } => PlanExpr::Array {
+            elements: elements
+                .iter()
+                .map(|item| remap_expr_columns(item, f))
+                .collect::<Option<Vec<_>>>()?,
+            element_type: element_type.clone(),
+            span: None,
+        },
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            ..
+        } => crate::try_map_array_contains_ref(expr, array, *negated, None, |e| {
+            remap_expr_columns(e, f).ok_or(())
+        })
+        .ok()?,
         PlanExpr::Between {
             expr,
             negated,
@@ -957,7 +988,12 @@ fn aggregate_single_column_arg_index(aggr_expr: &PlanExpr) -> Option<usize> {
 }
 
 fn aggregate_single_column_arg(aggr_expr: &PlanExpr) -> Option<&PlanExpr> {
-    let PlanExpr::Function { args, .. } = aggr_expr else {
+    let PlanExpr::Function {
+        args,
+        order_by: None,
+        ..
+    } = aggr_expr
+    else {
         return None;
     };
     let [arg] = args.as_slice() else {
@@ -1145,8 +1181,12 @@ fn shift_column_indices(expr: PlanExpr, offset: usize) -> PlanExpr {
             name,
             args,
             distinct,
+            order_by,
             span,
         } => PlanExpr::Function {
+            order_by: crate::plan::SortExpr::map_exprs(order_by, &mut |e| {
+                shift_column_indices(e, offset)
+            }),
             name,
             args: args
                 .into_iter()
@@ -1175,6 +1215,26 @@ fn shift_column_indices(expr: PlanExpr, offset: usize) -> PlanExpr {
                 .map(|item| shift_column_indices(item, offset))
                 .collect(),
             negated,
+            span,
+        },
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains(expr, array, negated, span, |e| {
+            shift_column_indices(e, offset)
+        }),
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => PlanExpr::Array {
+            elements: elements
+                .into_iter()
+                .map(|item| shift_column_indices(item, offset))
+                .collect(),
+            element_type,
             span,
         },
         PlanExpr::Between {
@@ -1416,8 +1476,12 @@ fn remap_expr_to_side(expr: &PlanExpr, side: Side, left_width: usize) -> Option<
             name,
             args,
             distinct,
+            order_by,
             ..
         } => PlanExpr::Function {
+            order_by: crate::plan::SortExpr::try_map_exprs_ref(order_by, &mut |e| {
+                remap_expr_to_side(e, side, left_width)
+            })?,
             name: name.clone(),
             args: args
                 .iter()
@@ -1447,9 +1511,12 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             collect_column_indices(right, cb);
         }
         PlanExpr::UnaryOp { expr, .. } => collect_column_indices(expr, cb),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_column_indices(arg, cb);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_column_indices(&s.expr, cb);
             }
         }
         PlanExpr::IsNull { expr, .. } | PlanExpr::IsNotNull { expr, .. } => {
@@ -1460,6 +1527,15 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             for item in list {
                 collect_column_indices(item, cb);
             }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                collect_column_indices(item, cb);
+            }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_column_indices(expr, cb);
+            collect_column_indices(array, cb);
         }
         PlanExpr::Between {
             expr, low, high, ..
@@ -1641,6 +1717,7 @@ mod tests {
             input: Box::new(join),
             group_by: vec![group_by],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: function_name.to_string(),
                 args: vec![col(2, "o_orderkey")],
                 distinct: false,
@@ -1667,6 +1744,7 @@ mod tests {
             input: Box::new(join),
             group_by: vec![col(0, "c_custkey")],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "COUNT".to_string(),
                 args: vec![col(2, "o_orderkey")],
                 distinct: false,
@@ -1678,6 +1756,7 @@ mod tests {
 
     fn sum_expr(arg: PlanExpr) -> PlanExpr {
         PlanExpr::Function {
+            order_by: None,
             name: "SUM".to_string(),
             args: vec![arg],
             distinct: false,

@@ -427,6 +427,7 @@ fn collect_join_key_sources(
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Window { input, .. }
+        | LogicalPlan::ProjectSet { input, .. }
         | LogicalPlan::AssignUniqueId { input, .. } => {
             collect_join_key_sources(input, keys_by_table);
         }
@@ -588,6 +589,7 @@ fn collect_inner_join_equivalence_classes(
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Window { input, .. }
+        | LogicalPlan::ProjectSet { input, .. }
         | LogicalPlan::AssignUniqueId { input, .. } => {
             collect_inner_join_equivalence_classes(input, classes);
         }
@@ -645,9 +647,12 @@ fn collect_inner_join_equivalence_expr_classes(
         | PlanExpr::Cast { expr, .. } => {
             collect_inner_join_equivalence_expr_classes(expr, classes);
         }
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_inner_join_equivalence_expr_classes(arg, classes);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_inner_join_equivalence_expr_classes(&s.expr, classes);
             }
         }
         PlanExpr::Between {
@@ -662,6 +667,15 @@ fn collect_inner_join_equivalence_expr_classes(
             for item in list {
                 collect_inner_join_equivalence_expr_classes(item, classes);
             }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                collect_inner_join_equivalence_expr_classes(item, classes);
+            }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_inner_join_equivalence_expr_classes(expr, classes);
+            collect_inner_join_equivalence_expr_classes(array, classes);
         }
         PlanExpr::CaseExpr {
             operand,
@@ -708,9 +722,12 @@ fn collect_expr_join_key_blocks(
         | PlanExpr::Cast { expr, .. } => {
             collect_expr_join_key_blocks(expr, stats, root_outputs, blocked);
         }
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_expr_join_key_blocks(arg, stats, root_outputs, blocked);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_expr_join_key_blocks(&s.expr, stats, root_outputs, blocked);
             }
         }
         PlanExpr::Between {
@@ -725,6 +742,15 @@ fn collect_expr_join_key_blocks(
             for item in list {
                 collect_expr_join_key_blocks(item, stats, root_outputs, blocked);
             }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                collect_expr_join_key_blocks(item, stats, root_outputs, blocked);
+            }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_expr_join_key_blocks(expr, stats, root_outputs, blocked);
+            collect_expr_join_key_blocks(array, stats, root_outputs, blocked);
         }
         PlanExpr::CaseExpr {
             operand,
@@ -815,6 +841,12 @@ fn block_plan_sources(plan: &LogicalPlan, blocked: &mut HashSet<ColumnSource>) {
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::AssignUniqueId { input, .. } => block_plan_sources(input, blocked),
+        LogicalPlan::ProjectSet { input, srfs, .. } => {
+            block_plan_sources(input, blocked);
+            for (_, expr) in srfs {
+                blocked.extend(expr_sources(expr, input));
+            }
+        }
         LogicalPlan::Window { input, functions } => {
             block_plan_sources(input, blocked);
             for function in functions {
@@ -923,9 +955,12 @@ fn collect_expr_sources(expr: &PlanExpr, input: &LogicalPlan, sources: &mut Vec<
         | PlanExpr::IsNull { expr, .. }
         | PlanExpr::IsNotNull { expr, .. }
         | PlanExpr::Cast { expr, .. } => collect_expr_sources(expr, input, sources),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_expr_sources(arg, input, sources);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_expr_sources(&s.expr, input, sources);
             }
         }
         PlanExpr::Between {
@@ -940,6 +975,15 @@ fn collect_expr_sources(expr: &PlanExpr, input: &LogicalPlan, sources: &mut Vec<
             for item in list {
                 collect_expr_sources(item, input, sources);
             }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                collect_expr_sources(item, input, sources);
+            }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_expr_sources(expr, input, sources);
+            collect_expr_sources(array, input, sources);
         }
         PlanExpr::CaseExpr {
             operand,
@@ -992,9 +1036,12 @@ fn collect_joined_expr_sources(
         | PlanExpr::Cast { expr, .. } => {
             collect_joined_expr_sources(expr, left_input, right_input, sources);
         }
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_joined_expr_sources(arg, left_input, right_input, sources);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_joined_expr_sources(&s.expr, left_input, right_input, sources);
             }
         }
         PlanExpr::Between {
@@ -1009,6 +1056,15 @@ fn collect_joined_expr_sources(
             for item in list {
                 collect_joined_expr_sources(item, left_input, right_input, sources);
             }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                collect_joined_expr_sources(item, left_input, right_input, sources);
+            }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_joined_expr_sources(expr, left_input, right_input, sources);
+            collect_joined_expr_sources(array, left_input, right_input, sources);
         }
         PlanExpr::CaseExpr {
             operand,
@@ -1327,8 +1383,12 @@ fn rewrite_expr(
             name,
             args,
             distinct,
+            order_by,
             span,
         } => PlanExpr::Function {
+            order_by: crate::plan::SortExpr::map_exprs(order_by, &mut |e| {
+                rewrite_expr(e, stats, root_outputs, blocked)
+            }),
             name,
             args: args
                 .into_iter()
@@ -1370,6 +1430,26 @@ fn rewrite_expr(
                 .map(|item| rewrite_expr(item, stats, root_outputs, blocked))
                 .collect(),
             negated,
+            span,
+        },
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains(expr, array, negated, span, |e| {
+            rewrite_expr(e, stats, root_outputs, blocked)
+        }),
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => PlanExpr::Array {
+            elements: elements
+                .into_iter()
+                .map(|item| rewrite_expr(item, stats, root_outputs, blocked))
+                .collect(),
+            element_type,
             span,
         },
         PlanExpr::Cast {
@@ -2063,6 +2143,7 @@ mod tests {
             input: Box::new(filtered),
             group_by: vec![],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "COUNT".to_string(),
                 args: vec![lit_i64(1)],
                 distinct: false,
@@ -2183,6 +2264,7 @@ mod tests {
                 input: Box::new(filtered),
                 group_by: vec![col(3, "l_shipmode")],
                 aggr_exprs: vec![PlanExpr::Function {
+                    order_by: None,
                     name: "COUNT".to_string(),
                     args: vec![lit_i64(1)],
                     distinct: false,
@@ -2326,6 +2408,13 @@ mod tests {
             | LogicalPlan::Explain { input, .. }
             | LogicalPlan::Distinct { input }
             | LogicalPlan::AssignUniqueId { input, .. } => assert_schema_lengths_consistent(input),
+            LogicalPlan::ProjectSet { input, srfs, .. } => {
+                assert_eq!(plan.schema().len(), input.schema().len() + srfs.len());
+                for (_, expr) in srfs {
+                    assert_expr_schema_lengths_consistent(expr);
+                }
+                assert_schema_lengths_consistent(input);
+            }
             LogicalPlan::Window { input, functions } => {
                 assert_eq!(plan.schema().len(), input.schema().len() + functions.len());
                 for function in functions {
@@ -2425,6 +2514,15 @@ mod tests {
                 for item in list {
                     assert_expr_schema_lengths_consistent(item);
                 }
+            }
+            PlanExpr::Array { elements, .. } => {
+                for item in elements {
+                    assert_expr_schema_lengths_consistent(item);
+                }
+            }
+            PlanExpr::ArrayContains { expr, array, .. } => {
+                assert_expr_schema_lengths_consistent(expr);
+                assert_expr_schema_lengths_consistent(array);
             }
             PlanExpr::CaseExpr {
                 operand,
@@ -2535,6 +2633,15 @@ mod tests {
                 for item in list {
                     assert_expr_subquery_key_types_match(item);
                 }
+            }
+            PlanExpr::Array { elements, .. } => {
+                for item in elements {
+                    assert_expr_subquery_key_types_match(item);
+                }
+            }
+            PlanExpr::ArrayContains { expr, array, .. } => {
+                assert_expr_subquery_key_types_match(expr);
+                assert_expr_subquery_key_types_match(array);
             }
             PlanExpr::CaseExpr {
                 operand,
@@ -3412,6 +3519,7 @@ mod tests {
             input: Box::new(join),
             group_by: Vec::new(),
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "SUM".to_string(),
                 args: vec![revenue_arg],
                 distinct: false,

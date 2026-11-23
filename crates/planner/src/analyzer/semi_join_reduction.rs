@@ -333,6 +333,11 @@ fn recurse_children<F: FnMut(LogicalPlan) -> LogicalPlan>(
             input: Box::new(f(*input)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(Box::new(f(*input)), srfs, schema),
         L::AssignUniqueId { input, id_column } => L::AssignUniqueId {
             input: Box::new(f(*input)),
             id_column,
@@ -856,6 +861,7 @@ ORDER BY s_name";
                 input: Box::new(scan("lineitem", &["l_partkey", "l_suppkey", "l_quantity"])),
                 group_by: vec![col(0, "l_partkey"), col(1, "l_suppkey")],
                 aggr_exprs: vec![PlanExpr::Function {
+                    order_by: None,
                     name: "SUM".to_string(),
                     args: vec![col(2, "l_quantity")],
                     distinct: false,

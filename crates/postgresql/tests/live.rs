@@ -409,6 +409,7 @@ async fn limit_and_empty_projection() {
     assert_eq!(rows(&limited), 5);
     // An untranslatable filter disables the remote LIMIT.
     let local = PlanExpr::Function {
+        order_by: None,
         name: "upper".into(),
         args: vec![col(1)],
         distinct: false,

@@ -271,6 +271,11 @@ fn push_down(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(push_down(*input)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(Box::new(push_down(*input)), srfs, schema),
         L::Distinct { input } => L::Distinct {
             input: Box::new(push_down(*input)),
         },
@@ -1090,9 +1095,21 @@ fn visit_column_pairs<F: FnMut(&str, usize)>(expr: &PlanExpr, callback: &mut F) 
                 visit_column_pairs(item, callback);
             }
         }
-        E::Function { args, .. } => {
+        E::Array { elements, .. } => {
+            for item in elements {
+                visit_column_pairs(item, callback);
+            }
+        }
+        E::ArrayContains { expr, array, .. } => {
+            visit_column_pairs(expr, callback);
+            visit_column_pairs(array, callback);
+        }
+        E::Function { args, order_by, .. } => {
             for a in args {
                 visit_column_pairs(a, callback);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                visit_column_pairs(&s.expr, callback);
             }
         }
         E::CaseExpr {
@@ -1211,19 +1228,31 @@ fn expr_struct_eq(a: &PlanExpr, b: &PlanExpr) -> bool {
                 name: n1,
                 args: a1,
                 distinct: d1,
+                order_by: o1,
                 ..
             },
             E::Function {
                 name: n2,
                 args: a2,
                 distinct: d2,
+                order_by: o2,
                 ..
             },
         ) => {
+            let (o1, o2) = (
+                o1.as_deref().map_or(&[][..], Vec::as_slice),
+                o2.as_deref().map_or(&[][..], Vec::as_slice),
+            );
             n1 == n2
                 && d1 == d2
                 && a1.len() == a2.len()
                 && a1.iter().zip(a2.iter()).all(|(x, y)| expr_struct_eq(x, y))
+                && o1.len() == o2.len()
+                && o1.iter().zip(o2).all(|(x, y)| {
+                    x.asc == y.asc
+                        && x.nulls_first == y.nulls_first
+                        && expr_struct_eq(&x.expr, &y.expr)
+                })
         }
         (E::Wildcard, E::Wildcard) => true,
         (
@@ -1325,9 +1354,21 @@ fn visit_column_names<F: FnMut(&str)>(expr: &PlanExpr, callback: &mut F) {
                 visit_column_names(item, callback);
             }
         }
-        E::Function { args, .. } => {
+        E::Array { elements, .. } => {
+            for item in elements {
+                visit_column_names(item, callback);
+            }
+        }
+        E::ArrayContains { expr, array, .. } => {
+            visit_column_names(expr, callback);
+            visit_column_names(array, callback);
+        }
+        E::Function { args, order_by, .. } => {
             for a in args {
                 visit_column_names(a, callback);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                visit_column_names(&s.expr, callback);
             }
         }
         E::CaseExpr {
@@ -1440,6 +1481,27 @@ fn rewrite_expr(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<PlanExpr> {
             negated: *negated,
             span: *span,
         },
+        E::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::try_map_array_contains_ref(expr, array, *negated, *span, |e| {
+            rewrite_expr(e, schema).ok_or(())
+        })
+        .ok()?,
+        E::Array {
+            elements,
+            element_type,
+            span,
+        } => E::Array {
+            elements: elements
+                .iter()
+                .map(|e| rewrite_expr(e, schema))
+                .collect::<Option<Vec<_>>>()?,
+            element_type: element_type.clone(),
+            span: *span,
+        },
         E::Cast {
             expr,
             data_type,
@@ -1453,8 +1515,12 @@ fn rewrite_expr(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<PlanExpr> {
             name,
             args,
             distinct,
+            order_by,
             span,
         } => E::Function {
+            order_by: crate::plan::SortExpr::try_map_exprs_ref(order_by, &mut |e| {
+                rewrite_expr(e, schema)
+            })?,
             name: name.clone(),
             args: args
                 .iter()

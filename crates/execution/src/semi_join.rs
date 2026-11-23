@@ -3173,9 +3173,12 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             collect_column_indices(right, cb);
         }
         PlanExpr::UnaryOp { expr, .. } => collect_column_indices(expr, cb),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for a in args {
                 collect_column_indices(a, cb);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_column_indices(&s.expr, cb);
             }
         }
         PlanExpr::IsNull { expr, .. } | PlanExpr::IsNotNull { expr, .. } => {
@@ -3186,6 +3189,15 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             for e in list {
                 collect_column_indices(e, cb);
             }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for e in elements {
+                collect_column_indices(e, cb);
+            }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_column_indices(expr, cb);
+            collect_column_indices(array, cb);
         }
         PlanExpr::Between {
             expr, low, high, ..
@@ -3256,8 +3268,12 @@ fn remap_column_indices(
             name,
             args,
             distinct,
+            order_by,
             span,
         } => PlanExpr::Function {
+            order_by: arneb_planner::SortExpr::map_exprs(order_by, &mut |e| {
+                remap_column_indices(e, remap)
+            }),
             name,
             args: args
                 .into_iter()
@@ -3286,6 +3302,26 @@ fn remap_column_indices(
                 .map(|e| remap_column_indices(e, remap))
                 .collect(),
             negated,
+            span,
+        },
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => arneb_planner::map_array_contains(expr, array, negated, span, |e| {
+            remap_column_indices(e, remap)
+        }),
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => PlanExpr::Array {
+            elements: elements
+                .into_iter()
+                .map(|e| remap_column_indices(e, remap))
+                .collect(),
+            element_type,
             span,
         },
         PlanExpr::Between {

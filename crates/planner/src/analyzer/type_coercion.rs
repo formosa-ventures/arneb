@@ -369,6 +369,11 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
             sql,
             plan: Box::new(analyze_plan(*plan, ctx)?),
         }),
+        LogicalPlan::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => analyze_project_set(*input, srfs, schema, ctx),
         LogicalPlan::Window { input, functions } => Ok(LogicalPlan::Window {
             input: Box::new(analyze_plan(*input, ctx)?),
             functions,
@@ -388,9 +393,48 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
     }
 }
 
+/// Out of line so the recursive `analyze_plan` frame stays small.
+#[inline(never)]
+fn analyze_project_set(
+    input: LogicalPlan,
+    srfs: Vec<(crate::plan::SrfKind, PlanExpr)>,
+    schema: Vec<ColumnInfo>,
+    ctx: &mut AnalyzerContext,
+) -> Result<LogicalPlan, PlanError> {
+    let input = analyze_plan(input, ctx)?;
+    let input_schema = input.schema();
+    let srfs = srfs
+        .into_iter()
+        .map(|(kind, e)| Ok((kind, coerce_expr(e, &input_schema, ctx)?)))
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    Ok(LogicalPlan::rebuild_project_set(
+        Box::new(input),
+        srfs,
+        schema,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Expression walker
 // ---------------------------------------------------------------------------
+
+/// Out-of-line so the recursive `coerce_expr` frame stays small.
+#[inline(never)]
+fn coerce_order_by(
+    order_by: Option<Box<Vec<crate::plan::SortExpr>>>,
+    schema: &[ColumnInfo],
+    ctx: &mut AnalyzerContext,
+) -> Result<Option<Box<Vec<crate::plan::SortExpr>>>, PlanError> {
+    let Some(v) = order_by else { return Ok(None) };
+    let mut out = Vec::with_capacity(v.len());
+    for s in *v {
+        out.push(crate::plan::SortExpr {
+            expr: coerce_expr(s.expr, schema, ctx)?,
+            ..s
+        });
+    }
+    Ok(Some(Box::new(out)))
+}
 
 fn coerce_expr(
     expr: PlanExpr,
@@ -468,6 +512,19 @@ fn coerce_expr(
                 span,
             })
         }
+        PlanExpr::Array { elements, span, .. } => {
+            let elements = elements
+                .into_iter()
+                .map(|e| coerce_expr(e, schema, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            unify_array(elements, schema, span)
+        }
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => coerce_array_contains(*expr, *array, negated, span, schema, ctx),
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -509,6 +566,7 @@ fn coerce_expr(
             name,
             args,
             distinct,
+            order_by,
             span,
         } => {
             // Coerce children but do not unify argument types against
@@ -528,7 +586,9 @@ fn coerce_expr(
                 let arg = args.remove(0);
                 args.insert(0, pad_char_operand(arg, schema));
             }
+            let order_by = coerce_order_by(order_by, schema, ctx)?;
             Ok(PlanExpr::Function {
+                order_by,
                 name,
                 args,
                 distinct,
@@ -665,6 +725,7 @@ fn pad_char_operand(expr: PlanExpr, schema: &[ColumnInfo]) -> PlanExpr {
         return expr;
     };
     PlanExpr::Function {
+        order_by: None,
         name: "rpad".to_string(),
         args: vec![
             expr,
@@ -749,6 +810,161 @@ fn unify_in_list(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok((maybe_cast(expr, &et, &target, expr_lit, location)?, list))
+}
+
+/// `coerce_expr` for [`PlanExpr::ArrayContains`], out of line so the
+/// recursive `coerce_expr` frame stays small.
+#[inline(never)]
+fn coerce_array_contains(
+    expr: PlanExpr,
+    array: PlanExpr,
+    negated: bool,
+    span: Option<arneb_sql_parser::Span>,
+    schema: &[ColumnInfo],
+    ctx: &mut AnalyzerContext,
+) -> Result<PlanExpr, PlanError> {
+    let expr = coerce_expr(expr, schema, ctx)?;
+    let array = coerce_expr(array, schema, ctx)?;
+    let (expr, array) = unify_array_contains(expr, array, schema, span.map(|s| s.start), ctx)?;
+    Ok(PlanExpr::ArrayContains {
+        expr: Box::new(expr),
+        array: Box::new(array),
+        negated,
+        span,
+    })
+}
+
+/// Aligns the operands of `expr = ANY (array)`: the array must be a
+/// `List(t)`; `expr` and the array's elements are cast to their common
+/// supertype. An untyped `$n` on either side takes its type from the other
+/// (`$n` in the array position is `List(type of expr)`), and a bare NULL
+/// array is a NULL of `List(type of expr)`.
+#[inline(never)]
+fn unify_array_contains(
+    expr: PlanExpr,
+    array: PlanExpr,
+    schema: &[ColumnInfo],
+    location: Option<arneb_common::error::Location>,
+    ctx: &mut AnalyzerContext,
+) -> Result<(PlanExpr, PlanExpr), PlanError> {
+    let unbound = |e: &PlanExpr| {
+        matches!(
+            e,
+            PlanExpr::Parameter {
+                type_hint: None,
+                ..
+            }
+        )
+    };
+    let mut expr = expr;
+    let mut array = array;
+    if unbound(&array) {
+        if let Some(t) = plan_expr_type(&expr, schema).filter(|t| *t != DataType::Null) {
+            array =
+                record_and_annotate_parameter(array, &DataType::List(Box::new(t)), location, ctx)?;
+        }
+    } else if unbound(&expr) {
+        if let Some(DataType::List(t)) = plan_expr_type(&array, schema) {
+            expr = record_and_annotate_parameter(expr, &t, location, ctx)?;
+        }
+    }
+    let (Some(lt), Some(at)) = (
+        plan_expr_type(&expr, schema),
+        plan_expr_type(&array, schema),
+    ) else {
+        return Ok((expr, array));
+    };
+    let element = match at.clone() {
+        DataType::List(t) => *t,
+        // `x = ANY ('{1,2}')`: a string literal on the array side is an
+        // array literal of the element type, as in PostgreSQL.
+        DataType::Null | DataType::Utf8
+            if lt != DataType::Null
+                && (at == DataType::Null
+                    || matches!(
+                        &array,
+                        PlanExpr::Literal {
+                            value: ScalarValue::Utf8(_),
+                            ..
+                        }
+                    )) =>
+        {
+            let target = DataType::List(Box::new(lt.clone()));
+            let array = PlanExpr::Cast {
+                expr: Box::new(array),
+                data_type: target,
+                span: None,
+            };
+            return Ok((expr, array));
+        }
+        found => {
+            return Err(PlanError::TypeMismatch {
+                expected: DataType::List(Box::new(lt)),
+                found,
+                location,
+            })
+        }
+    };
+    if lt == element || lt == DataType::Null {
+        return Ok((expr, array));
+    }
+    let site = CoercionSite::Binary {
+        left_is_literal: is_literal_like(&expr),
+        right_is_literal: false,
+    };
+    let supertype =
+        common_supertype(&lt, &element, site).ok_or_else(|| PlanError::TypeMismatch {
+            expected: lt.clone(),
+            found: element.clone(),
+            location,
+        })?;
+    let expr_lit = is_literal_like(&expr);
+    let expr = maybe_cast(expr, &lt, &supertype, expr_lit, location)?;
+    let array = if supertype == element {
+        array
+    } else {
+        PlanExpr::Cast {
+            expr: Box::new(array),
+            data_type: DataType::List(Box::new(supertype)),
+            span: None,
+        }
+    };
+    Ok((expr, array))
+}
+
+/// Casts every element of an `ARRAY[...]` to the common supertype of the
+/// elements (the `CASE` branch rules), and records it as `element_type`.
+fn unify_array(
+    elements: Vec<PlanExpr>,
+    schema: &[ColumnInfo],
+    span: Option<arneb_sql_parser::Span>,
+) -> Result<PlanExpr, PlanError> {
+    let location = span.map(|s| s.start);
+    let types: Vec<Option<DataType>> = elements.iter().map(|e| plan_expr_type(e, schema)).collect();
+    let element_type =
+        super::array_element_type(&elements, schema).map_err(|(expected, found)| {
+            PlanError::TypeMismatch {
+                expected,
+                found,
+                location,
+            }
+        })?;
+    let elements = elements
+        .into_iter()
+        .zip(types)
+        .map(|(e, t)| match t {
+            Some(t) if t != element_type => {
+                let lit = is_literal_like(&e);
+                maybe_cast(e, &t, &element_type, lit, location)
+            }
+            _ => Ok(e),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PlanExpr::Array {
+        elements,
+        element_type,
+        span,
+    })
 }
 
 #[allow(clippy::type_complexity)]
@@ -1110,8 +1326,7 @@ pub(super) fn walk_plan_exprs(
                 .into_iter()
                 .map(|s| SortExpr {
                     expr: walk_expr(s.expr, f),
-                    asc: s.asc,
-                    nulls_first: s.nulls_first,
+                    ..s
                 })
                 .collect(),
         },
@@ -1259,6 +1474,21 @@ pub(super) fn walk_expr(expr: PlanExpr, f: &mut dyn FnMut(PlanExpr) -> PlanExpr)
             negated,
             span,
         },
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains(expr, array, negated, span, |e| walk_expr(e, f)),
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => PlanExpr::Array {
+            elements: elements.into_iter().map(|e| walk_expr(e, f)).collect(),
+            element_type,
+            span,
+        },
         PlanExpr::Cast {
             expr,
             data_type,
@@ -1286,8 +1516,10 @@ pub(super) fn walk_expr(expr: PlanExpr, f: &mut dyn FnMut(PlanExpr) -> PlanExpr)
             name,
             args,
             distinct,
+            order_by,
             span,
         } => PlanExpr::Function {
+            order_by: crate::plan::SortExpr::map_exprs(order_by, &mut |e| walk_expr(e, f)),
             name,
             args: args.into_iter().map(|a| walk_expr(a, f)).collect(),
             distinct,

@@ -2021,6 +2021,49 @@ struct AggrInfo {
     args: Vec<PlanExpr>,
     is_count_star: bool,
     distinct: bool,
+    /// `ARRAY_AGG` only: the ORDER BY keys (possibly none).
+    order: Vec<(PlanExpr, bool, bool)>,
+}
+
+impl AggrInfo {
+    fn new(
+        name: &str,
+        args: &[PlanExpr],
+        order_by: Option<&[arneb_planner::SortExpr]>,
+        is_count_star: bool,
+        distinct: bool,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            args: args.to_vec(),
+            is_count_star,
+            distinct,
+            order: order_by
+                .unwrap_or_default()
+                .iter()
+                .map(|k| (k.expr.clone(), k.asc, k.nulls_first))
+                .collect(),
+        }
+    }
+
+    /// Evaluates the aggregate's input column for `batch`. `ARRAY_AGG`
+    /// receives its value and ORDER BY keys packed into one struct (see
+    /// [`aggregate::pack_array_agg_input`]); every other aggregate gets its
+    /// first argument.
+    fn eval_arg(&self, batch: &RecordBatch) -> Result<ArrayRef, ExecutionError> {
+        if self.name.eq_ignore_ascii_case("ARRAY_AGG") {
+            let value = expression::evaluate(&self.args[0], batch, None)?;
+            let keys = self
+                .order
+                .iter()
+                .map(|(e, asc, nulls_first)| {
+                    expression::evaluate(e, batch, None).map(|a| (a, *asc, *nulls_first))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return aggregate::pack_array_agg_input(value, keys);
+        }
+        expression::evaluate(&self.args[0], batch, None)
+    }
 }
 
 fn agg_spill_enabled() -> bool {
@@ -2138,16 +2181,18 @@ impl HashAggregateExec {
                     name,
                     args,
                     distinct,
+                    order_by,
                     ..
                 } => {
                     let is_count_star =
                         args.is_empty() || args.iter().any(|a| matches!(a, PlanExpr::Wildcard));
-                    Ok(AggrInfo {
-                        name: name.clone(),
-                        args: args.clone(),
+                    Ok(AggrInfo::new(
+                        name,
+                        args,
+                        order_by.as_deref().map(Vec::as_slice),
                         is_count_star,
-                        distinct: *distinct,
-                    })
+                        *distinct,
+                    ))
                 }
                 other => Err(ExecutionError::InvalidOperation(format!(
                     "expected aggregate function, got {other:?}"
@@ -2176,7 +2221,7 @@ impl HashAggregateExec {
                     if info.is_count_star {
                         count_star_input_array(&count_star_column(&batch))
                     } else {
-                        expression::evaluate(&info.args[0], &batch, None)
+                        info.eval_arg(&batch)
                             .and_then(|c| materialize_dictionary_array(&c))
                     }
                 })
@@ -2235,7 +2280,7 @@ impl HashAggregateExec {
                 let col = if info.is_count_star {
                     count_star_column(&batch)
                 } else {
-                    expression::evaluate(&info.args[0], &batch, None)?
+                    info.eval_arg(&batch)?
                 };
                 accumulators[i].update_batch(&col)?;
             }
@@ -2264,16 +2309,18 @@ impl HashAggregateExec {
                         name,
                         args,
                         distinct,
+                        order_by,
                         ..
                     } => {
                         let is_count_star =
                             args.is_empty() || args.iter().any(|a| matches!(a, PlanExpr::Wildcard));
-                        Ok(AggrInfo {
-                            name: name.clone(),
-                            args: args.clone(),
+                        Ok(AggrInfo::new(
+                            name,
+                            args,
+                            order_by.as_deref().map(Vec::as_slice),
                             is_count_star,
-                            distinct: *distinct,
-                        })
+                            *distinct,
+                        ))
                     }
                     other => Err(ExecutionError::InvalidOperation(format!(
                         "expected aggregate function, got {other:?}"
@@ -2374,16 +2421,18 @@ impl HashAggregateExec {
                     name,
                     args,
                     distinct,
+                    order_by,
                     ..
                 } => {
                     let is_count_star =
                         args.is_empty() || args.iter().any(|a| matches!(a, PlanExpr::Wildcard));
-                    Ok(AggrInfo {
-                        name: name.clone(),
-                        args: args.clone(),
+                    Ok(AggrInfo::new(
+                        name,
+                        args,
+                        order_by.as_deref().map(Vec::as_slice),
                         is_count_star,
-                        distinct: *distinct,
-                    })
+                        *distinct,
+                    ))
                 }
                 other => Err(ExecutionError::InvalidOperation(format!(
                     "expected aggregate function, got {other:?}"
@@ -2436,7 +2485,7 @@ impl HashAggregateExec {
                     if info.is_count_star {
                         count_star_input_array(&count_star_column(&batch))
                     } else {
-                        expression::evaluate(&info.args[0], &batch, None)
+                        info.eval_arg(&batch)
                             .and_then(|c| materialize_dictionary_array(&c))
                     }
                 })
@@ -2560,7 +2609,7 @@ impl HashAggregateExec {
                         if info.is_count_star {
                             count_star_input_array(&count_star_column(&batch))
                         } else {
-                            expression::evaluate(&info.args[0], &batch, None)
+                            info.eval_arg(&batch)
                                 .and_then(|c| materialize_dictionary_array(&c))
                         }
                     })
@@ -2610,7 +2659,7 @@ impl HashAggregateExec {
                 let col = if info.is_count_star {
                     count_star_column(&batch)
                 } else {
-                    expression::evaluate(&info.args[0], &batch, None)?
+                    info.eval_arg(&batch)?
                 };
                 accs[i].add_input(&group_ids, &col)?;
             }
@@ -2677,16 +2726,18 @@ impl HashAggregateExec {
                         name,
                         args,
                         distinct,
+                        order_by,
                         ..
                     } => {
                         let is_count_star =
                             args.is_empty() || args.iter().any(|a| matches!(a, PlanExpr::Wildcard));
-                        Ok(AggrInfo {
-                            name: name.clone(),
-                            args: args.clone(),
+                        Ok(AggrInfo::new(
+                            name,
+                            args,
+                            order_by.as_deref().map(Vec::as_slice),
                             is_count_star,
-                            distinct: *distinct,
-                        })
+                            *distinct,
+                        ))
                     }
                     other => Err(ExecutionError::InvalidOperation(format!(
                         "expected aggregate function, got {other:?}"
@@ -2819,16 +2870,18 @@ impl HashAggregateExec {
                         name,
                         args,
                         distinct,
+                        order_by,
                         ..
                     } => {
                         let is_count_star =
                             args.is_empty() || args.iter().any(|a| matches!(a, PlanExpr::Wildcard));
-                        Ok(AggrInfo {
-                            name: name.clone(),
-                            args: args.clone(),
+                        Ok(AggrInfo::new(
+                            name,
+                            args,
+                            order_by.as_deref().map(Vec::as_slice),
                             is_count_star,
-                            distinct: *distinct,
-                        })
+                            *distinct,
+                        ))
                     }
                     other => Err(ExecutionError::InvalidOperation(format!(
                         "expected aggregate function, got {other:?}"
@@ -3033,7 +3086,7 @@ async fn build_partial_groups(
                 let col = if info.is_count_star {
                     count_star_column(&batch)
                 } else {
-                    expression::evaluate(&info.args[0], &batch, None)?
+                    info.eval_arg(&batch)?
                 };
                 bucket[i].update_batch(&col)?;
             }
@@ -3059,7 +3112,7 @@ async fn build_partial_groups(
                 if info.is_count_star {
                     count_star_input_array(&count_star_column(&batch))
                 } else {
-                    expression::evaluate(&info.args[0], &batch, None)
+                    info.eval_arg(&batch)
                         .and_then(|c| materialize_dictionary_array(&c))
                 }
             })
@@ -3134,7 +3187,7 @@ async fn build_partial_groups_batch_aware(
                 let col = if info.is_count_star {
                     count_star_column(&batch)
                 } else {
-                    expression::evaluate(&info.args[0], &batch, None)?
+                    info.eval_arg(&batch)?
                 };
                 accs[i].add_input(&group_ids, &col)?;
             }
@@ -3160,7 +3213,7 @@ async fn build_partial_groups_batch_aware(
                 if info.is_count_star {
                     count_star_input_array(&count_star_column(&batch))
                 } else {
-                    expression::evaluate(&info.args[0], &batch, None)
+                    info.eval_arg(&batch)
                         .and_then(|c| materialize_dictionary_array(&c))
                 }
             })
@@ -3722,16 +3775,18 @@ impl ExecutionPlan for StreamingHashAggregateExec {
                     name,
                     args,
                     distinct,
+                    order_by,
                     ..
                 } => {
                     let is_count_star =
                         args.is_empty() || args.iter().any(|a| matches!(a, PlanExpr::Wildcard));
-                    Ok(AggrInfo {
-                        name: name.clone(),
-                        args: args.clone(),
+                    Ok(AggrInfo::new(
+                        name,
+                        args,
+                        order_by.as_deref().map(Vec::as_slice),
                         is_count_star,
-                        distinct: *distinct,
-                    })
+                        *distinct,
+                    ))
                 }
                 other => Err(ExecutionError::InvalidOperation(format!(
                     "expected aggregate function, got {other:?}"
@@ -3788,7 +3843,7 @@ impl ExecutionPlan for StreamingHashAggregateExec {
                     if info.is_count_star {
                         count_star_input_array(&count_star_column(batch))
                     } else {
-                        expression::evaluate(&info.args[0], batch, None)
+                        info.eval_arg(batch)
                             .and_then(|c| materialize_dictionary_array(&c))
                     }
                 })
@@ -4052,7 +4107,7 @@ impl ExecutionPlan for AssignUniqueIdExec {
 // ===========================================================================
 
 /// A stream that applies a mapping function to each batch from an input stream.
-struct MapStream<F> {
+pub(crate) struct MapStream<F> {
     input: SendableRecordBatchStream,
     schema: arrow::datatypes::SchemaRef,
     map_fn: F,
@@ -4062,7 +4117,7 @@ impl<F> MapStream<F>
 where
     F: FnMut(RecordBatch) -> Result<RecordBatch, ExecutionError> + Send + Unpin,
 {
-    fn new(
+    pub(crate) fn new(
         input: SendableRecordBatchStream,
         schema: arrow::datatypes::SchemaRef,
         map_fn: F,
@@ -4940,12 +4995,14 @@ mod tests {
             group_by: vec![],
             aggr_exprs: vec![
                 PlanExpr::Function {
+                    order_by: None,
                     name: "COUNT".to_string(),
                     args: vec![],
                     distinct: false,
                     span: None,
                 },
                 PlanExpr::Function {
+                    order_by: None,
                     name: "SUM".to_string(),
                     args: vec![PlanExpr::Column {
                         index: 2,
@@ -5049,6 +5106,7 @@ mod tests {
         }];
         let partial_aggr_exprs = vec![
             PlanExpr::Function {
+                order_by: None,
                 name: "SUM".to_string(),
                 args: vec![PlanExpr::Column {
                     index: 1,
@@ -5059,6 +5117,7 @@ mod tests {
                 span: None,
             },
             PlanExpr::Function {
+                order_by: None,
                 name: "SUM".to_string(),
                 args: vec![PlanExpr::Column {
                     index: 2,
@@ -5071,6 +5130,7 @@ mod tests {
         ];
         let final_aggr_exprs = vec![
             PlanExpr::Function {
+                order_by: None,
                 name: "SUM".to_string(),
                 args: vec![PlanExpr::Column {
                     index: 1,
@@ -5081,6 +5141,7 @@ mod tests {
                 span: None,
             },
             PlanExpr::Function {
+                order_by: None,
                 name: "SUM".to_string(),
                 args: vec![PlanExpr::Column {
                     index: 2,
@@ -5228,6 +5289,7 @@ mod tests {
                     span: None,
                 }],
                 aggr_exprs: vec![PlanExpr::Function {
+                    order_by: None,
                     name: "COUNT".to_string(),
                     args: vec![],
                     distinct: false,
@@ -5379,6 +5441,7 @@ mod tests {
             span: None,
         }];
         let aggr_exprs = vec![PlanExpr::Function {
+            order_by: None,
             name: "SUM".to_string(),
             args: vec![PlanExpr::Column {
                 index: 1,
@@ -5552,30 +5615,35 @@ mod tests {
         };
         let aggr_exprs = vec![
             PlanExpr::Function {
+                order_by: None,
                 name: "SUM".to_string(),
                 args: vec![value_col()],
                 distinct: false,
                 span: None,
             },
             PlanExpr::Function {
+                order_by: None,
                 name: "COUNT".to_string(),
                 args: vec![value_col()],
                 distinct: false,
                 span: None,
             },
             PlanExpr::Function {
+                order_by: None,
                 name: "AVG".to_string(),
                 args: vec![value_col()],
                 distinct: false,
                 span: None,
             },
             PlanExpr::Function {
+                order_by: None,
                 name: "MIN".to_string(),
                 args: vec![value_col()],
                 distinct: false,
                 span: None,
             },
             PlanExpr::Function {
+                order_by: None,
                 name: "MAX".to_string(),
                 args: vec![value_col()],
                 distinct: false,
@@ -5747,6 +5815,7 @@ mod tests {
             },
         ];
         let aggr_exprs = vec![PlanExpr::Function {
+            order_by: None,
             name: "SUM".to_string(),
             args: vec![PlanExpr::BinaryOp {
                 left: Box::new(PlanExpr::Column {
@@ -5910,6 +5979,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "COUNT".to_string(),
                 args: vec![PlanExpr::Column {
                     index: 1,
@@ -6010,6 +6080,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "COUNT".to_string(),
                 args: vec![PlanExpr::Column {
                     index: 1,
@@ -6097,6 +6168,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "COUNT".to_string(),
                 args: vec![PlanExpr::Column {
                     index: 1,

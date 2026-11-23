@@ -4,6 +4,7 @@
 
 //! Shared types, error handling, and configuration for arneb.
 
+pub mod array_text;
 pub mod catalog_version;
 pub mod config;
 pub mod diagnostic;

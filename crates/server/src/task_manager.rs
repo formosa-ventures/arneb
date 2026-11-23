@@ -581,6 +581,7 @@ impl TaskManager {
 
         let query_id = descriptor.query_id;
         let task_key = task_id_str.clone();
+        let report_to = self.coord_address.clone();
         let tracker = self.clone();
         // The body starts only once it is tracked, so a cancel racing this
         // submission either aborts it or makes `track` refuse it.
@@ -597,6 +598,25 @@ impl TaskManager {
                 }
                 Err(e) => {
                     tracing::error!(task_id = %task_id_for_cleanup, error = %e, "task failed");
+                    // #279: tell the coordinator now, so it fails the query
+                    // with this error rather than with a consumer's later,
+                    // knock-on one. Best effort: a lost report only delays
+                    // the failure until a consumer reads this task's output.
+                    if let Some(coord) = report_to {
+                        let report =
+                            arneb_rpc::TaskFailureReport::new(query_id, task_id_str.clone(), &e);
+                        tokio::spawn(async move {
+                            if let Err(err) = arneb_rpc::report_task_failure(&coord, &report).await
+                            {
+                                tracing::warn!(
+                                    target: "arneb::cluster",
+                                    task_id = %report.task_id,
+                                    error = %err,
+                                    "task failure report to the coordinator failed"
+                                );
+                            }
+                        });
+                    }
                     let mut statuses = manager.task_statuses.write().unwrap();
                     statuses.insert(task_id_str, TaskStatus::Failed(e));
                 }
@@ -2601,6 +2621,85 @@ mod tests {
             "expected ResourceExhausted, got {err:?}"
         );
         assert!(err.to_string().contains("memory limit"), "{err}");
+    }
+
+    /// #279: a failed task reports itself to the coordinator right away,
+    /// with its class, without waiting for a consumer to read its output.
+    #[tokio::test]
+    async fn a_failed_task_reports_to_the_coordinator_with_its_class() {
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+        use arneb_execution::memory_pool::GreedyMemoryPool;
+
+        let ids = Int32Array::from((0..10_000).collect::<Vec<_>>());
+        let rows = RecordBatch::try_new(schema(), vec![Arc::new(ids)]).unwrap();
+        let table = Arc::new(MemoryTable::new(
+            vec![arneb_common::types::ColumnInfo {
+                name: "id".into(),
+                data_type: arneb_common::types::DataType::Int32,
+                nullable: false,
+            }],
+            vec![rows],
+        ));
+        let mem_schema = Arc::new(MemorySchema::new());
+        mem_schema.register_table("t", table);
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("default", mem_schema);
+        let cm = Arc::new(CatalogManager::new("memory", "default"));
+        cm.register_catalog("memory", catalog.clone());
+        let registry = ConnectorRegistry::new();
+        registry.register(
+            "memory",
+            Arc::new(MemoryConnectorFactory::new(catalog, "default")),
+        );
+        let statement = arneb_sql_parser::parse("SELECT id, count(*) FROM t GROUP BY id").unwrap();
+        let plan = arneb_planner::QueryPlanner::new(&cm)
+            .plan_statement(&statement)
+            .await
+            .unwrap();
+
+        // The coordinator: a Flight server that records failure reports.
+        let (tx, mut reports) = tokio::sync::mpsc::unbounded_channel();
+        let mut coord = FlightState::new();
+        coord.set_task_failure_callback(Arc::new(move |report| {
+            let _ = tx.send(report);
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(arneb_rpc::__serve_flight_for_test(listener, coord));
+
+        let tm = TaskManager::with_admission_gate(
+            FlightState::new(),
+            cm,
+            Arc::new(registry),
+            Arc::new(GreedyMemoryPool::new(1 << 30)),
+            None,
+            Some(coord_addr),
+        )
+        .with_query_memory_limit(Some(1024));
+        let q = QueryId::new();
+        let mut task = descriptor(q);
+        task.plan_json = serde_json::to_string(&plan).unwrap();
+        tm.handle_task(task);
+
+        // No consumer ever reads the task's output.
+        let report = tokio::time::timeout(std::time::Duration::from_secs(10), reports.recv())
+            .await
+            .expect("the failure is reported without a consumer")
+            .unwrap();
+        assert_eq!(report.query_id, q);
+        assert!(
+            report.task_id.starts_with(&q.to_string()),
+            "{}",
+            report.task_id
+        );
+        assert!(report.resource_exhausted, "{report:?}");
+        assert!(
+            report.message.contains("memory limit"),
+            "{}",
+            report.message
+        );
     }
 
     #[test]

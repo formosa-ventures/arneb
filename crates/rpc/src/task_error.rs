@@ -97,6 +97,69 @@ impl TaskFailure {
     }
 }
 
+impl TaskFailure {
+    /// The error a coordinator raises for this failure: `ResourceExhausted`
+    /// with the worker's message for a memory-limit failure, else
+    /// `InvalidOperation("{context}: message")`.
+    pub fn into_execution_error(self, context: impl fmt::Display) -> ExecutionError {
+        if self.resource_exhausted {
+            ExecutionError::ResourceExhausted(self.message)
+        } else {
+            ExecutionError::InvalidOperation(format!("{context}: {}", self.message))
+        }
+    }
+}
+
+/// Worker → coordinator (`report_task_failure`): a task of a distributed
+/// query failed, so the coordinator can fail the query at once with this
+/// error instead of waiting until a consumer stumbles on it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaskFailureReport {
+    /// The query's id, as the coordinator dispatched it.
+    pub query_id: arneb_common::QueryId,
+    /// `query_id.stage.partition`, for the log.
+    pub task_id: String,
+    /// The failure's message.
+    pub message: String,
+    /// Whether it is a memory or spill limit failure (`ResourceExhausted`).
+    #[serde(default)]
+    pub resource_exhausted: bool,
+}
+
+impl TaskFailureReport {
+    /// A report of `failure` for task `task_id` of `query_id`.
+    pub fn new(
+        query_id: arneb_common::QueryId,
+        task_id: impl Into<String>,
+        failure: &TaskFailure,
+    ) -> Self {
+        Self {
+            query_id,
+            task_id: task_id.into(),
+            message: failure.message.clone(),
+            resource_exhausted: failure.resource_exhausted,
+        }
+    }
+
+    /// The reported failure.
+    pub fn failure(&self) -> TaskFailure {
+        TaskFailure {
+            message: self.message.clone(),
+            resource_exhausted: self.resource_exhausted,
+        }
+    }
+
+    /// Serialize to JSON.
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("TaskFailureReport serialization should not fail")
+    }
+
+    /// Deserialize from JSON.
+    pub fn decode(data: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(data).map_err(|e| e.to_string())
+    }
+}
+
 impl fmt::Display for TaskFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
@@ -181,6 +244,36 @@ pub(crate) fn stream_error_status(err: FlightError) -> Status {
 mod tests {
     use super::*;
     use arneb_common::error::{is_resource_exhausted, PlanError};
+
+    #[test]
+    fn a_failure_report_round_trips_with_its_class() {
+        let query_id = arneb_common::QueryId::new();
+        let failure = TaskFailure::resource_exhausted("spill limit exceeded");
+        let report = TaskFailureReport::new(query_id, "q.2.1", &failure);
+        let back = TaskFailureReport::decode(&report.encode()).unwrap();
+        assert_eq!(back, report);
+        assert_eq!(back.failure(), failure);
+        assert!(matches!(
+            back.failure().into_execution_error("task q.2.1 failed"),
+            ExecutionError::ResourceExhausted(m) if m == "spill limit exceeded"
+        ));
+        let other = TaskFailure::new("boom").into_execution_error("task q.2.1 failed");
+        assert_eq!(
+            other.to_string(),
+            "invalid operation: task q.2.1 failed: boom"
+        );
+        // A report from a worker that predates the class field decodes as
+        // an ordinary failure.
+        let legacy = format!(
+            r#"{{"query_id":"{}","task_id":"t","message":"m"}}"#,
+            query_id.0
+        );
+        assert!(
+            !TaskFailureReport::decode(legacy.as_bytes())
+                .unwrap()
+                .resource_exhausted
+        );
+    }
 
     #[test]
     fn resource_exhausted_round_trips() {

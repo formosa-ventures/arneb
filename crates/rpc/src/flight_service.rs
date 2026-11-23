@@ -41,6 +41,9 @@ pub enum TaskStatusResponse {
 /// the task ID is unknown (never submitted or already cleaned up).
 pub type TaskStatusCallback = Arc<dyn Fn(&str) -> Option<TaskStatusResponse> + Send + Sync>;
 
+/// Coordinator-side callback for a worker's `report_task_failure`.
+pub type TaskFailureCallback = Arc<dyn Fn(crate::task_error::TaskFailureReport) + Send + Sync>;
+
 /// Callback invoked when a heartbeat is received. `Ok` is the reply sent
 /// back to the worker; an `Err` refuses the worker (e.g. a version
 /// mismatch) and is returned to it as `FailedPrecondition` with that
@@ -103,6 +106,7 @@ pub struct FlightState {
     heartbeat_callback: Option<HeartbeatCallback>,
     task_callback: Option<TaskCallback>,
     task_status_callback: Option<TaskStatusCallback>,
+    task_failure_callback: Option<TaskFailureCallback>,
     df_report_callback: Option<DfReportCallback>,
     df_notify_callback: Option<DfNotifyCallback>,
     cancel_query_callback: Option<CancelQueryCallback>,
@@ -118,6 +122,7 @@ impl Default for FlightState {
             heartbeat_callback: None,
             task_callback: None,
             task_status_callback: None,
+            task_failure_callback: None,
             df_report_callback: None,
             df_notify_callback: None,
             cancel_query_callback: None,
@@ -153,6 +158,12 @@ impl FlightState {
     /// with a liveness check.
     pub fn set_task_status_callback(&mut self, callback: TaskStatusCallback) {
         self.task_status_callback = Some(callback);
+    }
+
+    /// Set the callback that receives workers' task-failure reports
+    /// (coordinator only).
+    pub fn set_task_failure_callback(&mut self, callback: TaskFailureCallback) {
+        self.task_failure_callback = Some(callback);
     }
 
     /// Set a callback for worker-reported partition Domains
@@ -494,6 +505,27 @@ impl FlightService for TrinoFlightService {
 
                 let result = arrow_flight::Result {
                     body: "task_accepted".into(),
+                };
+                let stream = futures::stream::once(async { Ok(result) });
+                Ok(Response::new(Box::pin(stream)))
+            }
+            "report_task_failure" => {
+                let report =
+                    crate::task_error::TaskFailureReport::decode(&action.body).map_err(|e| {
+                        Status::invalid_argument(format!("bad task failure report: {e}"))
+                    })?;
+                tracing::debug!(
+                    query_id = %report.query_id,
+                    task_id = %report.task_id,
+                    "received task failure report"
+                );
+                // Without a callback (a worker, or an old coordinator path)
+                // the report is dropped; the consumer still sees the failure.
+                if let Some(ref callback) = self.state.task_failure_callback {
+                    callback(report);
+                }
+                let result = arrow_flight::Result {
+                    body: "task_failure_accepted".into(),
                 };
                 let stream = futures::stream::once(async { Ok(result) });
                 Ok(Response::new(Box::pin(stream)))

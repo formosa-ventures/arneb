@@ -60,6 +60,10 @@ struct PlanningContext {
     /// their table qualifier, and left out of `*`, so the joined column
     /// appears once (the left copy), as in PostgreSQL and Trino.
     merged: std::collections::HashSet<usize>,
+    /// The `GROUP BY` keys of the aggregate whose output this context
+    /// describes (empty otherwise), for `GROUPING(...)` under a plain
+    /// `GROUP BY`.
+    group_by: Vec<ast::Expr>,
 }
 
 impl PlanningContext {
@@ -67,6 +71,7 @@ impl PlanningContext {
         Self {
             columns: Vec::new(),
             merged: std::collections::HashSet::new(),
+            group_by: Vec::new(),
         }
     }
 
@@ -866,6 +871,7 @@ impl<'a> QueryPlanner<'a> {
                 };
                 ctx.columns.push((qualifier, col.clone()));
             }
+            ctx.group_by = group_by_ast.clone();
 
             // HAVING (applied after aggregation)
             // Rewrite aggregate expressions in HAVING to column references
@@ -1542,6 +1548,85 @@ impl<'a> QueryPlanner<'a> {
         } else {
             LogicalPlan::UnionAll { inputs: parts }
         })
+    }
+
+    /// `GROUPING(k1, ..., kn)`, as in Trino: a BIGINT bit set with one bit per
+    /// argument, the first argument the most significant, set when that key
+    /// is rolled up (not part of the row's grouping). Under `ROLLUP` each
+    /// key's bit is its `GROUPING(key)` marker column; under a plain
+    /// `GROUP BY` every key is always grouped, so its bit is 0. An argument
+    /// that is not a grouping key is an error.
+    async fn plan_grouping(
+        &self,
+        args: &[ast::FunctionArg],
+        ctx: &PlanningContext,
+        span: Option<arneb_sql_parser::Span>,
+    ) -> Result<PlanExpr, PlanError> {
+        if args.is_empty() {
+            return Err(PlanError::invalid_expression(
+                "GROUPING requires at least one grouping expression",
+            ));
+        }
+        let mut bits = Vec::with_capacity(args.len());
+        for arg in args {
+            let ast::FunctionArg::Unnamed(key) = arg else {
+                return Err(PlanError::invalid_expression(
+                    "GROUPING takes grouping expressions as arguments",
+                ));
+            };
+            let marker = format!("GROUPING({})", format_ast_unqualified(key));
+            if let Some((index, (_, col))) = ctx
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, (_, col))| col.name.eq_ignore_ascii_case(&marker))
+            {
+                bits.push(Some(PlanExpr::Column {
+                    index,
+                    name: col.name.clone(),
+                    span,
+                }));
+                continue;
+            }
+            // Not a ROLLUP key: it must be a key of a plain GROUP BY.
+            if ctx.group_by.is_empty() || !self.is_group_by_expr(key, &ctx.group_by) {
+                return Err(PlanError::invalid_expression(format!(
+                    "GROUPING argument {} is not a grouping expression",
+                    format_ast_unqualified(key)
+                )));
+            }
+            bits.push(None);
+        }
+        let n = bits.len();
+        let literal = |value: i64| PlanExpr::Literal {
+            value: ScalarValue::Int64(value),
+            span,
+        };
+        let mut result: Option<PlanExpr> = None;
+        for (i, bit) in bits.into_iter().enumerate() {
+            let Some(marker) = bit else { continue };
+            let weight = 1i64 << (n - 1 - i);
+            let term = if weight == 1 {
+                marker
+            } else {
+                PlanExpr::BinaryOp {
+                    left: Box::new(marker),
+                    op: ast::BinaryOp::Multiply,
+                    right: Box::new(literal(weight)),
+                    span,
+                }
+            };
+            result = Some(match result {
+                None => term,
+                Some(acc) => PlanExpr::BinaryOp {
+                    left: Box::new(acc),
+                    op: ast::BinaryOp::Plus,
+                    right: Box::new(term),
+                    span,
+                },
+            });
+        }
+        Ok(result.unwrap_or_else(|| literal(0)))
     }
 
     /// Decorrelate `<expr> IN (subquery)` / `<expr> NOT IN (subquery)`.
@@ -2461,24 +2546,7 @@ impl<'a> QueryPlanner<'a> {
                     ));
                 }
                 if name.eq_ignore_ascii_case("GROUPING") {
-                    if let [ast::FunctionArg::Unnamed(key)] = args.as_slice() {
-                        let marker = format!("GROUPING({})", format_ast_unqualified(key));
-                        if let Some((index, (_, col))) = ctx
-                            .columns
-                            .iter()
-                            .enumerate()
-                            .find(|(_, (_, col))| col.name.eq_ignore_ascii_case(&marker))
-                        {
-                            return Ok(PlanExpr::Column {
-                                index,
-                                name: col.name.clone(),
-                                span: node_span,
-                            });
-                        }
-                    }
-                    return Err(PlanError::invalid_expression(
-                        "GROUPING requires one ROLLUP grouping expression",
-                    ));
+                    return self.plan_grouping(args, ctx, node_span).await;
                 }
                 if args.is_empty() {
                     if let Some(literal) = session_literal(self.catalog, name, node_span) {

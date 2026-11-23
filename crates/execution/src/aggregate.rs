@@ -784,6 +784,8 @@ impl Accumulator for MaxAccumulator {
 /// A scalar value that supports total ordering for min/max.
 #[derive(Debug, Clone)]
 enum OrdScalar {
+    Int8(i8),
+    Int16(i16),
     Int32(i32),
     Int64(i64),
     Float32(f32),
@@ -797,6 +799,10 @@ enum OrdScalar {
 impl OrdScalar {
     fn to_scalar(&self) -> ScalarValue {
         match self {
+            // `ScalarValue` has no 8/16-bit integer; `scalars_to_array`
+            // narrows these back to the column's declared type.
+            OrdScalar::Int8(v) => ScalarValue::Int32(i32::from(*v)),
+            OrdScalar::Int16(v) => ScalarValue::Int32(i32::from(*v)),
             OrdScalar::Int32(v) => ScalarValue::Int32(*v),
             OrdScalar::Int64(v) => ScalarValue::Int64(*v),
             OrdScalar::Float32(v) => ScalarValue::Float32(*v),
@@ -834,6 +840,8 @@ impl PartialOrd for OrdScalar {
 impl Ord for OrdScalar {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
+            (OrdScalar::Int8(a), OrdScalar::Int8(b)) => a.cmp(b),
+            (OrdScalar::Int16(a), OrdScalar::Int16(b)) => a.cmp(b),
             (OrdScalar::Int32(a), OrdScalar::Int32(b)) => a.cmp(b),
             (OrdScalar::Int64(a), OrdScalar::Int64(b)) => a.cmp(b),
             (OrdScalar::Float32(a), OrdScalar::Float32(b)) => a.total_cmp(b),
@@ -850,6 +858,14 @@ impl Ord for OrdScalar {
 fn extract_ordscalar(arr: &ArrayRef, index: usize) -> Result<OrdScalar, ExecutionError> {
     use arrow::datatypes::DataType::*;
     match arr.data_type() {
+        Int8 => {
+            let a = arr.as_primitive::<datatypes::Int8Type>();
+            Ok(OrdScalar::Int8(a.value(index)))
+        }
+        Int16 => {
+            let a = arr.as_primitive::<datatypes::Int16Type>();
+            Ok(OrdScalar::Int16(a.value(index)))
+        }
         Int32 => {
             let a = arr.as_primitive::<datatypes::Int32Type>();
             Ok(OrdScalar::Int32(a.value(index)))
@@ -2360,6 +2376,14 @@ pub(crate) fn scalar_from_array(
 ) -> Result<ScalarValue, ExecutionError> {
     use arrow::datatypes::DataType::*;
     match arr.data_type() {
+        // `ScalarValue` has no 8/16-bit integer; TINYINT and SMALLINT
+        // values travel as Int32.
+        Int8 => Ok(ScalarValue::Int32(i32::from(
+            arr.as_primitive::<datatypes::Int8Type>().value(index),
+        ))),
+        Int16 => Ok(ScalarValue::Int32(i32::from(
+            arr.as_primitive::<datatypes::Int16Type>().value(index),
+        ))),
         Int32 => Ok(ScalarValue::Int32(
             arr.as_primitive::<datatypes::Int32Type>().value(index),
         )),

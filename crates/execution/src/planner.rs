@@ -780,8 +780,21 @@ impl ExecutionContext {
                     });
                 }
                 let val = crate::operator::extract_scalar(col, 0)?;
-                Ok(PlanExpr::Literal {
+                let literal = PlanExpr::Literal {
                     value: val,
+                    span: *span,
+                };
+                // `ScalarValue` has no 8/16-bit integer: a TINYINT or
+                // SMALLINT result comes back as Int32, so cast it back to
+                // the type the analyzer planned the comparison with.
+                let narrow = match col.data_type() {
+                    arrow::datatypes::DataType::Int8 => arneb_common::types::DataType::Int8,
+                    arrow::datatypes::DataType::Int16 => arneb_common::types::DataType::Int16,
+                    _ => return Ok(literal),
+                };
+                Ok(PlanExpr::Cast {
+                    expr: Box::new(literal),
+                    data_type: narrow,
                     span: *span,
                 })
             }

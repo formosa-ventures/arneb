@@ -57,6 +57,10 @@ pub struct CoercionRule {
 /// rule applicability. Exact types can be expressed as `Exact(dt)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypePattern {
+    /// The `Int8` variant (TINYINT).
+    Int8,
+    /// The `Int16` variant (SMALLINT).
+    Int16,
     /// The `Int32` variant.
     Int32,
     /// The `Int64` variant.
@@ -80,7 +84,9 @@ impl TypePattern {
     fn matches(self, dt: &DataType) -> bool {
         matches!(
             (self, dt),
-            (TypePattern::Int32, DataType::Int32)
+            (TypePattern::Int8, DataType::Int8)
+                | (TypePattern::Int16, DataType::Int16)
+                | (TypePattern::Int32, DataType::Int32)
                 | (TypePattern::Int64, DataType::Int64)
                 | (TypePattern::Float32, DataType::Float32)
                 | (TypePattern::Float64, DataType::Float64)
@@ -96,6 +102,62 @@ impl TypePattern {
 /// returns the first match; the matrix is deliberately disjoint so
 /// behavior is order-independent.
 const MATRIX: &[CoercionRule] = &[
+    // --- TINYINT / SMALLINT widening (lossless, as in Trino) ---
+    CoercionRule {
+        from: TypePattern::Int8,
+        to: TypePattern::Int16,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int8,
+        to: TypePattern::Int32,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int8,
+        to: TypePattern::Int64,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int8,
+        to: TypePattern::Float32,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int8,
+        to: TypePattern::Float64,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int8,
+        to: TypePattern::AnyDecimal,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int16,
+        to: TypePattern::Int32,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int16,
+        to: TypePattern::Int64,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int16,
+        to: TypePattern::Float32,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int16,
+        to: TypePattern::Float64,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int16,
+        to: TypePattern::AnyDecimal,
+        safety: Safety::AlwaysSafe,
+    },
     // --- Numeric widening ---
     CoercionRule {
         from: TypePattern::Int32,
@@ -317,7 +379,19 @@ pub fn common_supertype(a: &DataType, b: &DataType, site: CoercionSite) -> Optio
         return Some(decimal_supertype(*p1, *s1, *p2, *s2));
     }
 
-    // Int ↔ Decimal: widen integer into the decimal's space.
+    // Int ↔ Decimal: widen integer into the decimal's space. As in
+    // Trino, TINYINT is DECIMAL(3,0), SMALLINT DECIMAL(5,0), INTEGER
+    // DECIMAL(10,0) and BIGINT DECIMAL(19,0).
+    if let (DataType::Int8, DataType::Decimal128 { precision, scale })
+    | (DataType::Decimal128 { precision, scale }, DataType::Int8) = (a, b)
+    {
+        return Some(decimal_supertype(3, 0, *precision, *scale));
+    }
+    if let (DataType::Int16, DataType::Decimal128 { precision, scale })
+    | (DataType::Decimal128 { precision, scale }, DataType::Int16) = (a, b)
+    {
+        return Some(decimal_supertype(5, 0, *precision, *scale));
+    }
     if let (DataType::Int32, DataType::Decimal128 { precision, scale })
     | (DataType::Decimal128 { precision, scale }, DataType::Int32) = (a, b)
     {
@@ -565,6 +639,37 @@ mod tests {
         assert_eq!(
             common_supertype(&DataType::Int32, &DataType::Int64, site),
             Some(DataType::Int64)
+        );
+    }
+
+    #[test]
+    fn supertype_small_integers_widen_like_trino() {
+        let site = CoercionSite::Binary {
+            left_is_literal: false,
+            right_is_literal: false,
+        };
+        let dec = |precision, scale| DataType::Decimal128 { precision, scale };
+        for (a, b, want) in [
+            (DataType::Int8, DataType::Int16, DataType::Int16),
+            (DataType::Int8, DataType::Int32, DataType::Int32),
+            (DataType::Int16, DataType::Int32, DataType::Int32),
+            (DataType::Int16, DataType::Int64, DataType::Int64),
+            (DataType::Int16, DataType::Float32, DataType::Float32),
+            (DataType::Int8, DataType::Float64, DataType::Float64),
+            // TINYINT is DECIMAL(3,0), SMALLINT DECIMAL(5,0).
+            (DataType::Int8, dec(5, 2), dec(5, 2)),
+            (DataType::Int16, dec(5, 2), dec(7, 2)),
+        ] {
+            assert_eq!(
+                common_supertype(&a, &b, site),
+                Some(want.clone()),
+                "{a} / {b}"
+            );
+            assert_eq!(common_supertype(&b, &a, site), Some(want), "{b} / {a}");
+        }
+        assert_eq!(
+            common_supertype(&DataType::Int16, &DataType::Utf8, site),
+            None
         );
     }
 

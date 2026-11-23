@@ -2098,8 +2098,8 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                         let _swapped_right_keys = left_keys;
                         dynamic_filter_ids.clear();
                         let regen_enabled = swap_df_regen_enabled();
-                        eprintln!(
-                            "[Q5_DF_REPRO] fragment_join_branch=swap df_regen={regen_enabled} old_left_width={old_left_width} old_right_width={old_right_width}"
+                        tracing::debug!(
+                            "fragment_join_branch=swap df_regen={regen_enabled} old_left_width={old_left_width} old_right_width={old_right_width}"
                         );
                         if regen_enabled {
                             let regenerated_join = assign_for_join(
@@ -2286,8 +2286,8 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                         replace_first_exchange_or_fallback(left_plan, probe_id, scan_root);
                     let mut build_plan = right_plan;
                     let regen_enabled = swap_df_regen_enabled();
-                    eprintln!(
-                        "[Q5_DF_REPRO] fragment_join_branch=v2b_inline df_regen={regen_enabled} probe_fragment={} build_fragment={}",
+                    tracing::debug!(
+                        "fragment_join_branch=v2b_inline df_regen={regen_enabled} probe_fragment={} build_fragment={}",
                         left_frags[0].id,
                         build_frag.id
                     );
@@ -2487,8 +2487,8 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                         &original_right_for_broadcast,
                         &original_left_for_estimate,
                     ) {
-                        eprintln!(
-                            "[Q5_DF_REPRO] fragment_join_branch=v2a_broadcast df_regen=false left_child={} right_child={} partition_count={partition_count}",
+                        tracing::debug!(
+                            "fragment_join_branch=v2a_broadcast df_regen=false left_child={} right_child={} partition_count={partition_count}",
                             left_frags[0].id,
                             right_frags[0].id
                         );

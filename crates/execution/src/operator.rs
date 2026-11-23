@@ -2426,7 +2426,7 @@ impl HashAggregateExec {
         let mut state_bytes = 0usize;
 
         for handle in handles {
-            let (partial, _partial_reservation) = handle.await.map_err(|e| {
+            let (partial, partial_reservation) = handle.await.map_err(|e| {
                 ExecutionError::InvalidOperation(format!("aggregate partial task: {e}"))
             })??;
             if no_grouping {
@@ -2448,6 +2448,10 @@ impl HashAggregateExec {
             } else {
                 state_bytes += merge_partial_groups(&mut merged, partial, aggr_info.len())?;
             }
+            // The partial was consumed by the merge (its groups moved or
+            // folded into `merged`), so its bytes are released before the
+            // merged state is counted: the same state is never counted twice.
+            drop(partial_reservation);
             reservation.try_resize(state_bytes)?;
         }
 
@@ -2920,7 +2924,7 @@ impl HashAggregateExec {
             global_gbh.reserve_groups(final_groups_upper_bound);
         }
 
-        for (partial_gbh, partial_accs, _partial_reservation) in partials {
+        for (partial_gbh, partial_accs, mut partial_reservation) in partials {
             // An input partition with zero rows never initialised its key
             // storage, so it yields zero key columns; feeding that to the
             // global hash errors (FlatRow expects one array per key).
@@ -2935,14 +2939,21 @@ impl HashAggregateExec {
             let partial_arrays = partial_gbh.build_group_arrays()?;
             let remap = global_gbh.get_group_ids(&partial_arrays)?;
             let n_global = global_gbh.num_groups();
-            for (i, pa) in partial_accs.iter().enumerate() {
+            // Merge one accumulator at a time and free its partial state
+            // (and that share of the partial's reservation) right after, so
+            // a partial and its merged copy overlap for one accumulator at
+            // most, in memory and in the pool.
+            for (i, pa) in partial_accs.into_iter().enumerate() {
                 final_accs[i].ensure_capacity(n_global);
                 final_accs[i].merge_from(pa.as_ref(), &remap)?;
+                let freed = pa.heap_bytes().min(partial_reservation.size());
+                drop(pa);
+                partial_reservation.shrink(freed);
+                let state_bytes = global_gbh.heap_bytes()
+                    + n_global * final_accs.len() * 16
+                    + grouped_heap_bytes(&final_accs);
+                reservation.try_resize(state_bytes)?;
             }
-            let state_bytes = global_gbh.heap_bytes()
-                + n_global * final_accs.len() * 16
-                + grouped_heap_bytes(&final_accs);
-            reservation.try_resize(state_bytes)?;
         }
 
         self.build_output_batch_aware(&global_gbh, &final_accs)
@@ -7403,6 +7414,27 @@ mod tests {
                 );
                 assert_eq!(pool.reserved(), 0, "the aggregate releases its bytes");
             }
+        }
+    }
+
+    /// Merging parallel partials does not count the same state twice: the
+    /// parallel peak stays within 10% of the single-partition peak (it was
+    /// 25% over when each partial stayed reserved through its merge).
+    #[tokio::test]
+    async fn a_parallel_distinct_merge_counts_its_state_once() {
+        use crate::memory_pool::{GreedyMemoryPool, MemoryPool};
+        for grouped in [false, true] {
+            let peak = |partitions| async move {
+                let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(256 << 20));
+                let agg = count_distinct_strings(grouped, partitions, pool.clone());
+                collect_stream(agg.execute(0).await.unwrap()).await.unwrap();
+                pool.reserved_peak()
+            };
+            let (single, parallel) = (peak(1).await, peak(4).await);
+            assert!(
+                parallel * 10 < single * 11,
+                "grouped={grouped}: parallel peak {parallel} vs single {single}"
+            );
         }
     }
 }

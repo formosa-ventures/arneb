@@ -169,6 +169,13 @@ SELECT * FROM orders
 WHERE customer_id IN (SELECT id FROM customers WHERE region = 'US');
 ```
 
+`IN` and `NOT IN` subqueries can sit anywhere in a `WHERE` clause, under
+`AND`, `OR` and `NOT`, for example
+`WHERE x NOT IN (SELECT y FROM u) OR x = 2`. They follow SQL's three-valued
+logic: `x NOT IN (...)` is NULL, so the row is dropped, when `x` is NULL
+and the subquery has rows, or when the subquery returns a NULL and nothing
+matches.
+
 ### EXISTS Subquery
 
 ```sql

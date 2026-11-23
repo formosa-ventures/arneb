@@ -1373,9 +1373,7 @@ impl<'a> QueryPlanner<'a> {
                         specs
                     }
                     PredicateTruth::NotFalse => {
-                        return Err(PlanError::invalid_expression(
-                            "IN subquery in this boolean context is not supported".to_string(),
-                        ));
+                        return self.in_subquery_not_false(input, expr, subquery, ctx).await;
                     }
                 };
                 Ok(specs.into_iter().fold(input, apply_semi_join))
@@ -1417,6 +1415,133 @@ impl<'a> QueryPlanner<'a> {
                 })
             }
         }
+    }
+
+    /// The rows of `input` where `<expr> IN (subquery)` is TRUE or NULL, i.e.
+    /// not FALSE (an `x NOT IN (...) OR ...` / `NOT (x IN (...) AND ...)`
+    /// operand). Three disjoint parts, joined with `UNION ALL`:
+    ///
+    /// - rows with a match (TRUE);
+    /// - rows without one, when the subquery yields a NULL (NULL);
+    /// - rows without one whose `<expr>` is NULL, when the subquery yields
+    ///   rows but no NULL (NULL).
+    ///
+    /// A row of a NULL `<expr>` over an empty subquery is FALSE and is left
+    /// out. A part that cannot have rows (non-nullable column) is skipped.
+    async fn in_subquery_not_false(
+        &self,
+        input: LogicalPlan,
+        expr: &ast::Expr,
+        subquery: &ast::Query,
+        ctx: &PlanningContext,
+    ) -> Result<LogicalPlan, PlanError> {
+        let mut specs = self
+            .decorrelate_in_subquery(expr.clone(), subquery.clone(), ctx, false)
+            .await?;
+        let matched = specs.remove(0);
+        let sub_plan = matched.right_plan.clone();
+        let sub_column = sub_plan.schema().remove(0);
+        let outer_nullable = match &matched.left_key {
+            PlanExpr::Column { index, .. } => ctx.columns[*index].1.nullable,
+            PlanExpr::Literal { value, .. } => matches!(value, ScalarValue::Null),
+            _ => true,
+        };
+        let unmatched = apply_semi_join(
+            input.clone(),
+            SemiJoinSpec {
+                kind: SemiJoinKind::Anti,
+                right_plan: matched.right_plan.clone(),
+                left_key: matched.left_key.clone(),
+                right_key: matched.right_key.clone(),
+                residual: None,
+            },
+        );
+        let outer_key = matched.left_key.clone();
+        let mut parts = vec![apply_semi_join(input, matched)];
+
+        let constant_key = PlanExpr::Literal {
+            value: ScalarValue::Int32(1),
+            span: None,
+        };
+        let sub_value = |index: usize| PlanExpr::Column {
+            index,
+            name: sub_column.name.clone(),
+            span: None,
+        };
+        // Some row of the subquery is NULL (a semi or anti join on a
+        // constant key against `subquery WHERE value IS NULL LIMIT 1`).
+        let subquery_has_null = |kind: SemiJoinKind| SemiJoinSpec {
+            kind,
+            right_plan: LogicalPlan::Limit {
+                input: Box::new(LogicalPlan::Filter {
+                    input: Box::new(sub_plan.clone()),
+                    predicate: PlanExpr::IsNull {
+                        expr: Box::new(sub_value(0)),
+                        span: None,
+                    },
+                }),
+                limit: Some(1),
+                offset: None,
+            },
+            left_key: constant_key.clone(),
+            right_key: constant_key.clone(),
+            residual: None,
+        };
+        if sub_column.nullable {
+            parts.push(apply_semi_join(
+                unmatched.clone(),
+                subquery_has_null(SemiJoinKind::Semi),
+            ));
+        }
+        if outer_nullable {
+            let without_null = if sub_column.nullable {
+                apply_semi_join(unmatched, subquery_has_null(SemiJoinKind::Anti))
+            } else {
+                unmatched
+            };
+            // `<expr> IS NULL` and the subquery has a row. The residual
+            // names the subquery's column (an always-true test of it), as
+            // the NOT IN emptiness check does.
+            let inner = sub_value(ctx.columns.len());
+            parts.push(apply_semi_join(
+                without_null,
+                SemiJoinSpec {
+                    kind: SemiJoinKind::Semi,
+                    right_plan: LogicalPlan::Limit {
+                        input: Box::new(sub_plan),
+                        limit: Some(1),
+                        offset: None,
+                    },
+                    left_key: constant_key.clone(),
+                    right_key: constant_key,
+                    residual: Some(PlanExpr::BinaryOp {
+                        left: Box::new(PlanExpr::IsNull {
+                            expr: Box::new(outer_key),
+                            span: None,
+                        }),
+                        op: ast::BinaryOp::And,
+                        right: Box::new(PlanExpr::BinaryOp {
+                            left: Box::new(PlanExpr::IsNull {
+                                expr: Box::new(inner.clone()),
+                                span: None,
+                            }),
+                            op: ast::BinaryOp::Or,
+                            right: Box::new(PlanExpr::IsNotNull {
+                                expr: Box::new(inner),
+                                span: None,
+                            }),
+                            span: None,
+                        }),
+                        span: None,
+                    }),
+                },
+            ));
+        }
+        Ok(if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            LogicalPlan::UnionAll { inputs: parts }
+        })
     }
 
     /// Decorrelate `<expr> IN (subquery)` / `<expr> NOT IN (subquery)`.

@@ -5646,13 +5646,15 @@ fn probe_prefetch_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// Stream the shared Single-build probe side batch-by-batch. Default off;
-/// enabled with `ARNEB_STREAM_HASH_PROBE=1`.
+/// Stream the shared Single-build probe side batch-by-batch by default.
+/// Set `ARNEB_STREAM_HASH_PROBE` to `0` or an empty string to collect the whole probe side.
 #[cfg(not(test))]
 fn stream_hash_probe_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let enabled = std::env::var("ARNEB_STREAM_HASH_PROBE").is_ok_and(|v| v == "1");
+        let enabled = std::env::var("ARNEB_STREAM_HASH_PROBE")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
         tracing::info!(
             target: "arneb::config",
             knob = "ARNEB_STREAM_HASH_PROBE",
@@ -5665,7 +5667,9 @@ fn stream_hash_probe_enabled() -> bool {
 
 #[cfg(test)]
 fn stream_hash_probe_enabled() -> bool {
-    std::env::var("ARNEB_STREAM_HASH_PROBE").is_ok_and(|v| v == "1")
+    std::env::var("ARNEB_STREAM_HASH_PROBE")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(true)
 }
 
 /// Broadcast/single-build cross-fragment dynamic-filter publishing gate.
@@ -6998,7 +7002,7 @@ mod tests {
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,
     ) {
-        std::env::remove_var("ARNEB_STREAM_HASH_PROBE");
+        std::env::set_var("ARNEB_STREAM_HASH_PROBE", "0");
         let collect_join =
             hash_join_for_stream_probe_equivalence(Arc::clone(&left), Arc::clone(&right));
         let collect_batches = collect_stream(collect_join.execute(0).await.expect("execute off"))
@@ -7037,6 +7041,128 @@ mod tests {
         let _g = env_test_guard().await;
         let left = partitioned_left_source(vec![vec![vec![1, 2], vec![3, 4]], vec![vec![5]]]);
         run_stream_probe_equivalence_case(left, empty_right_source()).await;
+    }
+
+    mod stream_probe_default {
+        //! By default the shared Single-build probe streams: the join returns
+        //! output for a probe batch before its probe side has ended.
+        //! `ARNEB_STREAM_HASH_PROBE=0` turns that off again.
+
+        use super::*;
+
+        /// Probe partition 0 yields one batch (key 2, which matches the build
+        /// side) and then never ends; partition 1 ends normally.
+        #[derive(Debug)]
+        struct NeverEndingProbeSource {
+            schema: Vec<ColumnInfo>,
+        }
+
+        #[async_trait]
+        impl DataSource for NeverEndingProbeSource {
+            fn schema(&self) -> Vec<ColumnInfo> {
+                self.schema.clone()
+            }
+
+            fn partition_count(&self) -> usize {
+                2
+            }
+
+            async fn scan(
+                &self,
+                _ctx: &ScanContext,
+                partition: usize,
+            ) -> Result<SendableRecordBatchStream, ExecutionError> {
+                let schema = column_info_to_arrow_schema(&self.schema);
+                let batch =
+                    RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![2]))])
+                        .unwrap();
+                let first = futures::stream::iter(vec![Ok(batch)]);
+                let inner: std::pin::Pin<
+                    Box<dyn futures::Stream<Item = Result<RecordBatch, ExecutionError>> + Send>,
+                > = if partition == 0 {
+                    Box::pin(first.chain(futures::stream::pending()))
+                } else {
+                    Box::pin(first)
+                };
+                Ok(Box::pin(AsyncBatchStream { schema, inner }))
+            }
+        }
+
+        fn never_ending_left() -> Arc<dyn ExecutionPlan> {
+            Arc::new(ScanExec {
+                source: Arc::new(NeverEndingProbeSource {
+                    schema: vec![ColumnInfo {
+                        name: "id".into(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    }],
+                }),
+                _table_name: "left_never_ending".into(),
+                scan_context: ScanContext::default(),
+                dynamic_filters: Default::default(),
+                dynamic_filters_consumed: Vec::new(),
+                dynamic_filter_collector: None,
+                dynamic_filtering_enabled: false,
+                dynamic_filtering_wait_timeout: std::time::Duration::from_secs(10),
+                scan_task_index: 0,
+                scan_task_count: 1,
+            })
+        }
+
+        /// Runs probe partition 0 on its own thread and returns the row count
+        /// of its first output batch, or `None` when none arrives in time.
+        fn first_output_rows(setting: Option<&'static str>) -> Option<usize> {
+            let _g = ENV_TEST_LOCK.blocking_lock();
+            match setting {
+                Some(value) => std::env::set_var("ARNEB_STREAM_HASH_PROBE", value),
+                None => std::env::remove_var("ARNEB_STREAM_HASH_PROBE"),
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let join =
+                        hash_join_for_stream_probe_equivalence(never_ending_left(), right_source());
+                    let mut stream = join.execute(0).await.expect("execute");
+                    while let Some(batch) = stream.next().await {
+                        let batch = batch.expect("batch");
+                        if batch.num_rows() > 0 {
+                            let _ = tx.send(batch.num_rows());
+                            break;
+                        }
+                    }
+                });
+            });
+            let rows = rx.recv_timeout(std::time::Duration::from_secs(5)).ok();
+            std::env::remove_var("ARNEB_STREAM_HASH_PROBE");
+            rows
+        }
+
+        #[test]
+        fn streams_by_default() {
+            assert_eq!(first_output_rows(None), Some(1));
+        }
+
+        #[test]
+        fn streams_when_set_to_one() {
+            assert_eq!(first_output_rows(Some("1")), Some(1));
+        }
+
+        #[test]
+        fn zero_turns_streaming_off() {
+            // The probe side never ends, so a join that collects it first
+            // never produces a batch.
+            assert_eq!(first_output_rows(Some("0")), None);
+        }
+
+        #[test]
+        fn an_empty_value_turns_streaming_off() {
+            // Like the other default-on knobs (`ARNEB_PROBE_PREFETCH`), a set
+            // but empty value disables it.
+            assert_eq!(first_output_rows(Some("")), None);
+        }
     }
 
     #[tokio::test]

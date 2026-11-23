@@ -98,6 +98,13 @@ pub(crate) fn evaluate(
         }
 
         PlanExpr::BinaryOp {
+            left,
+            op: op @ (ast::BinaryOp::And | ast::BinaryOp::Or),
+            right,
+            ..
+        } => evaluate_logical(left, op, right, batch, registry),
+
+        PlanExpr::BinaryOp {
             left, op, right, ..
         } => {
             let left_arr = evaluate(left, batch, registry)?;
@@ -294,9 +301,11 @@ pub(crate) fn evaluate(
 /// Trino's `TRY(expr)`: evaluate `expr`, turning evaluation errors into
 /// NULL for the offending rows only.
 ///
-/// The whole batch is evaluated first (the fast, common path). Only if
-/// that fails is the batch re-evaluated one row at a time, so rows that
-/// succeed keep their value and rows that fail become NULL. Every
+/// The whole batch is evaluated first (the fast, common path). If that
+/// fails, the batch is halved and each half retried, down to single rows,
+/// so rows that succeed keep their value and rows that fail become NULL.
+/// A batch with a few bad rows costs about `bad × log2(rows)` small
+/// evaluations instead of one per row. Every
 /// evaluation error is caught (Trino catches only a fixed set of error
 /// codes — division by zero, invalid cast/argument, overflow — but in
 /// practice those are the errors scalar evaluation raises).
@@ -314,22 +323,102 @@ fn evaluate_try(
     if let Ok(arr) = evaluate(arg, batch, registry) {
         return Ok(arr);
     }
-    let rows: Vec<Option<ArrayRef>> = (0..batch.num_rows())
-        .map(|i| evaluate(arg, &batch.slice(i, 1), registry).ok())
-        .collect();
-    let Some(data_type) = rows.iter().flatten().map(|a| a.data_type().clone()).next() else {
+    // `Err(1)` stands for one failed row.
+    let mut runs: Vec<Result<ArrayRef, usize>> = Vec::new();
+    try_bisect(arg, batch, registry, &mut runs);
+    let Some(data_type) = runs
+        .iter()
+        .flatten()
+        .map(|a| a.data_type().clone())
+        .find(|t| *t != ArrowDataType::Null)
+    else {
         return Ok(Arc::new(NullArray::new(batch.num_rows())));
     };
-    let pieces: Vec<ArrayRef> = rows
+    let pieces: Vec<ArrayRef> = runs
         .into_iter()
-        .map(|r| match r {
-            Some(a) if a.data_type() == &data_type => Ok(a),
-            Some(a) => kernels::cast::cast(&a, &data_type).map_err(ExecutionError::from),
-            None => Ok(arrow::array::new_null_array(&data_type, 1)),
+        .map(|run| match run {
+            Ok(a) if a.data_type() == &data_type => Ok(a),
+            Ok(a) => kernels::cast::cast(&a, &data_type).map_err(ExecutionError::from),
+            Err(len) => Ok(arrow::array::new_null_array(&data_type, len)),
         })
         .collect::<Result<_, _>>()?;
     let refs: Vec<&dyn Array> = pieces.iter().map(|a| a.as_ref()).collect();
     Ok(kernels::concat::concat(&refs)?)
+}
+
+/// `left AND right` / `left OR right` in SQL three-valued logic.
+///
+/// The right side counts only for the rows the left side leaves open (not
+/// FALSE for AND, not TRUE for OR), as in Trino: a guard such as
+/// `s <> 'n/a' AND CAST(s AS INTEGER) > 0` never fails on a row it rules
+/// out. The right side is evaluated over the whole batch first (one
+/// vectorized pass, the common case); only if that fails is it evaluated
+/// again over just the open rows, where an error is the query's.
+fn evaluate_logical(
+    left: &PlanExpr,
+    op: &ast::BinaryOp,
+    right: &PlanExpr,
+    batch: &RecordBatch,
+    registry: Option<&FunctionRegistry>,
+) -> Result<ArrayRef, ExecutionError> {
+    let is_and = matches!(op, ast::BinaryOp::And);
+    let name = if is_and { "AND" } else { "OR" };
+    let l = as_boolean_operand(&evaluate(left, batch, registry)?, name)?;
+    let num_rows = batch.num_rows();
+    // Every row decided by the left side alone: FALSE under AND, TRUE
+    // under OR.
+    let deciding = if is_and { 0 } else { num_rows };
+    if l.null_count() == 0 && l.true_count() == deciding {
+        return Ok(Arc::new(l));
+    }
+    let right_arr = match evaluate(right, batch, registry) {
+        Ok(arr) => arr,
+        Err(e) => {
+            // The rows the left side leaves open: not FALSE for AND, not
+            // TRUE for OR.
+            let open: Vec<u32> = (0..num_rows)
+                .filter(|&i| l.is_null(i) || l.value(i) == is_and)
+                .map(|i| i as u32)
+                .collect();
+            if open.len() == num_rows {
+                return Err(e);
+            }
+            // Rows left out come back NULL, which the Kleene kernels
+            // resolve to the left side's deciding value.
+            let arr = evaluate_case_rows(right, batch, &open, registry)?;
+            expand_case_rows(&arr, &open, num_rows)?
+        }
+    };
+    let r = as_boolean_operand(&right_arr, name)?;
+    let result = if is_and {
+        kernels::boolean::and_kleene(&l, &r)?
+    } else {
+        kernels::boolean::or_kleene(&l, &r)?
+    };
+    Ok(Arc::new(result))
+}
+
+/// Evaluate `arg` over `batch` in order, appending each succeeding run's
+/// values and `Err(1)` for each row that fails on its own. The caller
+/// already knows the whole of `batch` fails.
+fn try_bisect(
+    arg: &PlanExpr,
+    batch: &RecordBatch,
+    registry: Option<&FunctionRegistry>,
+    runs: &mut Vec<Result<ArrayRef, usize>>,
+) {
+    let rows = batch.num_rows();
+    if rows <= 1 {
+        runs.push(Err(rows));
+        return;
+    }
+    let half = rows / 2;
+    for part in [batch.slice(0, half), batch.slice(half, rows - half)] {
+        match evaluate(arg, &part, registry) {
+            Ok(arr) => runs.push(Ok(arr)),
+            Err(_) => try_bisect(arg, &part, registry, runs),
+        }
+    }
 }
 
 /// Threshold above which `InList` switches from `OR`-of-Arrow-`eq`-
@@ -2007,6 +2096,7 @@ mod tests {
             name: "TRY".to_string(),
             args: vec![cast_x(arneb_common::types::DataType::Int32)],
             distinct: false,
+            order_by: None,
             span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
@@ -2015,6 +2105,74 @@ mod tests {
             ints.iter().collect::<Vec<_>>(),
             vec![Some(7), None, Some(-1)]
         );
+    }
+
+    /// TRY keeps every good row and nulls every bad one, wherever the bad
+    /// rows fall in the batch.
+    #[test]
+    fn try_nulls_scattered_failing_rows_and_keeps_the_rest() {
+        let values: Vec<i64> = (0..37)
+            .map(|i| if i % 5 == 3 { 3_000_000_000 } else { i })
+            .collect();
+        let batch = single_column_batch(Arc::new(Int64Array::from(values.clone())));
+        let expr = PlanExpr::Function {
+            name: "TRY".to_string(),
+            args: vec![cast_x(arneb_common::types::DataType::Int32)],
+            distinct: false,
+            order_by: None,
+            span: None,
+        };
+        let result = evaluate(&expr, &batch, None).unwrap();
+        let ints = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        let expected: Vec<Option<i32>> = values.iter().map(|&v| i32::try_from(v).ok()).collect();
+        assert_eq!(ints.iter().collect::<Vec<_>>(), expected);
+    }
+
+    /// The right side of AND/OR sees only the rows the left side leaves
+    /// open, so a strict cast there is not evaluated on the others.
+    #[test]
+    fn and_or_evaluate_the_right_side_only_where_the_left_leaves_it_open() {
+        let batch = single_column_batch(Arc::new(StringArray::from(vec![
+            Some("12"),
+            Some("abc"),
+            None,
+        ])));
+        let x = || PlanExpr::Column {
+            index: 0,
+            name: "x".to_string(),
+            span: None,
+        };
+        let s = |v: &str| PlanExpr::Literal {
+            value: ScalarValue::Utf8(v.to_string()),
+            span: None,
+        };
+        let cast_gt_0 = bin(
+            cast_x(arneb_common::types::DataType::Int32),
+            ast::BinaryOp::Gt,
+            PlanExpr::Literal {
+                value: ScalarValue::Int32(0),
+                span: None,
+            },
+        );
+        let and = bin(
+            bin(x(), ast::BinaryOp::NotEq, s("abc")),
+            ast::BinaryOp::And,
+            cast_gt_0.clone(),
+        );
+        assert_eq!(eval_bool(&and, &batch), vec![Some(true), Some(false), None]);
+        let or = bin(
+            bin(x(), ast::BinaryOp::Eq, s("abc")),
+            ast::BinaryOp::Or,
+            cast_gt_0.clone(),
+        );
+        assert_eq!(eval_bool(&or, &batch), vec![Some(true), Some(true), None]);
+        // A row the left side leaves open still fails.
+        let unguarded = bin(
+            bin(x(), ast::BinaryOp::NotEq, s("12")),
+            ast::BinaryOp::And,
+            cast_gt_0,
+        );
+        assert!(evaluate(&unguarded, &batch, None).is_err());
     }
 
     #[test]

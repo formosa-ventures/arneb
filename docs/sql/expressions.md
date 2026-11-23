@@ -105,8 +105,15 @@ Any cast the target type cannot hold is an error, whether the value is a
 literal or comes from a column: an integer out of range
 (`CAST(3000000000 AS INTEGER)`, `CAST(70000 AS SMALLINT)`), a string that is
 not a number or date (`CAST('abc' AS INTEGER)`, `CAST('1998-13-45' AS DATE)`),
-or NaN and infinity cast to an integer. `TRY(CAST(...))` returns `NULL` for
-just the rows that fail.
+or NaN and infinity cast to an integer. `TRY(CAST(...))`, or its shorthand
+`TRY_CAST(x AS type)`, returns `NULL` for just the rows that fail.
+
+As in Trino, a cast is evaluated only on the rows the result depends on: the
+right side of `AND` / `OR` sees only the rows the left side leaves open, a
+`CASE` branch or later `COALESCE` argument only the rows that reach it, and a
+`WHERE` conjunct that can fail on a row (a cast, function call or arithmetic
+over a column) runs after the conjuncts written before it. So
+`WHERE s <> 'n/a' AND CAST(s AS INTEGER) > 0` never casts `'n/a'`.
 
 ## BETWEEN
 

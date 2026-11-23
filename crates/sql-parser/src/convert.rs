@@ -717,7 +717,10 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             right,
         } => array_in_list(*left, *right, true, span),
         sp::Expr::Cast {
-            expr, data_type, ..
+            kind,
+            expr,
+            data_type,
+            ..
         } => {
             let e = convert_expr(*expr)?;
             // `'name'::regclass` / `::regtype` are resolved by the planner
@@ -735,11 +738,23 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 });
             }
             let dt = convert_data_type(data_type)?;
-            Ok(ast::Expr::Cast {
+            let cast = ast::Expr::Cast {
                 expr: Box::new(e),
                 data_type: dt,
                 span,
-            })
+            };
+            // `TRY_CAST(x AS t)` (and BigQuery's `SAFE_CAST`) is Trino's
+            // `TRY(CAST(x AS t))`: a value the target cannot hold is NULL.
+            match kind {
+                sp::CastKind::TryCast | sp::CastKind::SafeCast => Ok(ast::Expr::Function {
+                    name: "TRY".to_string(),
+                    args: vec![ast::FunctionArg::Unnamed(cast)],
+                    distinct: false,
+                    order_by: Vec::new(),
+                    span,
+                }),
+                sp::CastKind::Cast | sp::CastKind::DoubleColon => Ok(cast),
+            }
         }
         // Typed string literals (`DATE '...'`, `TIMESTAMP '...'`, `TIME '...'`)
         // parse as Expr::TypedString in sqlparser-rs. Lower them to casts,

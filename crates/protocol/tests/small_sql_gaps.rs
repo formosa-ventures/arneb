@@ -137,6 +137,58 @@ async fn try_cast_still_turns_the_failing_rows_into_null() {
 }
 
 #[tokio::test]
+async fn try_cast_turns_the_failing_rows_into_null() {
+    let (got, _) = rows("SELECT TRY_CAST(big AS INTEGER), TRY_CAST(s AS INTEGER) FROM n").await;
+    assert_eq!(
+        got,
+        vec![
+            row(&["7", "12"]),
+            row(&["NULL", "NULL"]),
+            row(&["NULL", "NULL"])
+        ]
+    );
+}
+
+// A cast guarded by the other side of AND/OR, or by an earlier COALESCE
+// argument, sees only the rows the result depends on, as in Trino.
+
+#[tokio::test]
+async fn a_cast_guarded_by_and_skips_the_rows_the_guard_rules_out() {
+    for sql in [
+        "SELECT s FROM n WHERE s <> 'abc' AND CAST(s AS INTEGER) > 0",
+        "SELECT s FROM n WHERE regexp_like(s, '^[0-9]+$') AND CAST(s AS INTEGER) > 5",
+    ] {
+        let (got, _) = rows(sql).await;
+        assert_eq!(got, vec![row(&["12"])], "{sql}");
+    }
+    let (got, _) =
+        rows("SELECT s, s <> 'abc' AND CAST(s AS INTEGER) > 0 FROM n WHERE s IS NOT NULL").await;
+    assert_eq!(got, vec![row(&["12", "true"]), row(&["abc", "false"])]);
+}
+
+#[tokio::test]
+async fn a_cast_guarded_by_or_skips_the_rows_the_guard_already_keeps() {
+    let (got, _) =
+        rows("SELECT s FROM n WHERE s = 'abc' OR CAST(s AS INTEGER) = 12 ORDER BY s").await;
+    assert_eq!(got, vec![row(&["12"]), row(&["abc"])]);
+}
+
+#[tokio::test]
+async fn a_cast_after_a_non_null_coalesce_argument_is_not_evaluated() {
+    let (got, _) =
+        rows("SELECT COALESCE(CASE WHEN s = 'abc' THEN 0 END, CAST(s AS INTEGER)) FROM n").await;
+    assert_eq!(got, vec![row(&["12"]), row(&["0"]), row(&["NULL"])]);
+}
+
+#[tokio::test]
+async fn a_cast_on_a_row_the_guard_lets_through_still_fails() {
+    let err = run("SELECT s FROM n WHERE s <> '12' AND CAST(s AS INTEGER) > 0")
+        .await
+        .unwrap_err();
+    assert!(err.contains("abc"), "{err}");
+}
+
+#[tokio::test]
 async fn a_column_cast_in_range_keeps_its_values() {
     let (got, types) = rows("SELECT CAST(big AS INTEGER) FROM n WHERE big < 100").await;
     assert_eq!(got, vec![row(&["7"])]);

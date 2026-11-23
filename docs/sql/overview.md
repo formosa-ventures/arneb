@@ -60,6 +60,16 @@ timeout`; the connection stays usable. An invalid value is `22023`. The
 server default is `[admission] statement_timeout`
 ([Admission Control](/guide/configuration#admission-control)).
 
+### Cancelling a statement
+
+A client's cancel request (psql's Ctrl-C, JDBC's `Statement.cancel`, the
+stop button in Metabase or DBeaver) cancels the statement running on that
+connection on every node, the same way a timeout does. It fails with
+`ERROR 57014 canceling statement due to user request`, and the connection
+stays usable. Each connection gets its own random cancel key at startup,
+so a request only reaches the connection that issued the key. A request
+that arrives while the connection is idle does nothing.
+
 ### Resource errors
 
 | SQLSTATE | Meaning |

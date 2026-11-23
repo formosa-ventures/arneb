@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod auth;
+mod cancel;
 mod encoding;
 mod error;
 mod handler;
@@ -27,5 +28,6 @@ pub use handler::{BatchSink, DistributedExecutor};
 // Re-export for integration testing
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::cancel::BackendKeys;
     pub use crate::handler::{execute_query, HandlerFactory};
 }

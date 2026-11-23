@@ -576,14 +576,20 @@ pub(crate) struct AuthStartupHandler {
     method: AuthMethod,
     tls_required: bool,
     state: Mutex<ScramState>,
+    backend_keys: Arc<crate::cancel::BackendKeys>,
 }
 
 impl AuthStartupHandler {
-    pub(crate) fn new(method: AuthMethod, tls_required: bool) -> Self {
+    pub(crate) fn new(
+        method: AuthMethod,
+        tls_required: bool,
+        backend_keys: Arc<crate::cancel::BackendKeys>,
+    ) -> Self {
         Self {
             method,
             tls_required,
             state: Mutex::new(ScramState::Start),
+            backend_keys,
         }
     }
 
@@ -722,6 +728,7 @@ impl AuthStartupHandler {
                     peer = %client.socket_addr(),
                     "pgwire client authenticated"
                 );
+                self.backend_keys.assign(client);
                 finish_authentication(client, &crate::metadata::server_parameters()).await
             }
             (_, _) => Err(protocol_violation(
@@ -746,9 +753,9 @@ impl StartupHandler for AuthStartupHandler {
         // Transport check first: `[tls] pgwire = "required"` applies in every
         // auth mode, before any SASL exchange starts. A plaintext
         // CancelRequest never reaches this handler, and needs no check:
-        // pgwire hands it to the cancel handler, which Arneb leaves as the
-        // no-op default (statement cancel is not implemented over pgwire),
-        // and closes the connection.
+        // pgwire hands it to the cancel handler, which stops the statement
+        // only when the request carries that connection's random backend
+        // key (`crate::cancel`), and closes the connection.
         if self.tls_required
             && matches!(message, PgWireFrontendMessage::Startup(_))
             && !client.is_secure()
@@ -765,6 +772,7 @@ impl StartupHandler for AuthStartupHandler {
             AuthMethod::None => {
                 if let PgWireFrontendMessage::Startup(ref startup) = message {
                     save_startup_parameters_to_metadata(client, startup);
+                    self.backend_keys.assign(client);
                     finish_authentication(client, &crate::metadata::server_parameters()).await?;
                 }
                 Ok(())

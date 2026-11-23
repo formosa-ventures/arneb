@@ -97,3 +97,26 @@ async fn a_parameter_that_looks_like_a_placeholder_cannot_inject_sql() {
     assert_eq!(rows[0].get::<_, String>(0), "it's $2");
     assert_eq!(rows[0].get::<_, String>(1), "$1");
 }
+
+/// A negative number bound after a minus sign must stay one value. Inlined
+/// as is, `5-$1` with `$1 = -1` became `5--1`, and the `--` turned the rest
+/// of the statement (here the WHERE clause) into a comment.
+#[tokio::test]
+async fn a_negative_parameter_after_a_minus_cannot_comment_out_the_rest() {
+    let port = start_server().await;
+    let c = connect(port).await;
+    let stmt = c
+        .prepare_typed(
+            "SELECT v, 5-$1 AS n FROM t WHERE v = $2",
+            &[
+                tokio_postgres::types::Type::INT8,
+                tokio_postgres::types::Type::TEXT,
+            ],
+        )
+        .await
+        .unwrap();
+    let rows = c.query(&stmt, &[&-1i64, &"nope"]).await.unwrap();
+    assert!(rows.is_empty(), "the WHERE clause must still apply");
+    let rows = c.query(&stmt, &[&-1i64, &"secret"]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+}

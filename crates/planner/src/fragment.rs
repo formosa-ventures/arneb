@@ -490,12 +490,12 @@ fn partial_agg_over_join_enabled() -> bool {
 
     *ENABLED.get_or_init(|| {
         let enabled = std::env::var("ARNEB_PARTIAL_AGG_OVER_JOIN")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false);
+            .map(|v| v != "0")
+            .unwrap_or(true);
         tracing::info!(
             target: "arneb::config",
             partial_agg_over_join = enabled,
-            "ARNEB_PARTIAL_AGG_OVER_JOIN effective value (default off; =1 to fuse partial aggregation into join-output fragments)"
+            "ARNEB_PARTIAL_AGG_OVER_JOIN effective value (default on; =0 to keep the partial aggregate in its own fragment after a join)"
         );
         enabled
     })
@@ -3141,17 +3141,27 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                     }
                 }
 
-                // q08 partial-over-join (default off): when a decomposable
+                // q08 partial-over-join (default on): when a decomposable
                 // grouped aggregate consumes the output of a single worker-side
                 // join fragment, push the PartialAggregate into that fragment
                 // so join batches are reduced before the fragment exchange.
                 // The coordinator still runs the FinalAggregate and any parent
                 // Projection computes final-only expressions such as num/den.
-                if partial_agg_over_join_enabled()
-                    && input_frags.len() == 1
-                    && input_frags[0].fragment_type != FragmentType::Fixed
-                    && matches!(input_frags[0].root, LogicalPlan::Join { .. })
-                {
+                // The fused fragment's output partitioning also sets its task
+                // count, and each task of a partitioned join reads bucket k
+                // of the join's inputs: the fused fragment must keep one task
+                // per join bucket. `None`: fusing would change it, keep the
+                // separate partial fragment.
+                let fused_output = input_frags
+                    .first()
+                    .and_then(|join| fused_join_output(join, &partial_output_partitioning))
+                    .filter(|_| {
+                        partial_agg_over_join_enabled()
+                            && input_frags.len() == 1
+                            && input_frags[0].fragment_type != FragmentType::Fixed
+                            && matches!(input_frags[0].root, LogicalPlan::Join { .. })
+                    });
+                if let Some(fused_output) = fused_output {
                     let join_id = input_frags[0].id;
                     if let Some(fused_input) =
                         inline_source_exchange(input_plan.clone(), join_id, &input_frags[0].root)
@@ -3163,7 +3173,7 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                             aggr_exprs: aggr_exprs.clone(),
                             schema: partial_schema.clone(),
                         };
-                        join_fragment.output_partitioning = partial_output_partitioning.clone();
+                        join_fragment.output_partitioning = fused_output;
                         let partial_exchange = LogicalPlan::ExchangeNode {
                             stage_id: join_fragment.id,
                             schema: partial_schema,
@@ -3795,6 +3805,42 @@ fn cast_f64(expr: PlanExpr) -> PlanExpr {
 /// PartialAggregate and the scan it sits on. Returns `None` if the target
 /// `ExchangeNode` isn't reachable through those wrappers — the caller then
 /// keeps the separate-fragment path, so this is always safe.
+/// Output partitioning for a partial aggregate fused into `join`, or
+/// `None` when fusing would change the join's task count.
+///
+/// A `HashPartitioned` join runs one task per bucket of its inputs, and its
+/// task count follows its output partitioning. A partial aggregate's
+/// `Single` output would make it one task, which reads bucket 0 only and
+/// serializes the whole join; `Hash { columns: [] }` keeps the tasks and
+/// still gives each one a single output partition. A hash-partitioned
+/// partial output keeps them only when its partition count is the join's.
+/// Other joins (a broadcast join in its probe scan's fragment) size their
+/// tasks from their scans, so any output works.
+fn fused_join_output(
+    join: &PlanFragment,
+    partial: &PartitioningScheme,
+) -> Option<PartitioningScheme> {
+    let join_tasks = match (&join.fragment_type, &join.output_partitioning) {
+        (
+            FragmentType::HashPartitioned,
+            PartitioningScheme::Hash {
+                partition_count, ..
+            },
+        ) => *partition_count,
+        _ => return Some(partial.clone()),
+    };
+    match partial {
+        PartitioningScheme::Single => Some(PartitioningScheme::Hash {
+            columns: Vec::new(),
+            partition_count: join_tasks,
+        }),
+        PartitioningScheme::Hash {
+            partition_count, ..
+        } if *partition_count == join_tasks => Some(partial.clone()),
+        _ => None,
+    }
+}
+
 fn inline_source_exchange(
     plan: LogicalPlan,
     target: StageId,
@@ -5156,10 +5202,27 @@ mod tests {
         assert_eq!(result.source_fragments.len(), 1);
         let join_frag = &result.source_fragments[0];
         assert_eq!(join_frag.fragment_type, FragmentType::HashPartitioned);
-        assert!(matches!(
+        // One task per join bucket: the join's inputs are hash-partitioned
+        // into N buckets, and the fused fragment must keep N tasks, each
+        // with a single output partition (#258: `Single` made it one task).
+        let input_buckets = join_frag
+            .source_fragments
+            .iter()
+            .map(|f| match f.output_partitioning {
+                PartitioningScheme::Hash {
+                    partition_count, ..
+                } => partition_count,
+                ref other => panic!("join input not hash-partitioned: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert!(input_buckets.iter().all(|&n| n == input_buckets[0]) && input_buckets[0] > 1);
+        assert_eq!(
             join_frag.output_partitioning,
-            PartitioningScheme::Single
-        ));
+            PartitioningScheme::Hash {
+                columns: Vec::new(),
+                partition_count: input_buckets[0],
+            }
+        );
         let LogicalPlan::PartialAggregate {
             input, aggr_exprs, ..
         } = &join_frag.root
@@ -5168,6 +5231,50 @@ mod tests {
         };
         assert_eq!(aggr_exprs.len(), 2);
         assert!(matches!(**input, LogicalPlan::Join { .. }));
+    }
+
+    fn join_fragment(output: PartitioningScheme) -> PlanFragment {
+        PlanFragment {
+            id: StageId(7),
+            fragment_type: FragmentType::HashPartitioned,
+            root: scan_with_columns("t", &["k"]),
+            output_partitioning: output,
+            source_fragments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_fused_partial_keeps_the_partitioned_joins_task_count() {
+        let join = join_fragment(PartitioningScheme::Hash {
+            columns: vec![0],
+            partition_count: 4,
+        });
+        assert_eq!(
+            fused_join_output(&join, &PartitioningScheme::Single),
+            Some(PartitioningScheme::Hash {
+                columns: Vec::new(),
+                partition_count: 4
+            })
+        );
+        let same = PartitioningScheme::Hash {
+            columns: vec![1],
+            partition_count: 4,
+        };
+        assert_eq!(fused_join_output(&join, &same), Some(same));
+        // A parallel final with another partition count would change the
+        // join's task count, so the partial stays in its own fragment.
+        let other = PartitioningScheme::Hash {
+            columns: vec![1],
+            partition_count: 3,
+        };
+        assert_eq!(fused_join_output(&join, &other), None);
+        // A join sized by its scans takes the partial's output as is.
+        let mut source_join = join_fragment(PartitioningScheme::Single);
+        source_join.fragment_type = FragmentType::Source;
+        assert_eq!(
+            fused_join_output(&source_join, &PartitioningScheme::Single),
+            Some(PartitioningScheme::Single)
+        );
     }
 
     #[test]

@@ -127,15 +127,8 @@ SELECT * FROM orders WHERE status IN ('shipped', 'delivered');
 SELECT * FROM users WHERE id IN (SELECT user_id FROM premium_users);
 ```
 
-`expression = ANY (array)` is true when the value equals an element of the
-array, and `expression <> ALL (array)` when it equals none. The array may be
-a literal, a column, a cast or a bound parameter. See
-[Arrays](/sql/advanced#arrays).
-
-```sql
-SELECT * FROM orders WHERE status = ANY (ARRAY['shipped', 'delivered']);
-SELECT * FROM orders WHERE id = ANY ($1);   -- $1 bound as int8[]
-```
+For `= ANY` / `<> ALL` over an array, see
+[ARRAY constructor and ANY / ALL](#array-constructor-and-any-all).
 
 ## LIKE
 
@@ -172,6 +165,10 @@ type, which the Python client returns as a `list`.
 ```sql
 SELECT ARRAY[1, 2, 3], ARRAY['a,b', NULL];
 ```
+
+`'{...}'::type[]` casts PostgreSQL array text (quoted elements, `NULL`,
+backslash escapes): `'{1,NULL,3}'::int[]`. Malformed text is an error, never
+`NULL`. `ARRAY[]` needs a cast to give it a type (`ARRAY[]::int[]`).
 
 `x = ANY (array)` and `x <> ALL (array)` work over an array expression or an
 array bind parameter (for example `= ANY($1)` with `{}` or `{1,NULL}`):

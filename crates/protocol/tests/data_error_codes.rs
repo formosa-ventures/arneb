@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use serde_json::Value;
@@ -45,6 +45,11 @@ fn state() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
             Arc::new(Int32Array::from(vec![1, i32::MAX])),
         ),
         ("z", DataType::Int32, Arc::new(Int32Array::from(vec![1, 0]))),
+        (
+            "f",
+            DataType::Float64,
+            Arc::new(Float64Array::from(vec![1.5, f64::NAN])),
+        ),
     ];
     let fields: Vec<Field> = columns
         .iter()
@@ -131,6 +136,26 @@ const CASES: &[(&str, &str, i64, &str)] = &[
         "NUMERIC_VALUE_OUT_OF_RANGE",
     ),
     ("SELECT i / z FROM d", "22012", 8, "DIVISION_BY_ZERO"),
+    // NaN to an integer: PostgreSQL says out of range, Trino invalid cast
+    // argument. ±Infinity is out of range in both.
+    (
+        "SELECT CAST(f AS INTEGER) FROM d",
+        "22003",
+        9,
+        "INVALID_CAST_ARGUMENT",
+    ),
+    (
+        "SELECT CAST(nan() AS BIGINT)",
+        "22003",
+        9,
+        "INVALID_CAST_ARGUMENT",
+    ),
+    (
+        "SELECT CAST(infinity() AS INTEGER)",
+        "22003",
+        19,
+        "NUMERIC_VALUE_OUT_OF_RANGE",
+    ),
     ("SELECT i % z FROM d", "22012", 8, "DIVISION_BY_ZERO"),
     (
         "SELECT CAST(big AS DECIMAL(5, 0)) FROM d",

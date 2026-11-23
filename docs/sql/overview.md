@@ -87,7 +87,8 @@ evaluates it. [`TRY`](/sql/functions#try) turns any of these into `NULL`.
 
 | SQLSTATE | Trino `errorName` (`errorCode`) | Example |
 |---|---|---|
-| `22003` | `NUMERIC_VALUE_OUT_OF_RANGE` (19) | `CAST(300 AS TINYINT)`, an INTEGER `+` that overflows, a DECIMAL result too wide for its type |
+| `22003` | `NUMERIC_VALUE_OUT_OF_RANGE` (19) | `CAST(300 AS TINYINT)`, `CAST(infinity() AS INTEGER)`, an INTEGER `+` that overflows, a DECIMAL result too wide for its type |
+| `22003` | `INVALID_CAST_ARGUMENT` (9) | `CAST(nan() AS INTEGER)`: PostgreSQL calls it out of range, Trino an invalid cast argument (`Cannot cast double NaN to integer`) |
 | `22P02` | `INVALID_CAST_ARGUMENT` (9) | `CAST('abc' AS INTEGER)` |
 | `22007` | `INVALID_CAST_ARGUMENT` (9) | `CAST('2024-13-45' AS DATE)` |
 | `22012` | `DIVISION_BY_ZERO` (8) | `x / 0`, `x % 0` on integers |

@@ -315,6 +315,9 @@ pub enum DataErrorKind {
     InvalidDatetimeFormat,
     /// Division (or modulo) by zero. pgwire `22012`, Trino `DIVISION_BY_ZERO`.
     DivisionByZero,
+    /// A floating-point NaN cast to an integer type. pgwire `22003`, as
+    /// PostgreSQL reports `'NaN'::float8::int`; Trino `INVALID_CAST_ARGUMENT`.
+    NanToInteger,
 }
 
 impl DataErrorKind {
@@ -335,6 +338,21 @@ impl DataErrorKind {
         }
     }
 
+    /// The kind of a cast from `from` to `to` that failed with `err`: as
+    /// [`Self::of_cast`], except a NaN cast to an integer, which only the
+    /// error itself can tell from a value out of range.
+    pub fn of_cast_error(
+        from: &arrow::datatypes::DataType,
+        to: &arrow::datatypes::DataType,
+        err: &arrow::error::ArrowError,
+    ) -> Self {
+        if crate::numeric_cast::is_nan_cast_error(err) {
+            Self::NanToInteger
+        } else {
+            Self::of_cast(from, to)
+        }
+    }
+
     /// Stable name of the kind, used to carry it across the exchange wire.
     pub fn tag(self) -> &'static str {
         match self {
@@ -342,6 +360,7 @@ impl DataErrorKind {
             Self::InvalidTextRepresentation => "invalid-text-representation",
             Self::InvalidDatetimeFormat => "invalid-datetime-format",
             Self::DivisionByZero => "division-by-zero",
+            Self::NanToInteger => "nan-to-integer",
         }
     }
 
@@ -352,6 +371,7 @@ impl DataErrorKind {
             Self::InvalidTextRepresentation,
             Self::InvalidDatetimeFormat,
             Self::DivisionByZero,
+            Self::NanToInteger,
         ]
         .into_iter()
         .find(|kind| kind.tag() == tag)
@@ -714,6 +734,7 @@ mod tests {
             DataErrorKind::InvalidTextRepresentation,
             DataErrorKind::InvalidDatetimeFormat,
             DataErrorKind::DivisionByZero,
+            DataErrorKind::NanToInteger,
         ] {
             assert_eq!(DataErrorKind::from_tag(kind.tag()), Some(kind));
         }

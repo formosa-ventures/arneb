@@ -125,7 +125,7 @@ fn cast_to_array(value: &ScalarValue, target: &DataType) -> Result<ArrayRef, Pla
             let source_arrow = source_array.data_type();
             if can_cast_types(source_arrow, &target_arrow) {
                 PlanError::Data {
-                    kind: DataErrorKind::of_cast(source_arrow, &target_arrow),
+                    kind: DataErrorKind::of_cast_error(source_arrow, &target_arrow, &e),
                     message,
                     location: None,
                 }

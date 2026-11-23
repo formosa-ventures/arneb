@@ -253,8 +253,6 @@ impl fmt::Debug for IcebergDataSource {
 struct FileColumnMap {
     /// Field ID → root column index in the file.
     root_by_field: HashMap<i32, usize>,
-    /// Root index → leaf index, for primitive roots only.
-    leaf_by_root: HashMap<usize, usize>,
 }
 
 impl FileColumnMap {
@@ -273,17 +271,7 @@ impl FileColumnMap {
                 root_by_field.entry(id).or_insert(idx);
             }
         }
-        let mut leaf_by_root = HashMap::new();
-        for leaf in 0..schema.num_columns() {
-            let root = schema.get_column_root_idx(leaf);
-            if roots[root].is_primitive() {
-                leaf_by_root.insert(root, leaf);
-            }
-        }
-        Self {
-            root_by_field,
-            leaf_by_root,
-        }
+        Self { root_by_field }
     }
 }
 
@@ -363,7 +351,9 @@ impl DataSource for IcebergDataSource {
             if file_arrow.field(root).data_type() != &target {
                 return None;
             }
-            fmap.leaf_by_root.get(&root).copied()
+            // `build_split_stream` maps the root to its leaf, and leaves
+            // nested roots out.
+            Some(root)
         };
         let file_filters: Vec<PlanExpr> = ctx
             .filters

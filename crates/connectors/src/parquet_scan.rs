@@ -115,8 +115,11 @@ pub async fn open_parquet_builder(
 /// Configure an opened file for one `(split_idx, splits_per_file)`
 /// sub-partition and build its stream.
 ///
-/// - `filters` must reference **file leaf column indices** (for Hive the
-///   table schema equals the file schema; Iceberg remaps by field ID).
+/// - `filters` and `dynamic_domains` reference **file root column indices**
+///   (for Hive and registered files the table schema equals the file schema;
+///   Iceberg remaps by field ID). They are mapped to the leaf indices the
+///   Parquet pushdown works on here; one on a nested root is not pushed
+///   (see [`roots_to_leaves`]).
 /// - `projection_roots`: file root columns to read (`None` = all).
 /// - `batch_size`: `None` uses [`crate::file::scan_default_batch_size`].
 ///
@@ -135,6 +138,9 @@ pub fn build_split_stream(
     split_idx: usize,
     splits_per_file: usize,
 ) -> Result<ParquetRecordBatchStream<ParquetObjectReader>, ExecutionError> {
+    let (filters, dynamic_domains) =
+        roots_to_leaves(builder.parquet_schema(), filters, dynamic_domains);
+    let (filters, dynamic_domains) = (&filters[..], &dynamic_domains[..]);
     let total_rows: usize = builder
         .metadata()
         .row_groups()
@@ -189,13 +195,9 @@ pub fn build_split_stream(
         builder = builder.with_projection(mask);
     }
 
-    // Default 2048 (override Parquet's built-in 8192) to keep per-
-    // partition in-flight Arrow batches small. Per Trino architecture
-    // research + arrow-rs issue #623: in-flight working set scales
-    // linearly with batch_size × pipeline_depth × partition_count;
-    // smaller default = lower memory floor for small queries (TPC-H
-    // Q01/Q06/Q10/Q12/Q14 baseline). Override via `ctx.batch_size`, or
-    // tune the default at runtime via `ARNEB_SCAN_BATCH_SIZE`.
+    // `ctx.batch_size`, else `scan_default_batch_size()` (16384 unless
+    // `ARNEB_SCAN_BATCH_SIZE` says otherwise). The in-flight working set
+    // scales with batch_size × pipeline_depth × partition_count.
     let batch_size = batch_size.unwrap_or_else(crate::file::scan_default_batch_size);
     builder = builder.with_batch_size(batch_size);
 
@@ -204,6 +206,44 @@ pub fn build_split_stream(
             "Parquet reader build error for '{file_path}': {e}"
         ))
     })
+}
+
+/// Map filters and dynamic-filter domains from file root column indices to
+/// the leaf column indices the Parquet pushdown (row-group statistics and
+/// `RowFilter`) reads.
+///
+/// Root and leaf indices differ as soon as a nested column (a struct or a
+/// map, which have several leaves) comes before the filtered one. A filter
+/// or domain on a nested root, or on a column the file does not have, is
+/// dropped: it still runs above the scan, which is what keeps this safe.
+pub fn roots_to_leaves(
+    schema: &parquet::schema::types::SchemaDescriptor,
+    filters: &[PlanExpr],
+    dynamic_domains: &[arneb_execution::DynamicFilterDomain],
+) -> (Vec<PlanExpr>, Vec<arneb_execution::DynamicFilterDomain>) {
+    let roots = schema.root_schema().get_fields();
+    let mut leaf_by_root: Vec<Option<usize>> = vec![None; roots.len()];
+    for leaf in 0..schema.num_columns() {
+        let root = schema.get_column_root_idx(leaf);
+        if roots[root].is_primitive() {
+            leaf_by_root[root] = Some(leaf);
+        }
+    }
+    let leaf_of = |root: usize| leaf_by_root.get(root).copied().flatten();
+    let filters = filters
+        .iter()
+        .filter_map(|f| crate::scan_adapter::remap_filter(f, &leaf_of))
+        .collect();
+    let dynamic_domains = dynamic_domains
+        .iter()
+        .filter_map(|d| {
+            Some(arneb_execution::DynamicFilterDomain {
+                column_index: leaf_of(d.column_index)?,
+                ..d.clone()
+            })
+        })
+        .collect();
+    (filters, dynamic_domains)
 }
 
 /// Bytes a scan of this file holds in its decode buffer: the compressed

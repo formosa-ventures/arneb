@@ -310,6 +310,10 @@ fn prune_with_minmax_f64(
     }
 }
 
+/// Longest `IN` list turned into a row-level Parquet predicate. A longer
+/// one still prunes row groups by statistics.
+pub const MAX_ROW_FILTER_INLIST: usize = 4096;
+
 /// Try to build a `RowFilter` from plan expressions for predicate pushdown.
 ///
 /// Returns `None` if no expressions can be translated. Unsupported expressions
@@ -525,6 +529,13 @@ fn try_build_predicate(
             let PlanExpr::Column { index, .. } = expr.as_ref() else {
                 return None;
             };
+            // A dynamic-filter list can hold hundreds of thousands of keys.
+            // Each split would build its own set of them, outside the memory
+            // pool, for a filter the FilterExec above the scan applies again
+            // anyway; such a list only prunes row groups.
+            if list.len() > MAX_ROW_FILTER_INLIST {
+                return None;
+            }
             let values = extract_inlist_literals(list)?;
             let mask = ProjectionMask::leaves(schema, [*index]);
             let predicate = build_inlist_predicate(values)?;

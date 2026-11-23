@@ -1480,6 +1480,123 @@ mod tests {
         }
     }
 
+    /// Filters reach the Parquet pushdown by leaf column, not by table
+    /// column. With a struct (two leaves) ahead of `id`, table column 1 is
+    /// `id` but leaf 1 is `s.b`; a filter on `id` must still test `id`.
+    #[tokio::test]
+    async fn a_filter_after_a_struct_column_tests_its_own_column() {
+        use arrow::array::StructArray;
+        use arrow::datatypes::Fields;
+        use object_store::memory::InMemory;
+        use object_store::PutPayload;
+        use parquet::arrow::arrow_writer::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let rows = 100_000;
+        let ids: Vec<i32> = (0..rows).collect();
+        let struct_fields = Fields::from(vec![
+            Field::new("a", ArrowDataType::Int32, false),
+            Field::new("b", ArrowDataType::Int32, false),
+        ]);
+        // `s.b` never equals any `id`, so a filter on `id` misapplied to
+        // `s.b` would drop every row.
+        let s = StructArray::new(
+            struct_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids.clone())),
+                Arc::new(Int32Array::from(
+                    ids.iter().map(|i| i + 1_000_000).collect::<Vec<_>>(),
+                )),
+            ],
+            None,
+        );
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("s", ArrowDataType::Struct(struct_fields), false),
+            Field::new("id", ArrowDataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(s), Arc::new(Int32Array::from(ids))],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(25_000))
+            .build();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, arrow_schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &ObjectPath::from("data/nested.parquet"),
+                PutPayload::from_bytes(buf.into()),
+            )
+            .await
+            .unwrap();
+        let registry = Arc::new(StorageRegistry::new());
+        registry.register_store("s3://nested-bucket", store);
+        let factory = FileConnectorFactory::new(registry);
+        factory
+            .register_table(
+                "nested",
+                "s3://nested-bucket/data/nested.parquet",
+                FileFormat::Parquet,
+                None,
+            )
+            .await
+            .unwrap();
+        let ds = factory
+            .create_data_source(&TableReference::table("nested"), &[], &parallelism(2))
+            .await
+            .unwrap();
+
+        use arneb_common::types::ScalarValue;
+        use arneb_planner::PlanExpr;
+        let id = || PlanExpr::Column {
+            index: 1,
+            name: "id".to_string(),
+            span: None,
+        };
+        let int = |v: i32| PlanExpr::Literal {
+            value: ScalarValue::Int32(v),
+            span: None,
+        };
+        let filters = vec![
+            PlanExpr::BinaryOp {
+                left: Box::new(id()),
+                op: arneb_sql_parser::ast::BinaryOp::GtEq,
+                right: Box::new(int(60_000)),
+                span: None,
+            },
+            PlanExpr::InList {
+                expr: Box::new(id()),
+                list: vec![int(5), int(60_005), int(70_000)],
+                negated: false,
+                span: None,
+            },
+        ];
+        let ctx = ScanContext::default().with_filters(filters);
+        let mut got = Vec::new();
+        for p in 0..ds.partition_count() {
+            let stream = ds.scan(&ctx, p).await.unwrap();
+            for b in arneb_common::stream::collect_stream(stream).await.unwrap() {
+                let col = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+                got.extend(col.values().iter().copied());
+            }
+        }
+        got.sort_unstable();
+        // The scan may return extra rows (FilterExec above it filters
+        // exactly); it must not lose the matching ones.
+        for want in [60_005, 70_000] {
+            assert!(got.contains(&want), "missing id {want}: {} rows", got.len());
+        }
+        assert!(
+            !got.contains(&5),
+            "row group pruning on `id` keeps id 5 out"
+        );
+    }
+
     #[tokio::test]
     async fn a_registered_parquet_scan_uses_the_scan_batch_size() {
         let factory = register_ids(100_000).await;

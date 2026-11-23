@@ -1091,9 +1091,12 @@ impl TaskManager {
 
                     if let Some(ref mut sw) = spill {
                         if let Err(e) = sw.write(&batch) {
-                            return Err(record_failure(format!(
-                                "exchange spill write failed: {e}"
-                            ).into()));
+                            return Err(record_failure(
+                                arneb_rpc::TaskFailure::from_execution_error(
+                                    "exchange spill write failed",
+                                    &e,
+                                ),
+                            ));
                         }
                         continue;
                     }
@@ -1151,9 +1154,12 @@ impl TaskManager {
                             }
                         };
                         if let Err(e) = sw.write(&returned) {
-                            return Err(record_failure(format!(
-                                "exchange spill write failed: {e}"
-                            ).into()));
+                            return Err(record_failure(
+                                arneb_rpc::TaskFailure::from_execution_error(
+                                    "exchange spill write failed",
+                                    &e,
+                                ),
+                            ));
                         }
                         spill = Some(sw);
                     }

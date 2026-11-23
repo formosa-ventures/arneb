@@ -157,6 +157,11 @@ pub struct TaskFailureReport {
     /// Whether it is a memory or spill limit failure (`ResourceExhausted`).
     #[serde(default)]
     pub resource_exhausted: bool,
+    /// A data error's [`DataErrorKind::tag`], so the client gets its
+    /// SQLSTATE. Absent from an older worker, whose report then reads as
+    /// an ordinary failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_kind: Option<String>,
 }
 
 impl TaskFailureReport {
@@ -171,17 +176,22 @@ impl TaskFailureReport {
             task_id: task_id.into(),
             message: failure.message.clone(),
             resource_exhausted: failure.is_resource_exhausted(),
+            data_kind: match failure.class {
+                FailureClass::Data(kind) => Some(kind.tag().to_string()),
+                _ => None,
+            },
         }
     }
 
     /// The reported failure.
     pub fn failure(&self) -> TaskFailure {
+        let data = self.data_kind.as_deref().and_then(DataErrorKind::from_tag);
         TaskFailure {
             message: self.message.clone(),
-            class: if self.resource_exhausted {
-                FailureClass::ResourceExhausted
-            } else {
-                FailureClass::Other
+            class: match (self.resource_exhausted, data) {
+                (true, _) => FailureClass::ResourceExhausted,
+                (false, Some(kind)) => FailureClass::Data(kind),
+                (false, None) => FailureClass::Other,
             },
         }
     }
@@ -327,6 +337,33 @@ mod tests {
                 .unwrap()
                 .resource_exhausted
         );
+    }
+
+    /// A data error reported straight to the coordinator keeps its kind,
+    /// so the client gets its SQLSTATE, not a generic internal error.
+    #[test]
+    fn a_data_error_report_round_trips_with_its_kind() {
+        let query_id = arneb_common::QueryId::new();
+        let failure = TaskFailure::data(
+            DataErrorKind::NumericValueOutOfRange,
+            "value 3000000000 is out of range for Int32",
+        );
+        let report = TaskFailureReport::new(query_id, "q.2.1", &failure);
+        let back = TaskFailureReport::decode(&report.encode()).unwrap();
+        assert_eq!(back.failure(), failure);
+        assert!(matches!(
+            back.failure().into_execution_error("task q.2.1 failed"),
+            ExecutionError::Data {
+                kind: DataErrorKind::NumericValueOutOfRange,
+                message,
+            } if message == "value 3000000000 is out of range for Int32"
+        ));
+        // A kind this coordinator does not know reads as an ordinary failure.
+        let unknown = TaskFailureReport {
+            data_kind: Some("from-a-newer-worker".to_string()),
+            ..report
+        };
+        assert_eq!(unknown.failure().class, FailureClass::Other);
     }
 
     #[test]

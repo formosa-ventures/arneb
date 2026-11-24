@@ -224,6 +224,25 @@ coordinator SHALL log the effective policy and attempt count on
 - **WHEN** the file sets `retry_policy = "query"` and `ARNEB_RETRY_POLICY=none` is set
 - **THEN** retry is off
 
+### Requirement: Coordinator root-stage placement
+`[cluster] include_coordinator` SHALL default to `false`, overridden by
+`ARNEB_INCLUDE_COORDINATOR` (env > file; an invalid boolean SHALL stop
+startup with an error naming the variable). When `false`, a root fragment
+whose plan holds a join, an aggregation, a sort, a window or a set operation
+SHALL run as a single-task stage on a worker, and the coordinator SHALL only
+gather that stage's output. A root fragment that only projects, filters,
+limits or unions its exchanges, or that scans a table or writes data, SHALL
+stay on the coordinator. The coordinator SHALL log the effective value on
+`arneb::config`.
+
+#### Scenario: Final aggregation leaves the coordinator
+- **WHEN** a distributed `SELECT count(*) FROM t` runs with the default setting
+- **THEN** the final aggregation runs in a worker task and the coordinator's root plan is a single exchange
+
+#### Scenario: Opt back in
+- **WHEN** `ARNEB_INCLUDE_COORDINATOR=true` is set
+- **THEN** the coordinator runs the root fragment's operators itself
+
 ### Requirement: [tls] config section
 The system SHALL accept an optional `[tls]` TOML section with `cert_path` and `key_path` (both required when the section is present), plus `pgwire` (`"required"` by default, or `"optional"`). Unknown keys SHALL be rejected. `ARNEB_TLS_CERT_PATH`, `ARNEB_TLS_KEY_PATH` and `ARNEB_TLS_PGWIRE` SHALL override the file values, and setting both path variables SHALL enable TLS without a `[tls]` section. The effective TLS mode SHALL be logged at startup on the `arneb::config` target, for example `tls_pgwire="required" tls_trino="https"`, or `tls="off"`.
 

@@ -1494,6 +1494,82 @@ fn plan_kind_label(plan: &LogicalPlan) -> String {
     }
 }
 
+/// Where the root fragment's plan should run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RootPlacement {
+    /// Only per-row work over its exchanges: cheap on the coordinator.
+    Light,
+    /// A join, aggregation, sort, window or set operation: run it on a
+    /// worker.
+    Offload,
+    /// Scans a table, writes data or explains: stays on the coordinator,
+    /// whose catalogs and data sources the plan was registered against.
+    Pinned,
+}
+
+/// Classify the root fragment's plan (down to its exchanges); the most
+/// restrictive node wins.
+fn root_placement(plan: &LogicalPlan) -> RootPlacement {
+    use LogicalPlan as L;
+    let own = match plan {
+        L::ExchangeNode { .. }
+        | L::OneRow
+        | L::Projection { .. }
+        | L::Filter { .. }
+        | L::Limit { .. }
+        | L::UnionAll { .. }
+        | L::ProjectSet { .. }
+        | L::AssignUniqueId { .. } => RootPlacement::Light,
+        L::Join { .. }
+        | L::SemiJoin { .. }
+        | L::AntiJoin { .. }
+        | L::Aggregate { .. }
+        | L::RollupAggregate { .. }
+        | L::PartialAggregate { .. }
+        | L::FinalAggregate { .. }
+        | L::Sort { .. }
+        | L::Distinct { .. }
+        | L::Intersect { .. }
+        | L::Except { .. }
+        | L::Window { .. } => RootPlacement::Offload,
+        L::TableScan { .. }
+        | L::Explain { .. }
+        | L::ScalarSubquery { .. }
+        | L::CreateTable { .. }
+        | L::DropTable { .. }
+        | L::CreateTableAsSelect { .. }
+        | L::InsertInto { .. }
+        | L::DeleteFrom { .. }
+        | L::CreateView { .. }
+        | L::DropView { .. } => return RootPlacement::Pinned,
+    };
+    let children: Vec<&LogicalPlan> = match plan {
+        L::Projection { input, .. }
+        | L::Filter { input, .. }
+        | L::Limit { input, .. }
+        | L::ProjectSet { input, .. }
+        | L::AssignUniqueId { input, .. }
+        | L::Aggregate { input, .. }
+        | L::RollupAggregate { input, .. }
+        | L::PartialAggregate { input, .. }
+        | L::FinalAggregate { input, .. }
+        | L::Sort { input, .. }
+        | L::Distinct { input }
+        | L::Window { input, .. } => vec![input],
+        L::Join { left, right, .. }
+        | L::SemiJoin { left, right, .. }
+        | L::AntiJoin { left, right, .. }
+        | L::Intersect { left, right }
+        | L::Except { left, right } => vec![left, right],
+        L::UnionAll { inputs } => inputs.iter().collect(),
+        _ => Vec::new(),
+    };
+    children
+        .into_iter()
+        .map(root_placement)
+        .fold(own, std::cmp::max)
+}
+
 pub struct PlanFragmenter {
     next_stage_id: u32,
     swap_df_allocator: DynamicFilterIdAllocator,
@@ -1511,6 +1587,10 @@ pub struct PlanFragmenter {
     /// a high-cardinality aggregate and `ARNEB_PARTITIONED_SEMI_JOIN` is on.
     force_parallel_final_agg: bool,
     join_child: bool,
+    /// Move the root fragment's work to a single-task worker stage, so the
+    /// coordinator only gathers the result (see
+    /// [`Self::with_coordinator_offload`]).
+    offload_coordinator_work: bool,
 }
 
 impl PlanFragmenter {
@@ -1526,7 +1606,22 @@ impl PlanFragmenter {
             max_hash_partitions: DEFAULT_MAX_HASH_PARTITIONS,
             force_parallel_final_agg: false,
             join_child: false,
+            offload_coordinator_work: false,
         }
+    }
+
+    /// When `true`, a root fragment that does real work (a join, an
+    /// aggregation, a sort, a window, a set operation) is moved into a
+    /// single-task `Fixed` fragment that runs on a worker, and the
+    /// coordinator's root becomes a bare exchange over it. This keeps
+    /// data-heavy operators off the coordinator, which also plans queries,
+    /// serves clients and receives heartbeats (Trino's
+    /// `node-scheduler.include-coordinator=false`). A root that only
+    /// projects, filters or limits its exchanges stays on the coordinator,
+    /// as does one that scans a table or writes data. Default `false`.
+    pub fn with_coordinator_offload(mut self, enabled: bool) -> Self {
+        self.offload_coordinator_work = enabled;
+        self
     }
 
     /// `dist-adaptive-partition`: set the live cluster worker count, a floor
@@ -1803,6 +1898,32 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
         // one `partition_count` so the M==N invariant holds at every boundary.
         // No-op at the historical fixed N=2 (already uniform).
         normalize_chain_partition_counts(&mut root);
+        if self.offload_coordinator_work {
+            root = self.offload_root_work(root);
+        }
+        root
+    }
+
+    /// The root fragment with its work moved to a worker stage, when
+    /// [`root_placement`] says it holds work that may run there.
+    fn offload_root_work(&mut self, mut root: PlanFragment) -> PlanFragment {
+        if root.source_fragments.is_empty() || root_placement(&root.root) != RootPlacement::Offload
+        {
+            return root;
+        }
+        let schema = root.root.schema();
+        let stage = PlanFragment {
+            id: self.next_id(),
+            fragment_type: FragmentType::Fixed,
+            root: std::mem::replace(&mut root.root, LogicalPlan::OneRow),
+            output_partitioning: PartitioningScheme::Single,
+            source_fragments: std::mem::take(&mut root.source_fragments),
+        };
+        root.root = LogicalPlan::ExchangeNode {
+            stage_id: stage.id,
+            schema,
+        };
+        root.source_fragments = vec![stage];
         root
     }
 
@@ -7632,5 +7753,141 @@ mod tests {
         assert_eq!(semi_build[0].id, semi_id);
         assert_eq!(anti_build[0].id, semi_id);
         assert_eq!(anti_build[0].column_index, 1);
+    }
+
+    fn sorted_scan() -> LogicalPlan {
+        LogicalPlan::Sort {
+            input: Box::new(scan("t")),
+            order_by: vec![SortExpr {
+                expr: column(0, "id"),
+                asc: true,
+                nulls_first: false,
+            }],
+        }
+    }
+
+    fn joined_scans() -> LogicalPlan {
+        LogicalPlan::Join {
+            left: Box::new(scan("left_table")),
+            right: Box::new(scan("right_table")),
+            join_type: ast::JoinType::Inner,
+            condition: crate::plan::JoinCondition::None,
+            dynamic_filter_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn coordinator_offload_moves_root_work_to_a_single_worker_stage() {
+        let plain = PlanFragmenter::new().fragment(sorted_scan());
+        assert!(
+            matches!(plain.root, LogicalPlan::Sort { .. }),
+            "without offload the sort runs on the coordinator: {:?}",
+            plain.root
+        );
+
+        let result = PlanFragmenter::new()
+            .with_coordinator_offload(true)
+            .fragment(sorted_scan());
+        let LogicalPlan::ExchangeNode { stage_id, schema } = &result.root else {
+            panic!("the coordinator only gathers: {:?}", result.root);
+        };
+        assert_eq!(schema, &sorted_scan().schema());
+        assert_eq!(result.output_partitioning, PartitioningScheme::Single);
+        let [stage] = result.source_fragments.as_slice() else {
+            panic!("one offloaded stage: {:?}", result.source_fragments);
+        };
+        assert_eq!(stage.id, *stage_id);
+        assert_ne!(stage.id, result.id);
+        assert_eq!(stage.fragment_type, FragmentType::Fixed);
+        assert_eq!(stage.output_partitioning, PartitioningScheme::Single);
+        let LogicalPlan::Sort { input, .. } = &stage.root else {
+            panic!("the sort moved to the worker stage: {:?}", stage.root);
+        };
+        let LogicalPlan::ExchangeNode {
+            stage_id: scan_stage,
+            ..
+        } = input.as_ref()
+        else {
+            panic!("the sort still reads the scan stage: {input:?}");
+        };
+        assert_eq!(stage.source_fragments.len(), 1);
+        assert_eq!(stage.source_fragments[0].id, *scan_stage);
+        assert_eq!(count_table_scans_in_fragments(&result, "t"), 1);
+    }
+
+    #[test]
+    fn coordinator_offload_keeps_stage_ids_unique() {
+        let result = PlanFragmenter::new()
+            .with_coordinator_offload(true)
+            .fragment(LogicalPlan::Limit {
+                input: Box::new(joined_scans()),
+                limit: Some(10),
+                offset: None,
+            });
+        let mut ids = Vec::new();
+        let mut pending = vec![&result];
+        while let Some(fragment) = pending.pop() {
+            ids.push(fragment.id);
+            pending.extend(&fragment.source_fragments);
+        }
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
+    }
+
+    #[test]
+    fn coordinator_offload_leaves_a_light_root_alone() {
+        for plan in [
+            scan("t"),
+            LogicalPlan::Limit {
+                input: Box::new(scan("t")),
+                limit: Some(5),
+                offset: None,
+            },
+            LogicalPlan::UnionAll {
+                inputs: vec![scan("a"), scan("b")],
+            },
+        ] {
+            let plain = PlanFragmenter::new().fragment(plan.clone());
+            let offloaded = PlanFragmenter::new()
+                .with_coordinator_offload(true)
+                .fragment(plan);
+            assert_eq!(
+                format!("{offloaded:?}"),
+                format!("{plain:?}"),
+                "a light root is not moved"
+            );
+        }
+    }
+
+    #[test]
+    fn root_placement_takes_the_most_restrictive_node() {
+        let exchange = || LogicalPlan::ExchangeNode {
+            stage_id: StageId(0),
+            schema: scan("t").schema(),
+        };
+        let limit = |input: LogicalPlan| LogicalPlan::Limit {
+            input: Box::new(input),
+            limit: Some(1),
+            offset: None,
+        };
+        let sort = |input: LogicalPlan| LogicalPlan::Sort {
+            input: Box::new(input),
+            order_by: Vec::new(),
+        };
+        assert_eq!(root_placement(&limit(exchange())), RootPlacement::Light);
+        assert_eq!(
+            root_placement(&limit(sort(exchange()))),
+            RootPlacement::Offload
+        );
+        // A scan left in the root was registered on the coordinator only.
+        let union = LogicalPlan::UnionAll {
+            inputs: vec![sort(exchange()), scan("t")],
+        };
+        assert_eq!(root_placement(&union), RootPlacement::Pinned);
+        let insert = LogicalPlan::InsertInto {
+            table: TableReference::table("t"),
+            source: Box::new(sort(exchange())),
+        };
+        assert_eq!(root_placement(&insert), RootPlacement::Pinned);
     }
 }

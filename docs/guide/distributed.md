@@ -294,6 +294,17 @@ above, is unchanged and works the same on a cordoned worker.
 5. Workers execute their fragments and return results via Flight RPC
 6. The coordinator assembles the final result and sends it to the client
 
+The coordinator does not run data-heavy operators. When the top of the plan
+(the part above the last exchange) holds a join, an aggregation, a sort, a
+window or a set operation, it runs as a single-task stage on a worker, and
+the coordinator only gathers that stage's rows for the client. Planning,
+client connections and worker heartbeats then never compete with query
+work on the coordinator. A top of the plan that only projects, filters or
+limits stays on the coordinator, where it adds no extra hop. Set
+`include_coordinator = true` in `[cluster]` (or
+`ARNEB_INCLUDE_COORDINATOR=true`) to run that work on the coordinator
+instead.
+
 ## Multi-Node Example
 
 Start a coordinator and two workers on a single machine:

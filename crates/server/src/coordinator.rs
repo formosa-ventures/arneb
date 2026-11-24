@@ -130,6 +130,9 @@ pub struct QueryCoordinator {
     /// Workers' task-failure reports, shared with the FlightState
     /// `task_failure_callback` registered in `main.rs`.
     task_failures: TaskFailures,
+    /// `[cluster] include_coordinator`: run the root fragment's work here
+    /// instead of on a worker. Off by default.
+    include_coordinator: bool,
 }
 
 impl QueryCoordinator {
@@ -139,7 +142,16 @@ impl QueryCoordinator {
             df_registry,
             retry: None,
             task_failures: TaskFailures::default(),
+            include_coordinator: false,
         }
+    }
+
+    /// Run the root fragment's joins, aggregations, sorts and windows on
+    /// the coordinator (`[cluster] include_coordinator = true`) instead of
+    /// in a single-task worker stage.
+    pub fn with_include_coordinator(mut self, include: bool) -> Self {
+        self.include_coordinator = include;
+        self
     }
 
     /// Fail a query as soon as a worker reports one of its tasks failed;
@@ -223,7 +235,8 @@ impl QueryCoordinator {
             .with_broadcast_threshold(exec_ctx.broadcast_max_build_bytes())
             .with_stats(exec_ctx.catalog_stats().cloned())
             .with_worker_count(worker_count)
-            .with_partition_policy(target_rows, max_partitions);
+            .with_partition_policy(target_rows, max_partitions)
+            .with_coordinator_offload(!self.include_coordinator);
         Ok((workers, in_flight, fragmenter))
     }
 

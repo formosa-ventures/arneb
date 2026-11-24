@@ -81,10 +81,13 @@ struct PlanLookup<'a> {
 
 impl ColumnStatsLookup for PlanLookup<'_> {
     fn lookup(&self, column: &str) -> Option<ColumnStatistics> {
-        walk_scans(self.input, &mut |table_ref| {
-            self.stats
-                .get(table_ref)
-                .and_then(|t| t.columns.get(column).cloned())
+        walk_scans(self.input, false, &mut |table_ref, null_extended| {
+            let mut column_stats = self.stats.get(table_ref)?.columns.get(column)?.clone();
+            if null_extended {
+                // Unmatched rows introduce NULLs absent from the base statistics.
+                column_stats.null_fraction = None;
+            }
+            Some(column_stats)
         })
     }
 }
@@ -726,7 +729,7 @@ pub fn total_scanned_rows(plan: &LogicalPlan, stats: &CatalogStats) -> f64 {
 }
 
 fn lookup_column_ndv(name: &str, plan: &LogicalPlan, stats: &CatalogStats) -> Option<u64> {
-    walk_scans(plan, &mut |scan_table| {
+    walk_scans(plan, false, &mut |scan_table, _| {
         stats
             .get(scan_table)
             .and_then(|t| t.columns.get(name))
@@ -734,12 +737,12 @@ fn lookup_column_ndv(name: &str, plan: &LogicalPlan, stats: &CatalogStats) -> Op
     })
 }
 
-fn walk_scans<T, F>(plan: &LogicalPlan, callback: &mut F) -> Option<T>
+fn walk_scans<T, F>(plan: &LogicalPlan, null_extended: bool, callback: &mut F) -> Option<T>
 where
-    F: FnMut(&TableReference) -> Option<T>,
+    F: FnMut(&TableReference, bool) -> Option<T>,
 {
     match plan {
-        LogicalPlan::TableScan { table, .. } => callback(table),
+        LogicalPlan::TableScan { table, .. } => callback(table, null_extended),
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Sort { input, .. }
@@ -750,23 +753,41 @@ where
         | LogicalPlan::RollupAggregate { input, .. }
         | LogicalPlan::PartialAggregate { input, .. }
         | LogicalPlan::FinalAggregate { input, .. }
-        | LogicalPlan::Window { input, .. } => walk_scans(input, callback),
-        LogicalPlan::Join { left, right, .. }
-        | LogicalPlan::SemiJoin { left, right, .. }
+        | LogicalPlan::Window { input, .. } => walk_scans(input, null_extended, callback),
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            ..
+        } => {
+            use ast::JoinType::{Full, Left, Right};
+            walk_scans(
+                left,
+                null_extended || matches!(join_type, Right | Full),
+                callback,
+            )
+            .or_else(|| {
+                walk_scans(
+                    right,
+                    null_extended || matches!(join_type, Left | Full),
+                    callback,
+                )
+            })
+        }
+        LogicalPlan::SemiJoin { left, right, .. }
         | LogicalPlan::AntiJoin { left, right, .. }
         | LogicalPlan::Intersect { left, right }
-        | LogicalPlan::Except { left, right } => {
-            walk_scans(left, callback).or_else(|| walk_scans(right, callback))
-        }
+        | LogicalPlan::Except { left, right } => walk_scans(left, null_extended, callback)
+            .or_else(|| walk_scans(right, null_extended, callback)),
         LogicalPlan::UnionAll { inputs } => {
             for input in inputs {
-                if let Some(v) = walk_scans(input, callback) {
+                if let Some(v) = walk_scans(input, null_extended, callback) {
                     return Some(v);
                 }
             }
             None
         }
-        LogicalPlan::ScalarSubquery { subplan } => walk_scans(subplan, callback),
+        LogicalPlan::ScalarSubquery { subplan } => walk_scans(subplan, null_extended, callback),
         _ => None,
     }
 }
@@ -1613,5 +1634,115 @@ mod tests {
             estimated_cardinality(&in_on, &stats),
             estimated_cardinality(&in_filter, &stats),
         );
+    }
+
+    mod outer_join_null_side {
+        //! `<col> IS NULL` above an outer join, where `<col>` comes from the
+        //! null-supplying side: every row the join could not match has NULL
+        //! there, so the base table's null fraction (from table stats) does
+        //! not describe the join output. TPC-DS q78's
+        //! `store_sales LEFT JOIN store_returns ... WHERE sr_ticket_number IS NULL`
+        //! was estimated at 0 rows from `sr_ticket_number`'s null fraction of
+        //! 0.0, so the planner broadcast 78 M fact rows as a hash-join build.
+
+        use super::*;
+
+        const SALES_ROWS: u64 = 86_406_277;
+        const RETURNS_ROWS: u64 = 8_639_377;
+
+        fn table_stats(rows: u64, column: &str, null_fraction: f64) -> TableStatistics {
+            let mut columns = HashMap::new();
+            columns.insert(
+                column.to_string(),
+                ColumnStatistics {
+                    null_fraction: Some(null_fraction),
+                    ..ColumnStatistics::default()
+                },
+            );
+            TableStatistics {
+                row_count: Some(rows),
+                size_bytes: None,
+                columns,
+            }
+        }
+
+        fn stats() -> CatalogStats {
+            let mut s = CatalogStats::new();
+            s.insert(
+                TableReference::table("store_sales"),
+                table_stats(SALES_ROWS, "ss_ticket_number", 0.0),
+            );
+            s.insert(
+                TableReference::table("store_returns"),
+                table_stats(RETURNS_ROWS, "sr_ticket_number", 0.0),
+            );
+            s
+        }
+
+        /// `store_sales <join_type> store_returns ON ss_ticket_number = sr_ticket_number`
+        /// filtered on `<column> IS NULL` (index 0 = left key, 1 = right key).
+        fn filtered(join_type: JoinType, index: usize, column: &str) -> LogicalPlan {
+            LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::Join {
+                    left: Box::new(make_scan("store_sales", vec!["ss_ticket_number"])),
+                    right: Box::new(make_scan("store_returns", vec!["sr_ticket_number"])),
+                    join_type,
+                    condition: JoinCondition::On(eq(
+                        col_expr(0, "ss_ticket_number"),
+                        col_expr(1, "sr_ticket_number"),
+                    )),
+                    dynamic_filter_ids: Vec::new(),
+                }),
+                predicate: PlanExpr::IsNull {
+                    expr: Box::new(col_expr(index, column)),
+                    span: None,
+                },
+            }
+        }
+
+        fn join_rows(join_type: JoinType) -> f64 {
+            match filtered(join_type, 1, "sr_ticket_number") {
+                LogicalPlan::Filter { input, .. } => estimated_cardinality(&input, &stats()),
+                _ => unreachable!(),
+            }
+        }
+
+        #[test]
+        fn left_join_right_column_is_null_is_not_estimated_from_base_null_fraction() {
+            let estimate =
+                estimated_cardinality(&filtered(JoinType::Left, 1, "sr_ticket_number"), &stats());
+            let floor = join_rows(JoinType::Left) * selectivity::DEFAULT_NULL_SELECTIVITY;
+            assert!(
+                estimate >= floor,
+                "IS NULL on the null-supplying side estimated at {estimate} rows, below {floor}"
+            );
+        }
+
+        #[test]
+        fn right_join_left_column_is_null_is_not_estimated_from_base_null_fraction() {
+            let estimate =
+                estimated_cardinality(&filtered(JoinType::Right, 0, "ss_ticket_number"), &stats());
+            let floor = join_rows(JoinType::Right) * selectivity::DEFAULT_NULL_SELECTIVITY;
+            assert!(
+                estimate >= floor,
+                "IS NULL on the null-supplying side estimated at {estimate} rows, below {floor}"
+            );
+        }
+
+        #[test]
+        fn left_join_preserved_side_keeps_its_null_fraction() {
+            // `ss_ticket_number` is never NULL-extended by a LEFT join, so its
+            // null fraction of 0.0 still applies (estimates are clamped to 1 row).
+            let estimate =
+                estimated_cardinality(&filtered(JoinType::Left, 0, "ss_ticket_number"), &stats());
+            assert_eq!(estimate, 1.0);
+        }
+
+        #[test]
+        fn inner_join_keeps_the_null_fraction() {
+            let estimate =
+                estimated_cardinality(&filtered(JoinType::Inner, 1, "sr_ticket_number"), &stats());
+            assert_eq!(estimate, 1.0);
+        }
     }
 }

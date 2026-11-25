@@ -47,6 +47,12 @@ pub const SYSTEM_RELATIONS: &[(&str, i64)] = &[
     ("pg_sequence", 2224),
 ];
 
+/// Separates the schema from the table in one entry of the relation list
+/// the planner hands the runtime `regclass` functions.
+pub const RELATION_FIELD_SEP: char = '\u{1f}';
+/// Separates the entries of that list.
+pub const RELATION_ENTRY_SEP: char = '\u{1e}';
+
 /// The PostgreSQL oid of system relation `name`, if it is one.
 pub fn system_relation_oid(name: &str) -> Option<i64> {
     SYSTEM_RELATIONS

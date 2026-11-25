@@ -376,6 +376,8 @@ pub(crate) fn function_return_type(
             .or(Some(DataType::Float64)),
         "MIN" | "MAX" => args.first().and_then(|a| plan_expr_type(a, schema)),
         "BOOL_OR" | "BOOL_AND" => Some(DataType::Boolean),
+        // Planted by SELECT-list subquery decorrelation: returns its value.
+        "__SINGLE_ROW_CHECK" => args.get(1).and_then(|a| plan_expr_type(a, schema)),
         "ARRAY_AGG" => args
             .first()
             .and_then(|a| plan_expr_type(a, schema))
@@ -443,11 +445,21 @@ pub(crate) fn function_return_type(
         "CODEPOINT" => Some(DataType::Int32),
         "STARTS_WITH" | "REGEXP_LIKE" => Some(DataType::Boolean),
         // PostgreSQL catalog functions (pg-catalog-tables).
-        "FORMAT_TYPE" | "PG_GET_USERBYID" | "OBJ_DESCRIPTION" | "COL_DESCRIPTION" => {
-            Some(DataType::Utf8)
+        "FORMAT_TYPE"
+        | "PG_GET_USERBYID"
+        | "OBJ_DESCRIPTION"
+        | "COL_DESCRIPTION"
+        | "PG_GET_CONSTRAINTDEF"
+        | "PG_GET_EXPR"
+        | "PG_GET_INDEXDEF"
+        | "PG_GET_SERIAL_SEQUENCE"
+        | "JSON_BUILD_OBJECT"
+        | "CURRENT_SETTING"
+        | "__REGCLASS_NAME" => Some(DataType::Utf8),
+        "PG_TABLE_IS_VISIBLE" | "PG_IS_OTHER_TEMP_SCHEMA" | "PG_COLLATION_IS_VISIBLE" => {
+            Some(DataType::Boolean)
         }
-        "PG_TABLE_IS_VISIBLE" | "PG_IS_OTHER_TEMP_SCHEMA" => Some(DataType::Boolean),
-        "TO_REGTYPE" => Some(DataType::Int64),
+        "TO_REGTYPE" | "__REGCLASS_OID" => Some(DataType::Int64),
 
         // Math — preserve integer-ness when the input is integral.
         "ROUND" => args

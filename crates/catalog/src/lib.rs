@@ -359,6 +359,10 @@ pub struct CatalogManager {
     /// The session user and the rules they are checked against, on a view
     /// made by [`CatalogManager::with_access`]. `None` checks nothing.
     access: Option<Arc<SessionAccess>>,
+    /// The `(schema, table)` of every relation a `pg_catalog` statement's
+    /// `regclass` casts can name, when this manager is that statement's
+    /// per-statement view and does not hold the tables itself.
+    regclass_relations: Option<Arc<Vec<(String, String)>>>,
 }
 
 /// A session user and the access rules that apply to them.
@@ -377,6 +381,7 @@ impl CatalogManager {
             default_schema: default_schema.into(),
             qualify_references: false,
             access: None,
+            regclass_relations: None,
         }
     }
 
@@ -401,6 +406,7 @@ impl CatalogManager {
             default_schema: default_schema.into(),
             qualify_references: true,
             access: self.access.clone(),
+            regclass_relations: self.regclass_relations.clone(),
         }
     }
 
@@ -417,6 +423,7 @@ impl CatalogManager {
                 user: user.into(),
                 rules,
             })),
+            regclass_relations: self.regclass_relations.clone(),
         }
     }
 
@@ -681,7 +688,20 @@ impl CatalogManager {
             default_schema: self.default_schema.clone(),
             qualify_references: self.qualify_references,
             access: self.access.clone(),
+            regclass_relations: self.regclass_relations.clone(),
         }
+    }
+
+    /// Sets the relations `regclass` casts name, for a manager that holds
+    /// only a statement's `pg_catalog` tables.
+    pub fn with_regclass_relations(mut self, relations: Vec<(String, String)>) -> Self {
+        self.regclass_relations = Some(Arc::new(relations));
+        self
+    }
+
+    /// The relations set by [`CatalogManager::with_regclass_relations`].
+    pub fn regclass_relations(&self) -> Option<&[(String, String)]> {
+        self.regclass_relations.as_deref().map(Vec::as_slice)
     }
 
     /// Returns the default catalog name.

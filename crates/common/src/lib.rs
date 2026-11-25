@@ -19,6 +19,7 @@ pub mod memory_profile;
 pub mod metrics;
 pub mod numeric_cast;
 pub mod pg_oid;
+pub mod pg_settings;
 pub mod stream;
 pub mod suggest;
 pub mod types;

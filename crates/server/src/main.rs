@@ -220,13 +220,56 @@ fn main() -> Result<()> {
     #[cfg(not(target_env = "msvc"))]
     configure_jemalloc_decay();
 
-    tokio::runtime::Builder::new_multi_thread()
+    // Flight is served on its own small runtime (#244), so query operators
+    // that hold every execution thread cannot delay heartbeats, probes or
+    // cancels. Built before the execution runtime so neither starts work
+    // while the other is half built.
+    let control = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(CONTROL_RUNTIME_THREADS)
+        .thread_name("arneb-control")
+        .enable_all()
+        .build()?;
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run())
+        .block_on(run(control.handle().clone()));
+    control.shutdown_background();
+    result
 }
 
-async fn run() -> Result<()> {
+/// Threads of the control runtime that serves Flight. Requests there are
+/// small and their heavy work runs on the execution runtime, so two keep
+/// one free while the other moves a large `do_get` frame.
+const CONTROL_RUNTIME_THREADS: usize = 2;
+
+/// Serve Flight on the `control` runtime, with the work behind requests
+/// on the calling (execution) runtime. Dropping the returned future stops
+/// the server, as it did when Flight ran inline.
+async fn serve_flight_on_control(
+    control: &tokio::runtime::Handle,
+    addr: String,
+    mut state: arneb_rpc::FlightState,
+) -> Result<(), String> {
+    struct AbortOnDrop(tokio::task::AbortHandle);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    state.set_execution_runtime(tokio::runtime::Handle::current());
+    let task = control.spawn(async move {
+        arneb_rpc::start_flight_server(&addr, state)
+            .await
+            .map_err(|e| e.to_string())
+    });
+    let _stop = AbortOnDrop(task.abort_handle());
+    match task.await {
+        Ok(result) => result,
+        Err(e) => Err(format!("flight server task ended: {e}")),
+    }
+}
+
+async fn run(control: tokio::runtime::Handle) -> Result<()> {
     // 1. Parse CLI args
     let args = CliArgs::parse();
     if let Some(Command::HashPassword { iterations }) = args.command {
@@ -1459,7 +1502,7 @@ async fn run() -> Result<()> {
             })
         }
         // Flight RPC server (all roles)
-        result = arneb_rpc::start_flight_server(&rpc_addr_clone, flight_state_clone) => {
+        result = serve_flight_on_control(&control, rpc_addr_clone, flight_state_clone) => {
             result.err().map(|e| {
                 tracing::error!(error = %e, "flight server error");
                 anyhow::anyhow!("flight server error: {e}")

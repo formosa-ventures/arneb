@@ -282,7 +282,7 @@ impl DataSource for ParquetDataSource {
         let buffer_bytes = crate::parquet_scan::row_group_buffer_bytes(
             builder.metadata(),
             ctx.projection.as_deref(),
-        );
+        ) + crate::parquet_pushdown::row_filter_set_bytes(&ctx.filters);
 
         let stream = builder.build().map_err(|e| {
             ExecutionError::InvalidOperation(format!("Parquet reader build error: {e}"))
@@ -633,7 +633,7 @@ impl DataSource for PreResolvedParquetDataSource {
         let buffer_bytes = crate::parquet_scan::row_group_buffer_bytes(
             builder.metadata(),
             ctx.projection.as_deref(),
-        );
+        ) + crate::parquet_pushdown::row_filter_set_bytes(&ctx.filters);
         let stream = crate::parquet_scan::build_split_stream(
             builder,
             &self.path,

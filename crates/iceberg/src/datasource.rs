@@ -362,7 +362,8 @@ impl DataSource for IcebergDataSource {
             .filter_map(|f| remap_filter(f, &leaf_for))
             .collect();
 
-        let buffer_bytes = parquet_scan::row_group_buffer_bytes(builder.metadata(), Some(&roots));
+        let buffer_bytes = parquet_scan::row_group_buffer_bytes(builder.metadata(), Some(&roots))
+            + arneb_connectors::parquet_pushdown::row_filter_set_bytes(&file_filters);
         let stream = parquet_scan::build_split_stream(
             builder,
             uri,

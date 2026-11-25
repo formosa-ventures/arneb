@@ -310,9 +310,47 @@ fn prune_with_minmax_f64(
     }
 }
 
-/// Longest `IN` list turned into a row-level Parquet predicate. A longer
-/// one still prunes row groups by statistics.
-pub const MAX_ROW_FILTER_INLIST: usize = 4096;
+/// Approximate heap bytes of the value sets the row-level `IN` predicates
+/// for `filters` hold while a scan runs (see `build_inlist_predicate`).
+///
+/// A dynamic-filter `IN` list can hold hundreds of thousands of keys and
+/// every split builds its own set, so a scan adds this to the bytes it
+/// accounts against the memory pool. Counts each pushable list (a
+/// non-negated `IN` of literals on a column) whether or not its type turns
+/// out to be supported, so it can only overstate.
+pub fn row_filter_set_bytes(filters: &[PlanExpr]) -> usize {
+    filters
+        .iter()
+        .map(|filter| match filter {
+            PlanExpr::InList {
+                expr,
+                list,
+                negated: false,
+                ..
+            } if matches!(expr.as_ref(), PlanExpr::Column { .. }) => list
+                .iter()
+                .map(|item| match item {
+                    PlanExpr::Literal { value, .. } => inlist_entry_bytes(value),
+                    _ => 0,
+                })
+                .sum(),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Bytes one value takes in a `HashSet` built by `build_inlist_predicate`:
+/// the slot, a control byte, the load-factor slack, and a string's heap.
+fn inlist_entry_bytes(value: &ScalarValue) -> usize {
+    let slot = match value {
+        ScalarValue::Int32(_) | ScalarValue::Date32(_) => std::mem::size_of::<i32>(),
+        ScalarValue::Int64(_) => std::mem::size_of::<i64>(),
+        ScalarValue::Utf8(s) => std::mem::size_of::<String>() + s.len(),
+        _ => 0,
+    };
+    // hashbrown keeps at most 7/8 of its buckets full.
+    (slot + 1) * 8 / 7
+}
 
 /// Try to build a `RowFilter` from plan expressions for predicate pushdown.
 ///
@@ -529,13 +567,10 @@ fn try_build_predicate(
             let PlanExpr::Column { index, .. } = expr.as_ref() else {
                 return None;
             };
-            // A dynamic-filter list can hold hundreds of thousands of keys.
-            // Each split would build its own set of them, outside the memory
-            // pool, for a filter the FilterExec above the scan applies again
-            // anyway; such a list only prunes row groups.
-            if list.len() > MAX_ROW_FILTER_INLIST {
-                return None;
-            }
+            // A dynamic-filter list can hold hundreds of thousands of keys;
+            // the scan accounts the set against the memory pool
+            // (`row_filter_set_bytes`). Filtering rows here keeps the
+            // decoded probe side small.
             let values = extract_inlist_literals(list)?;
             let mask = ProjectionMask::leaves(schema, [*index]);
             let predicate = build_inlist_predicate(values)?;
@@ -822,6 +857,56 @@ mod tests {
             "took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_long_in_list_still_filters_rows_in_the_reader() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        // One row group, so pruning keeps it and only the row-level
+        // predicate can drop rows. The list is far longer than any cap a
+        // dynamic filter's key set would plausibly stay under.
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow::array::Int32Array::from(
+                (0..40_000).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let file = tempfile::tempfile().unwrap();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file.try_clone().unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let filter = id_in((0..20_000).map(|v| ScalarValue::Int32(v * 2)));
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let row_filter =
+            build_row_filter(std::slice::from_ref(&filter), builder.parquet_schema()).unwrap();
+        let rows: usize = builder
+            .with_row_filter(row_filter)
+            .build()
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum();
+        assert_eq!(rows, 20_000);
+
+        // The set it holds is accounted: at least a slot per key.
+        let bytes = row_filter_set_bytes(&[filter]);
+        assert!(bytes >= 20_000 * std::mem::size_of::<i32>(), "{bytes}");
+    }
+
+    #[test]
+    fn only_pushable_in_lists_count_toward_row_filter_memory() {
+        let mut negated = id_in([ScalarValue::Int32(1)]);
+        if let PlanExpr::InList { negated: n, .. } = &mut negated {
+            *n = true;
+        }
+        let on_column = id_in([ScalarValue::Utf8("abc".to_string())]);
+        assert_eq!(row_filter_set_bytes(&[negated]), 0);
+        assert!(row_filter_set_bytes(&[on_column]) >= std::mem::size_of::<String>() + "abc".len());
     }
 
     #[test]

@@ -274,6 +274,18 @@ workers can use up to twice the limit in total, and a skewed query hits it
 first on the node with the most data. Start around 0.5–0.8 × the node's
 spill budget.
 
+**Aggregate state.** DISTINCT aggregates, and other aggregates that cannot
+take the batch-aware path, reserve their state (the groups and every
+distinct value) against the node's memory pool, and this state cannot spill.
+The pool is bounded whenever a spill budget is resolved: from
+`[memory] spill_budget_bytes`, or, with no explicit value, from the
+container's cgroup memory limit × `cgroup_ratio`. That makes it bounded by
+default in Docker and Kubernetes. There a large `COUNT(DISTINCT ..)` whose
+state outgrows the budget fails with SQLSTATE `53200`
+(`EXCEEDED_LOCAL_MEMORY_LIMIT`), instead of growing until the container is
+OOM-killed. Raise the budget (or the container limit) if such queries need
+more, or set `cgroup_ratio = 0.0` to go back to an unbounded pool.
+
 **Timeouts and cancellation.** pgwire sessions use `SET statement_timeout`,
 and Trino sessions use the `query_max_execution_time` (excludes queue time)
 and `query_max_run_time` (includes it) session properties; see

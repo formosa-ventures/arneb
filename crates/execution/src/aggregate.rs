@@ -50,6 +50,15 @@ pub trait GroupedAccumulator: Send + Sync {
     /// Number of groups for which this accumulator has reserved state.
     fn num_groups(&self) -> usize;
 
+    /// Approximate heap bytes held beyond the fixed per-group state that
+    /// the operator already estimates, for memory accounting. Accumulators
+    /// whose per-group state has a fixed size keep the default 0; one that
+    /// keeps input values must report them. Must be cheap: the aggregate
+    /// operators call it after every batch.
+    fn heap_bytes(&self) -> usize {
+        0
+    }
+
     /// Merge `other`'s state into `self`, mapping each `g` in
     /// `0..other.num_groups()` through `group_remap` (so
     /// `self.state[group_remap[g]] ⊕= other.state[g]`).
@@ -95,6 +104,15 @@ pub trait Accumulator: Send + Sync {
         Err(ExecutionError::InvalidOperation(
             "this accumulator does not support parallel merge".to_string(),
         ))
+    }
+
+    /// Approximate heap bytes the accumulator's state holds, for memory
+    /// accounting against the query's pool. An accumulator whose state
+    /// does not grow with its input keeps the default 0; one that keeps
+    /// input values (`DISTINCT`) reports them. Must be cheap: the
+    /// aggregate operators call it after every update.
+    fn heap_bytes(&self) -> usize {
+        0
     }
 }
 
@@ -1253,6 +1271,22 @@ struct ArrayAggRow {
 #[derive(Debug, Default)]
 struct ArrayAggBuffer {
     rows: Vec<ArrayAggRow>,
+    /// Approximate heap bytes `rows` holds, for memory accounting.
+    bytes: usize,
+}
+
+impl ArrayAggRow {
+    /// Approximate bytes this row holds once buffered.
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.keys.len() * std::mem::size_of::<ScalarValue>()
+            + crate::group_key::scalar_heap_bytes(&self.value)
+            + self
+                .keys
+                .iter()
+                .map(crate::group_key::scalar_heap_bytes)
+                .sum::<usize>()
+    }
 }
 
 /// What a packed batch declares: element type and key directions.
@@ -1284,11 +1318,23 @@ fn unpack_array_agg(
 }
 
 impl ArrayAggBuffer {
+    fn push(&mut self, row: ArrayAggRow) {
+        self.bytes += row.bytes();
+        self.rows.push(row);
+    }
+
+    /// Appends copies of `other`'s rows; returns the bytes added.
+    fn extend_from(&mut self, other: &ArrayAggBuffer) -> usize {
+        self.rows.extend(other.rows.iter().cloned());
+        self.bytes += other.bytes;
+        other.bytes
+    }
+
     fn push_batch(&mut self, packed: &arrow::array::StructArray) -> Result<(), ExecutionError> {
         let cols = packed.columns();
         for i in 0..packed.len() {
             let scalar = |c: &ArrayRef| crate::operator::extract_scalar(c, i);
-            self.rows.push(ArrayAggRow {
+            self.push(ArrayAggRow {
                 value: scalar(&cols[0])?,
                 keys: cols[1..].iter().map(scalar).collect::<Result<_, _>>()?,
             });
@@ -1402,7 +1448,7 @@ impl Accumulator for ArrayAggAccumulator {
         if self.shape.is_none() {
             self.shape = other.shape.clone();
         }
-        self.buffer.rows.extend(other.buffer.rows.iter().cloned());
+        self.buffer.extend_from(&other.buffer);
         Ok(())
     }
 
@@ -1412,6 +1458,11 @@ impl Accumulator for ArrayAggAccumulator {
 
     fn reset(&mut self) {
         self.buffer.rows.clear();
+        self.buffer.bytes = 0;
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.buffer.bytes
     }
 }
 
@@ -1420,6 +1471,8 @@ impl Accumulator for ArrayAggAccumulator {
 pub(crate) struct GroupedArrayAggAccumulator {
     shape: Option<ArrayAggShape>,
     groups: Vec<ArrayAggBuffer>,
+    /// Sum of the groups' buffered bytes, so `heap_bytes` stays O(1).
+    bytes: usize,
 }
 
 impl GroupedAccumulator for GroupedArrayAggAccumulator {
@@ -1435,10 +1488,12 @@ impl GroupedAccumulator for GroupedArrayAggAccumulator {
         let cols = packed.columns();
         for (i, &g) in group_ids.iter().enumerate() {
             let scalar = |c: &ArrayRef| crate::operator::extract_scalar(c, i);
-            self.groups[g as usize].rows.push(ArrayAggRow {
+            let row = ArrayAggRow {
                 value: scalar(&cols[0])?,
                 keys: cols[1..].iter().map(scalar).collect::<Result<_, _>>()?,
-            });
+            };
+            self.bytes += row.bytes();
+            self.groups[g as usize].push(row);
         }
         Ok(())
     }
@@ -1475,9 +1530,13 @@ impl GroupedAccumulator for GroupedArrayAggAccumulator {
             if self.groups.len() <= dest {
                 self.groups.resize_with(dest + 1, ArrayAggBuffer::default);
             }
-            self.groups[dest].rows.extend(buf.rows.iter().cloned());
+            self.bytes += self.groups[dest].extend_from(buf);
         }
         Ok(())
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.bytes
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -2289,6 +2348,8 @@ pub(crate) fn create_grouped_accumulator(
 pub(crate) struct DistinctAccumulator {
     inner: Box<dyn Accumulator>,
     seen: FastHashSet<GroupKey>,
+    /// Running [`GroupKey::entry_bytes`] total of `seen`.
+    seen_bytes: usize,
 }
 
 impl DistinctAccumulator {
@@ -2296,7 +2357,18 @@ impl DistinctAccumulator {
         Self {
             inner,
             seen: FastHashSet::default(),
+            seen_bytes: 0,
         }
+    }
+
+    /// Records `key` as seen; true when it is new.
+    fn insert(&mut self, key: GroupKey) -> bool {
+        let bytes = key.entry_bytes();
+        let new = self.seen.insert(key);
+        if new {
+            self.seen_bytes += bytes;
+        }
+        new
     }
 }
 
@@ -2318,7 +2390,7 @@ impl Accumulator for DistinctAccumulator {
         // had not yet seen so the inner accumulator gets each unique
         // value exactly once across all partitions.
         for k in &other.seen {
-            if self.seen.insert(k.clone()) {
+            if self.insert(k.clone()) {
                 // Inner ingestion happens by way of the GroupKey
                 // scalar values; we re-materialise to a single-row
                 // array per scalar so the inner Accumulator's
@@ -2339,7 +2411,7 @@ impl Accumulator for DistinctAccumulator {
             }
             let scalar = scalar_from_array(values, i)?;
             let key = GroupKey::single(scalar);
-            if self.seen.insert(key) {
+            if self.insert(key) {
                 new_indices.push(i as u32);
             }
         }
@@ -2361,6 +2433,11 @@ impl Accumulator for DistinctAccumulator {
     fn reset(&mut self) {
         self.inner.reset();
         self.seen.clear();
+        self.seen_bytes = 0;
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.seen_bytes + self.inner.heap_bytes()
     }
 }
 
@@ -2470,6 +2547,36 @@ pub(crate) fn scalar_from_array(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `array_agg` keeps every input value, so it reports them for memory
+    /// accounting, in both its single-group and grouped forms.
+    #[test]
+    fn array_agg_reports_the_values_it_buffers() {
+        use arrow::array::{StringArray, StructArray};
+        use arrow::datatypes::{DataType as ArrowDataType, Field};
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["x".repeat(100); 50]));
+        let packed: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("v", ArrowDataType::Utf8, true)),
+            values,
+        )]));
+        let mut single = ArrayAggAccumulator::default();
+        assert_eq!(Accumulator::heap_bytes(&single), 0);
+        single.update_batch(&packed).unwrap();
+        assert!(Accumulator::heap_bytes(&single) >= 50 * 100);
+
+        let mut grouped = GroupedArrayAggAccumulator::default();
+        grouped.ensure_capacity(2);
+        let ids: Vec<u32> = (0..50).map(|i| i % 2).collect();
+        grouped.add_input(&ids, &packed).unwrap();
+        let after_input = GroupedAccumulator::heap_bytes(&grouped);
+        assert!(after_input >= 50 * 100);
+        let mut merged = GroupedArrayAggAccumulator::default();
+        merged.ensure_capacity(1);
+        merged.merge_from(&grouped, &[0, 0]).unwrap();
+        assert_eq!(GroupedAccumulator::heap_bytes(&merged), after_input);
+        single.reset();
+        assert_eq!(Accumulator::heap_bytes(&single), 0);
+    }
     use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
     use std::sync::Arc;
 

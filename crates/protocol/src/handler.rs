@@ -654,13 +654,33 @@ impl SimpleQueryHandler for ConnectionHandler {
 
 /// Substitute `$1`, `$2`, ... placeholders with parameter values, each
 /// already a SQL literal (see [`extract_params`]).
+///
+/// One pass over the placeholders the SQL tokenizer finds, so a `$N` inside
+/// a string literal, a quoted identifier or a comment stays as written, and
+/// a parameter value is never scanned again (a value containing `$1` cannot
+/// pull another parameter into the statement). A `$N` with no matching
+/// parameter is left for the parser to reject. SQL that does not tokenize is
+/// returned unchanged so the parser reports the syntax error.
 fn bind_parameters(sql: &str, params: &[String]) -> String {
-    let mut result = sql.to_string();
-    // Replace in reverse order ($10 before $1) to avoid partial matches
-    for (i, literal) in params.iter().enumerate().rev() {
-        result = result.replace(&format!("${}", i + 1), literal);
+    let Ok(placeholders) = arneb_sql_parser::dollar_placeholders(sql) else {
+        return sql.to_string();
+    };
+    let mut bound = String::with_capacity(sql.len());
+    let mut copied = 0;
+    for placeholder in placeholders {
+        let Some(literal) = placeholder
+            .number
+            .checked_sub(1)
+            .and_then(|i| params.get(i))
+        else {
+            continue;
+        };
+        bound.push_str(&sql[copied..placeholder.range.start]);
+        bound.push_str(literal);
+        copied = placeholder.range.end;
     }
-    result
+    bound.push_str(&sql[copied..]);
+    bound
 }
 
 /// A portal's parameters as SQL literals. A parameter is decoded by the type
@@ -762,11 +782,11 @@ fn param_literal(
     }
     if portal.parameter_format.is_binary(i) {
         return Ok(match *declared {
-            Type::INT2 => get!(i16, declared).map(|v| v.to_string()),
-            Type::INT4 => get!(i32, declared).map(|v| v.to_string()),
-            Type::INT8 => get!(i64, declared).map(|v| v.to_string()),
-            Type::FLOAT4 => get!(f32, declared).map(|v| v.to_string()),
-            Type::FLOAT8 => get!(f64, declared).map(|v| v.to_string()),
+            Type::INT2 => get!(i16, declared).map(|v| signed_literal(v.to_string())),
+            Type::INT4 => get!(i32, declared).map(|v| signed_literal(v.to_string())),
+            Type::INT8 => get!(i64, declared).map(|v| signed_literal(v.to_string())),
+            Type::FLOAT4 => get!(f32, declared).map(|v| float_literal(v as f64)),
+            Type::FLOAT8 => get!(f64, declared).map(float_literal),
             Type::BOOL => get!(bool, declared).map(bool_literal),
             Type::DATE => get!(chrono::NaiveDate, declared).map(|d| format!("DATE '{d}'")),
             Type::TIMESTAMP => get!(chrono::NaiveDateTime, declared).map(timestamp_literal),
@@ -801,9 +821,13 @@ fn param_literal(
             _ => quoted(value),
         },
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => quoted(value),
+        // A declared float may be NaN or ±Infinity, which have no literal.
+        Type::FLOAT4 | Type::FLOAT8 => match value.parse::<f64>() {
+            Ok(v) if !v.is_finite() => float_literal(v),
+            _ => numeric_literal(&value).unwrap_or_else(|| quoted(value)),
+        },
         // Declared numeric, or untyped: a number stays a number.
-        _ if value.parse::<f64>().is_ok() => value,
-        _ => quoted(value),
+        _ => numeric_literal(&value).unwrap_or_else(|| quoted(value)),
     }))
 }
 
@@ -993,6 +1017,46 @@ fn float_text(v: f64) -> String {
         if v > 0.0 { "Infinity" } else { "-Infinity" }.to_owned()
     } else {
         v.to_string()
+    }
+}
+
+/// `text` as an inlined numeric literal, when it is a plain finite decimal
+/// number; `None` otherwise (`inf`, `nan` and anything else that Rust's
+/// float parser accepts but SQL would read as an identifier).
+fn numeric_literal(text: &str) -> Option<String> {
+    let plain = text
+        .bytes()
+        .all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E'));
+    match text.parse::<f64>() {
+        Ok(v) if plain && v.is_finite() => Some(signed_literal(text.to_string())),
+        _ => None,
+    }
+}
+
+/// A negative number goes in parentheses: inlined after a minus sign
+/// (`5-$1` with `$1 = -1`) it would otherwise start a `--` comment and
+/// drop the rest of the statement.
+fn signed_literal(text: String) -> String {
+    if text.starts_with('-') {
+        format!("({text})")
+    } else {
+        text
+    }
+}
+
+/// A float as SQL: NaN and ±Infinity become `nan()` / `infinity()` calls.
+fn float_literal(value: f64) -> String {
+    if value.is_nan() {
+        "nan()".to_string()
+    } else if value.is_infinite() {
+        if value > 0.0 {
+            "infinity()"
+        } else {
+            "(-infinity())"
+        }
+        .to_string()
+    } else {
+        signed_literal(value.to_string())
     }
 }
 
@@ -2935,6 +2999,21 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn an_inlined_number_cannot_start_a_comment_or_become_an_identifier() {
+        assert_eq!(numeric_literal("5").as_deref(), Some("5"));
+        assert_eq!(numeric_literal("1.5e3").as_deref(), Some("1.5e3"));
+        assert_eq!(numeric_literal("-1").as_deref(), Some("(-1)"));
+        for text in ["inf", "-inf", "nan", "NaN", "Infinity", "1 --", "0x10"] {
+            assert_eq!(numeric_literal(text), None, "{text}");
+        }
+        assert_eq!(signed_literal("-7".to_string()), "(-7)");
+        assert_eq!(float_literal(-2.5), "(-2.5)");
+        assert_eq!(float_literal(f64::NAN), "nan()");
+        assert_eq!(float_literal(f64::INFINITY), "infinity()");
+        assert_eq!(float_literal(f64::NEG_INFINITY), "(-infinity())");
+    }
     use arneb_common::types::{ColumnInfo, DataType};
     use arneb_sql_parser::ast;
     use arrow::array::Int64Array;
@@ -4653,5 +4732,55 @@ mod tests {
         }
         let sink = run_capped("SELECT cat FROM t", Some(&Retrying)).await;
         assert_eq!(sink_cats(&sink), vec![format!("{:<10}", "Books")]);
+    }
+
+    // -- `$N` parameter binding --
+
+    #[test]
+    fn bind_parameters_substitutes_each_placeholder_once() {
+        let params = ["'x'".to_string(), "2".to_string()];
+        assert_eq!(
+            bind_parameters("SELECT $1, $2, $1", &params),
+            "SELECT 'x', 2, 'x'"
+        );
+    }
+
+    /// A parameter value is never rescanned: a value that contains `$1`
+    /// stays inside its literal, so a quote in another parameter cannot
+    /// close that literal and inject SQL.
+    #[test]
+    fn a_parameter_value_containing_a_placeholder_is_not_rebound() {
+        let params = ["'''); DROP TABLE t; --'".to_string(), "'$1'".to_string()];
+        let bound = bind_parameters("SELECT * FROM t WHERE a = $1 AND b = $2", &params);
+        assert_eq!(
+            bound,
+            "SELECT * FROM t WHERE a = '''); DROP TABLE t; --' AND b = '$1'"
+        );
+        let Ok(ast::Statement::Query { .. }) = arneb_sql_parser::parse(&bound) else {
+            panic!("bound SQL must stay a single query: {bound}");
+        };
+    }
+
+    #[test]
+    fn placeholders_inside_quotes_and_comments_are_left_alone() {
+        let params = ["1".to_string()];
+        assert_eq!(
+            bind_parameters("SELECT '$1' AS \"$1\" -- $1\n , $1", &params),
+            "SELECT '$1' AS \"$1\" -- $1\n , 1"
+        );
+    }
+
+    #[test]
+    fn a_placeholder_beyond_the_parameters_is_left_for_the_parser() {
+        let params = ["1".to_string()];
+        assert_eq!(bind_parameters("SELECT $1, $2", &params), "SELECT 1, $2");
+        assert_eq!(bind_parameters("SELECT $0", &params), "SELECT $0");
+        assert_eq!(bind_parameters("SELECT $10", &params), "SELECT $10");
+    }
+
+    #[test]
+    fn sql_that_does_not_tokenize_is_returned_unchanged() {
+        let params = ["1".to_string()];
+        assert_eq!(bind_parameters("SELECT '$1", &params), "SELECT '$1");
     }
 }

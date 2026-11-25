@@ -2083,6 +2083,15 @@ mod tests {
 
     /// A Flight server whose `cancel_query` callback records query ids,
     /// and whose `release_query` callback records them as `released`.
+    /// Waits until `done` holds, up to 5 s, so a test does not depend on how
+    /// fast a cancel or release RPC reaches a recording worker.
+    async fn eventually(done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     async fn recording_worker() -> (String, Arc<std::sync::Mutex<Vec<QueryId>>>) {
         let (addr, seen, _) = recording_worker_with_releases().await;
         (addr, seen)
@@ -2123,7 +2132,7 @@ mod tests {
         let (b, seen_b, released_b) = recording_worker_with_releases().await;
         let q = QueryId::new();
         drop(CancelGuard::new(q, vec![a.clone(), b.clone()]));
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        eventually(|| seen_a.lock().unwrap().len() == 1 && seen_b.lock().unwrap().len() == 1).await;
         assert_eq!(*seen_a.lock().unwrap(), vec![q]);
         assert_eq!(*seen_b.lock().unwrap(), vec![q]);
         assert!(released_a.lock().unwrap().is_empty());
@@ -2132,7 +2141,7 @@ mod tests {
         let mut ok = CancelGuard::new(done, vec![a.clone(), b]);
         ok.finish([a.clone(), a]);
         drop(ok);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        eventually(|| !released_a.lock().unwrap().is_empty()).await;
         assert_eq!(seen_a.lock().unwrap().len(), 1);
         assert_eq!(seen_b.lock().unwrap().len(), 1);
         assert_eq!(*released_a.lock().unwrap(), vec![done]);
@@ -2176,7 +2185,7 @@ mod tests {
         // The recording workers run nothing, so the query fails; its guard
         // then cancels it on the workers it was scheduled onto.
         let _ = coordinator.execute(scan(), &ctx).await;
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        eventually(|| !seen_b.lock().unwrap().is_empty()).await;
         assert!(seen_a.lock().unwrap().is_empty(), "w1 is cordoned");
         assert_eq!(seen_b.lock().unwrap().len(), 1);
         assert_eq!(
@@ -2291,7 +2300,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         handle.abort();
         let _ = handle.await;
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        eventually(|| !seen.lock().unwrap().is_empty()).await;
         assert_eq!(*seen.lock().unwrap(), vec![q]);
     }
     use arneb_common::types::{ColumnInfo, DataType, TableReference};

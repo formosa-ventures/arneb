@@ -2057,6 +2057,17 @@ impl ExecutionPlan for HashJoinExec {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static BUILD_ROW_BITMAPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn build_row_bitmap(rows: usize) -> Vec<bool> {
+    #[cfg(test)]
+    BUILD_ROW_BITMAPS.with(|count| count.set(count.get() + 1));
+    vec![false; rows]
+}
+
 impl HashJoinExec {
     fn join_type_label(&self) -> &'static str {
         match self.join_type {
@@ -2096,6 +2107,10 @@ impl HashJoinExec {
         let probe_exec = Arc::new(self.probe_driver());
 
         let inner = async_stream::try_stream! {
+            let mut right_matched = build_row_bitmap(right_batch.num_rows());
+            let mut pending = Vec::new();
+            let mut pending_rows = 0;
+            let mut emitted = false;
             while let Some(batch_res) = left_stream.next().await {
                 let left_batch = batch_res.map_err(|e| {
                     ExecutionError::upstream("hash join streaming probe left stream", e)
@@ -2103,8 +2118,36 @@ impl HashJoinExec {
                 if left_batch.num_rows() == 0 {
                     continue;
                 }
-                for out in probe_exec.probe(&left_batch, &right_batch, &hash_map)? {
-                    yield out;
+                if dict_probe_build_enabled() && matches!(probe_exec.join_type, ast::JoinType::Inner) {
+                    for out in probe_exec.probe_with_bitmap(
+                        &left_batch, &right_batch, &hash_map, true, &mut right_matched,
+                    )? {
+                        yield out;
+                    }
+                    continue;
+                }
+                let schema = probe_exec.build_output_schema(&left_batch, &right_batch);
+                for out in probe_one_left_batch(
+                    &left_batch, &right_batch, &hash_map, &probe_exec.left_keys,
+                    &probe_exec.right_keys, probe_exec.residual.as_ref(), probe_exec.join_type,
+                    &schema, &mut right_matched,
+                )? {
+                    pending_rows += out.num_rows();
+                    pending.push(out);
+                }
+                // Deliver the first match before waiting for another probe batch.
+                if (!emitted && pending_rows > 0) || pending_rows >= STREAMING_OUTPUT_TARGET_ROWS {
+                    for merged in flush_join_pending(&mut pending, &schema)? {
+                        yield merged;
+                    }
+                    emitted = true;
+                    pending_rows = 0;
+                }
+            }
+            if let Some(last) = pending.last() {
+                let schema = last.schema();
+                for merged in flush_join_pending(&mut pending, &schema)? {
+                    yield merged;
                 }
             }
         };
@@ -4576,7 +4619,7 @@ impl HashJoinExec {
                 tokio::task::spawn_blocking(move || -> Result<Vec<RecordBatch>, ExecutionError> {
                     // INNER/LEFT don't consult `right_matched`
                     // cross-batch — local throwaway per chunk.
-                    let mut right_matched = vec![false; n_right];
+                    let mut right_matched = build_row_bitmap(n_right);
                     let mut out = Vec::new();
                     for b in &chunk {
                         if b.num_rows() == 0 {
@@ -4744,7 +4787,7 @@ impl HashJoinExec {
             let mut probe_input_rows: u64 = 0;
             let mut output_rows: u64 = 0;
             let mut output_batches: u64 = 0;
-            let mut right_matched: Vec<bool> = vec![false; right_batch.num_rows()];
+            let mut right_matched = build_row_bitmap(right_batch.num_rows());
             let mut pending: Vec<RecordBatch> = Vec::new();
             let mut pending_rows: usize = 0;
 
@@ -4863,7 +4906,7 @@ impl HashJoinExec {
             let mut output_rows: u64 = 0;
             let mut output_batches: u64 = 0;
             // INNER/LEFT never read `right_matched` cross-batch — throwaway.
-            let mut right_matched: Vec<bool> = vec![false; right_rows as usize];
+            let mut right_matched = build_row_bitmap(right_rows as usize);
             let mut pending: Vec<RecordBatch> = Vec::new();
             let mut pending_rows: usize = 0;
 
@@ -5061,8 +5104,25 @@ impl HashJoinExec {
         hash_map: &JoinHashMap,
         dict_probe_build: bool,
     ) -> Result<Vec<RecordBatch>, ExecutionError> {
+        let mut right_matched = build_row_bitmap(right_batch.num_rows());
+        self.probe_with_bitmap(
+            left_batch,
+            right_batch,
+            hash_map,
+            dict_probe_build,
+            &mut right_matched,
+        )
+    }
+
+    fn probe_with_bitmap(
+        &self,
+        left_batch: &RecordBatch,
+        right_batch: &RecordBatch,
+        hash_map: &JoinHashMap,
+        dict_probe_build: bool,
+        right_matched: &mut [bool],
+    ) -> Result<Vec<RecordBatch>, ExecutionError> {
         let left_rows = left_batch.num_rows();
-        let right_rows = right_batch.num_rows();
 
         let output_schema = self.build_output_schema(left_batch, right_batch);
 
@@ -5116,7 +5176,6 @@ impl HashJoinExec {
         };
 
         let mut left_matched = vec![false; left_rows];
-        let mut right_matched = vec![false; right_rows];
         for &l in &left_indices {
             left_matched[l as usize] = true;
         }
@@ -7043,6 +7102,44 @@ mod tests {
         run_stream_probe_equivalence_case(left, empty_right_source()).await;
     }
 
+    /// The streaming probe of a shared Single build must not redo
+    /// O(build rows) work for every probe batch. Inner and Left joins never
+    /// read the matched-build-rows bitmap across batches, so at most one
+    /// bitmap sized to the build side may be allocated for the whole stream,
+    /// however many probe batches arrive. `BUILD_ROW_BITMAPS` counts, on
+    /// this thread, every allocation of state with one entry per build row
+    /// made while probing.
+    #[tokio::test]
+    async fn stream_probe_allocates_build_sized_state_once_per_stream() {
+        let _g = env_test_guard().await;
+        std::env::set_var("ARNEB_STREAM_HASH_PROBE", "1");
+        let build: Vec<i32> = (0..50_000).collect();
+        let probe_batches: Vec<Vec<i32>> = (0..40).map(|b| vec![b * 7, b * 7 + 1, -1]).collect();
+        for join_type in [ast::JoinType::Inner, ast::JoinType::Left] {
+            let mut join = hash_join_for_stream_probe_equivalence(
+                partitioned_left_source(vec![probe_batches.clone(), vec![vec![3]]]),
+                right_source_multi_batch(vec![build.clone()]),
+            );
+            join.join_type = join_type;
+            super::BUILD_ROW_BITMAPS.with(|c| c.set(0));
+            let batches = collect_stream(join.execute(0).await.expect("execute"))
+                .await
+                .expect("collect");
+            let allocations = super::BUILD_ROW_BITMAPS.with(|c| c.get());
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let expected = match join_type {
+                ast::JoinType::Inner => 80,
+                _ => 120,
+            };
+            assert_eq!(rows, expected, "{join_type:?} output rows");
+            assert!(
+                allocations <= 1,
+                "{join_type:?}: {allocations} build-sized bitmaps for 40 probe batches"
+            );
+        }
+        std::env::remove_var("ARNEB_STREAM_HASH_PROBE");
+    }
+
     mod stream_probe_default {
         //! By default the shared Single-build probe streams: the join returns
         //! output for a probe batch before its probe side has ended.
@@ -7051,14 +7148,18 @@ mod tests {
         use super::*;
 
         /// Probe partition 0 yields one batch (key 2, which matches the build
-        /// side) and then never ends; partition 1 ends normally.
+        /// side), waits 200 ms, sets `ended` and ends; partition 1 ends
+        /// normally. A streaming join returns that batch's output before
+        /// `ended` is set; a join that collects its probe side first returns
+        /// it only after.
         #[derive(Debug)]
-        struct NeverEndingProbeSource {
+        struct SlowEndingProbeSource {
             schema: Vec<ColumnInfo>,
+            ended: Arc<std::sync::atomic::AtomicBool>,
         }
 
         #[async_trait]
-        impl DataSource for NeverEndingProbeSource {
+        impl DataSource for SlowEndingProbeSource {
             fn schema(&self) -> Vec<ColumnInfo> {
                 self.schema.clone()
             }
@@ -7077,10 +7178,16 @@ mod tests {
                     RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![2]))])
                         .unwrap();
                 let first = futures::stream::iter(vec![Ok(batch)]);
+                let ended = Arc::clone(&self.ended);
+                let slow_end = futures::stream::once(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    ended.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+                .filter_map(|()| async { None });
                 let inner: std::pin::Pin<
                     Box<dyn futures::Stream<Item = Result<RecordBatch, ExecutionError>> + Send>,
                 > = if partition == 0 {
-                    Box::pin(first.chain(futures::stream::pending()))
+                    Box::pin(first.chain(slow_end))
                 } else {
                     Box::pin(first)
                 };
@@ -7088,16 +7195,17 @@ mod tests {
             }
         }
 
-        fn never_ending_left() -> Arc<dyn ExecutionPlan> {
+        fn slow_ending_left(ended: Arc<std::sync::atomic::AtomicBool>) -> Arc<dyn ExecutionPlan> {
             Arc::new(ScanExec {
-                source: Arc::new(NeverEndingProbeSource {
+                source: Arc::new(SlowEndingProbeSource {
                     schema: vec![ColumnInfo {
                         name: "id".into(),
                         data_type: DataType::Int32,
                         nullable: false,
                     }],
+                    ended,
                 }),
-                _table_name: "left_never_ending".into(),
+                _table_name: "left_slow_ending".into(),
                 scan_context: ScanContext::default(),
                 dynamic_filters: Default::default(),
                 dynamic_filters_consumed: Vec::new(),
@@ -7109,59 +7217,60 @@ mod tests {
             })
         }
 
-        /// Runs probe partition 0 on its own thread and returns the row count
-        /// of its first output batch, or `None` when none arrives in time.
-        fn first_output_rows(setting: Option<&'static str>) -> Option<usize> {
+        /// Runs probe partition 0 and reports whether its first output batch
+        /// (one row) arrived before the probe side ended.
+        fn first_output_before_probe_end(setting: Option<&'static str>) -> bool {
             let _g = ENV_TEST_LOCK.blocking_lock();
             match setting {
                 Some(value) => std::env::set_var("ARNEB_STREAM_HASH_PROBE", value),
                 None => std::env::remove_var("ARNEB_STREAM_HASH_PROBE"),
             }
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .build()
-                    .unwrap();
-                runtime.block_on(async move {
-                    let join =
-                        hash_join_for_stream_probe_equivalence(never_ending_left(), right_source());
-                    let mut stream = join.execute(0).await.expect("execute");
-                    while let Some(batch) = stream.next().await {
-                        let batch = batch.expect("batch");
-                        if batch.num_rows() > 0 {
-                            let _ = tx.send(batch.num_rows());
-                            break;
-                        }
+            let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let before_end = runtime.block_on(async {
+                let join = hash_join_for_stream_probe_equivalence(
+                    slow_ending_left(Arc::clone(&ended)),
+                    right_source(),
+                );
+                let mut stream = join.execute(0).await.expect("execute");
+                while let Some(batch) = stream.next().await {
+                    let batch = batch.expect("batch");
+                    if batch.num_rows() > 0 {
+                        assert_eq!(batch.num_rows(), 1);
+                        return !ended.load(std::sync::atomic::Ordering::SeqCst);
                     }
-                });
+                }
+                panic!("the join returned no rows");
             });
-            let rows = rx.recv_timeout(std::time::Duration::from_secs(5)).ok();
             std::env::remove_var("ARNEB_STREAM_HASH_PROBE");
-            rows
+            before_end
         }
 
         #[test]
         fn streams_by_default() {
-            assert_eq!(first_output_rows(None), Some(1));
+            assert!(first_output_before_probe_end(None));
         }
 
         #[test]
         fn streams_when_set_to_one() {
-            assert_eq!(first_output_rows(Some("1")), Some(1));
+            assert!(first_output_before_probe_end(Some("1")));
         }
 
         #[test]
         fn zero_turns_streaming_off() {
-            // The probe side never ends, so a join that collects it first
-            // never produces a batch.
-            assert_eq!(first_output_rows(Some("0")), None);
+            // A join that collects its probe side first returns output only
+            // once that side has ended.
+            assert!(!first_output_before_probe_end(Some("0")));
         }
 
         #[test]
         fn an_empty_value_turns_streaming_off() {
             // Like the other default-on knobs (`ARNEB_PROBE_PREFETCH`), a set
             // but empty value disables it.
-            assert_eq!(first_output_rows(Some("")), None);
+            assert!(!first_output_before_probe_end(Some("")));
         }
     }
 

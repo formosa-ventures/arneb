@@ -109,7 +109,7 @@ runs the in-binary defaults.
 | Broadcast build-side swap | on | `ARNEB_BROADCAST_BUILD_SIDE_SWAP=0` | Builds the estimated-smaller side of a broadcast join and streams the larger side. |
 | Broadcast build cap | `1000000000` bytes | `ARNEB_BROADCAST_MAX_BUILD_BYTES=<bytes>` (`0` disables broadcast) | Largest estimated build side that is broadcast rather than hash-partitioned. |
 | Scan batch size | `16384` rows | `ARNEB_SCAN_BATCH_SIZE=<rows>` | Arrow batch size for file and Hive scans; larger amortises per-batch overhead at the cost of in-flight memory. |
-| Streaming hash probe | on | `ARNEB_STREAM_HASH_PROBE=0` | Probes a shared Single-build hash join one batch at a time to avoid buffering the whole probe side. |
+| Streaming hash probe | on | `ARNEB_STREAM_HASH_PROBE=0` (an empty value also turns it off) | Probes a shared Single-build hash join one batch at a time to avoid buffering the whole probe side. |
 | Probe prefetch | on | `ARNEB_PROBE_PREFETCH=0` | Hash-join probe prefetches the bucket a few rows ahead (CPU hint, no effect on results). |
 | Aggregate prefetch | on | `ARNEB_AGG_PREFETCH=0` | Same prefetch hint for hash-aggregate lookups. |
 | Compact semi/anti `<>` build | on | `ARNEB_COMPACT_SEMI_NE=0` | Semi/anti joins with a `<>` residual keep a per-key `{distinct, first value}` map instead of the full build rows (q21: no build spill). |

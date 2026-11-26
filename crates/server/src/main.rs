@@ -353,6 +353,13 @@ async fn run(control: tokio::runtime::Handle) -> Result<()> {
             .context("invalid [cluster] retry_policy")?,
         _ => None,
     };
+    let include_coordinator = match role {
+        ServerRole::Coordinator => config
+            .cluster
+            .include_coordinator(|k| std::env::var(k).ok())
+            .context("invalid [cluster] include_coordinator")?,
+        _ => false,
+    };
     // Client-facing TLS ([tls] / ARNEB_TLS_*): one certificate for pgwire and
     // the Trino listener. Workers serve neither, so they skip loading it.
     let server_tls = match (&config.tls_settings, role) {
@@ -775,10 +782,16 @@ async fn run(control: tokio::runtime::Handle) -> Result<()> {
                 query_retry_attempts = retry.map(|r| r.max_retries),
                 "query retry effective value ([cluster] retry_policy / ARNEB_RETRY_POLICY, query_retry_attempts / ARNEB_QUERY_RETRY_ATTEMPTS)"
             );
+            tracing::info!(
+                target: "arneb::config",
+                include_coordinator,
+                "root-stage placement effective value ([cluster] include_coordinator / ARNEB_INCLUDE_COORDINATOR)"
+            );
             let coord =
                 coordinator::QueryCoordinator::new(node_registry.clone(), df_registry.clone())
                     .with_retry(retry)
-                    .with_task_failures(task_failures.clone());
+                    .with_task_failures(task_failures.clone())
+                    .with_include_coordinator(include_coordinator);
             Some(Arc::new(coord))
         }
         _ => None,

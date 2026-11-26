@@ -678,7 +678,7 @@ impl LateDomain {
         };
         *guard = None;
         tracing::debug!(
-            target: "arneb::dynamic_filter",
+            target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
             "scan late_resolved subscribed_df_id={} applied={}",
             self.df_id,
             outcome.is_some()
@@ -836,7 +836,7 @@ impl ScanExec {
         let timeout = self.dynamic_filtering_wait_timeout;
         for consumer in awaited {
             tracing::debug!(
-                target: "arneb::dynamic_filter",
+                target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                 "scan subscribe df_id={} column_index={} column_name={}",
                 consumer.id, consumer.column_index, consumer.column_name
             );
@@ -846,18 +846,11 @@ impl ScanExec {
             let mut recv = collector.take_receiver(consumer.id).await;
             match tokio::time::timeout(timeout, &mut recv).await {
                 Ok(Ok(domain)) => {
-                    let domain_variant = match &domain {
-                        arneb_common::Domain::DistinctValues(values) => {
-                            format!("DistinctValues(len={})", values.len())
-                        }
-                        arneb_common::Domain::Range { .. } => "Range".to_string(),
-                        arneb_common::Domain::Bloom(_) => "Bloom".to_string(),
-                        arneb_common::Domain::All => "All".to_string(),
-                    };
                     tracing::debug!(
-                        target: "arneb::dynamic_filter",
+                        target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                         "scan resolved subscribed_df_id={} domain={}",
-                        consumer.id, domain_variant
+                        consumer.id,
+                        domain.summary()
                     );
                     if consumer.probe_side {
                         out.late.push(LateFilter {
@@ -876,18 +869,18 @@ impl ScanExec {
                     });
                 }
                 Ok(Err(_)) => {
-                    tracing::debug!(target: "arneb::dynamic_filter","scan recv_closed subscribed_df_id={}", consumer.id);
                     // Sender dropped before resolution because the
                     // query/worker-side collector went away. Fall
                     // through to static-filter-only behaviour.
                     tracing::debug!(
+                        target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                         df_id = %consumer.id,
-                        "dynamic filter sender dropped before resolution"
+                        "scan recv_closed: dynamic filter sender dropped before resolution"
                     );
                 }
                 Err(_) => {
                     tracing::debug!(
-                        target: "arneb::dynamic_filter",
+                        target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                         "scan timeout subscribed_df_id={} timeout_ms={} deferred={}",
                         consumer.id,
                         timeout.as_millis(),

@@ -114,17 +114,6 @@ use clap::Parser;
 
 use crate::config::{parse_data_type, AppConfig, ServerRole};
 
-fn dfrpc_domain_variant(domain: &arneb_common::Domain) -> String {
-    match domain {
-        arneb_common::Domain::DistinctValues(values) => {
-            format!("DistinctValues(len={})", values.len())
-        }
-        arneb_common::Domain::Range { .. } => "Range".to_string(),
-        arneb_common::Domain::Bloom(_) => "Bloom".to_string(),
-        arneb_common::Domain::All => "All".to_string(),
-    }
-}
-
 /// Arneb — Distributed SQL query engine
 #[derive(Parser)]
 #[command(name = "arneb", version, about)]
@@ -666,13 +655,13 @@ async fn run(control: tokio::runtime::Handle) -> Result<()> {
             state.set_df_report_callback(std::sync::Arc::new(
                 move |req: arneb_rpc::ReportDynamicFilterRequest| {
                     tracing::debug!(
-                        target: "arneb::dynamic_filter",
+                        target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                         "coord flight received_report query_id={} task_id={} partition_idx={} df_id={} domain={}",
                         req.query_id,
                         req.task_id,
                         req.partition_idx,
                         req.df_id,
-                        dfrpc_domain_variant(&req.domain)
+                        req.domain.summary()
                     );
                     let registry = df_registry_for_cb.clone();
                     tokio::spawn(async move {
@@ -892,12 +881,12 @@ async fn run(control: tokio::runtime::Handle) -> Result<()> {
         flight_state.set_df_notify_callback(Arc::new(
             move |req: arneb_rpc::NotifyDynamicFilterRequest| {
                 tracing::debug!(
-                    target: "arneb::dynamic_filter",
+                    target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                     "worker flight received_notify query_id={} task_id={} df_id={} domain={}",
                     req.query_id,
                     req.task_id,
                     req.df_id,
-                    dfrpc_domain_variant(&req.domain)
+                    req.domain.summary()
                 );
                 let tm = tm_for_notify.clone();
                 tokio::spawn(async move {

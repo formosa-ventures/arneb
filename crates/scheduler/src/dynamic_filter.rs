@@ -29,15 +29,6 @@ use arneb_common::error::ExecutionError;
 use arneb_common::{Domain, DynamicFilterId, StageId, DEFAULT_MAX_DISTINCT_VALUES};
 use tokio::sync::oneshot;
 
-fn dfrpc_domain_variant(domain: &Domain) -> String {
-    match domain {
-        Domain::DistinctValues(values) => format!("DistinctValues(len={})", values.len()),
-        Domain::Range { .. } => "Range".to_string(),
-        Domain::Bloom(_) => "Bloom".to_string(),
-        Domain::All => "All".to_string(),
-    }
-}
-
 /// Per-DF accumulation state.
 #[derive(Debug)]
 struct DfState {
@@ -97,7 +88,7 @@ impl DynamicFilterService {
     pub fn register_query(&mut self, filter_ids: &[(DynamicFilterId, StageId, u32)]) {
         for (df_id, stage_id, expected) in filter_ids {
             tracing::debug!(
-                target: "arneb::dynamic_filter",
+                target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                 "coord service register df_id={} stage_id={} expected_task_count={}",
                 df_id, stage_id, expected
             );
@@ -134,11 +125,11 @@ impl DynamicFilterService {
         })?;
 
         tracing::debug!(
-            target: "arneb::dynamic_filter",
+            target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
             "coord service report df_id={} partition_idx={} domain={} reported_before={} expected_task_count={}",
             df_id,
             partition_idx,
-            dfrpc_domain_variant(&partial),
+            partial.summary(),
             state.partitions.len(),
             state.expected_partitions
         );
@@ -164,7 +155,7 @@ impl DynamicFilterService {
 
         if (state.partitions.len() as u32) == state.expected_partitions {
             tracing::debug!(
-                target: "arneb::dynamic_filter",
+                target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                 "coord service merge_start df_id={} reports={} expected_task_count={}",
                 df_id,
                 state.partitions.len(),
@@ -178,10 +169,10 @@ impl DynamicFilterService {
                 .reduce(|acc, next| acc.union(next, max))
                 .unwrap_or_else(Domain::all);
             tracing::debug!(
-                target: "arneb::dynamic_filter",
+                target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                 "coord service resolved df_id={} domain={} subscribers={}",
                 df_id,
-                dfrpc_domain_variant(&merged),
+                merged.summary(),
                 state.notify.len()
             );
             state.resolved = Some(merged.clone());
@@ -190,7 +181,7 @@ impl DynamicFilterService {
             }
         } else {
             tracing::debug!(
-                target: "arneb::dynamic_filter",
+                target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                 "coord service waiting df_id={} reports={} expected_task_count={}",
                 df_id,
                 state.partitions.len(),

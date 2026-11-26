@@ -41,7 +41,8 @@ export default defineConfig({
             { text: 'Observability', link: '/guide/observability' },
             { text: 'Performance', link: '/guide/performance' },
             { text: 'Trino Clients', link: '/guide/trino-clients' },
-            { text: 'Client Compatibility', link: '/guide/clients' }
+            { text: 'Client Compatibility', link: '/guide/clients' },
+            { text: 'Production Checklist', link: '/guide/production-checklist' }
           ]
         }
       ],

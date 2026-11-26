@@ -7334,6 +7334,69 @@ mod tests {
         partitions: usize,
         memory_pool: Arc<dyn crate::memory_pool::MemoryPool>,
     ) -> HashAggregateExec {
+        let aggr = PlanExpr::Function {
+            name: "COUNT".to_string(),
+            args: vec![PlanExpr::Column {
+                index: 1,
+                name: "v".to_string(),
+                span: None,
+            }],
+            distinct: true,
+            order_by: None,
+            span: None,
+        };
+        let count = ColumnInfo {
+            name: "cnt".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        aggregate_strings(grouped, partitions, memory_pool, aggr, count)
+    }
+
+    /// `percentile_disc(0.5) WITHIN GROUP (ORDER BY v)` over the same input
+    /// as [`count_distinct_strings`].
+    fn median_of_strings(
+        grouped: bool,
+        partitions: usize,
+        memory_pool: Arc<dyn crate::memory_pool::MemoryPool>,
+    ) -> HashAggregateExec {
+        let v = PlanExpr::Column {
+            index: 1,
+            name: "v".to_string(),
+            span: None,
+        };
+        let aggr = PlanExpr::Function {
+            name: "PERCENTILE_DISC".to_string(),
+            args: vec![PlanExpr::Literal {
+                value: ScalarValue::Float64(0.5),
+                span: None,
+            }],
+            distinct: false,
+            order_by: Some(Box::new(vec![arneb_planner::SortExpr {
+                expr: v,
+                asc: true,
+                nulls_first: false,
+            }])),
+            span: None,
+        };
+        let median = ColumnInfo {
+            name: "median".to_string(),
+            data_type: DataType::Utf8,
+            nullable: true,
+        };
+        aggregate_strings(grouped, partitions, memory_pool, aggr, median)
+    }
+
+    /// `aggr` (output column `out`) over 20 000 distinct strings `v`,
+    /// optionally grouped by `k = i % 4`, read from `partitions` input
+    /// partitions.
+    fn aggregate_strings(
+        grouped: bool,
+        partitions: usize,
+        memory_pool: Arc<dyn crate::memory_pool::MemoryPool>,
+        aggr: PlanExpr,
+        out: ColumnInfo,
+    ) -> HashAggregateExec {
         let columns = vec![
             ColumnInfo {
                 name: "k".to_string(),
@@ -7368,11 +7431,6 @@ mod tests {
             batches,
             partitioning: crate::partitioning::Partitioning::UnknownPartitioning(partitions),
         });
-        let count = ColumnInfo {
-            name: "cnt".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-        };
         HashAggregateExec {
             input,
             group_by: if grouped {
@@ -7384,21 +7442,11 @@ mod tests {
             } else {
                 Vec::new()
             },
-            aggr_exprs: vec![PlanExpr::Function {
-                name: "COUNT".to_string(),
-                args: vec![PlanExpr::Column {
-                    index: 1,
-                    name: "v".to_string(),
-                    span: None,
-                }],
-                distinct: true,
-                order_by: None,
-                span: None,
-            }],
+            aggr_exprs: vec![aggr],
             output_schema: if grouped {
-                vec![columns[0].clone(), count]
+                vec![columns[0].clone(), out]
             } else {
-                vec![count]
+                vec![out]
             },
             output_order: None,
             estimated_groups: None,
@@ -7429,6 +7477,49 @@ mod tests {
                     ),
                 }
                 assert_eq!(pool.reserved(), 0, "a failed aggregate releases its bytes");
+            }
+        }
+    }
+
+    /// Percentiles buffer every value of a group: under a tight pool they
+    /// fail with ResourceExhausted instead of growing untracked, and with
+    /// room their peak reservation covers the values.
+    #[tokio::test]
+    async fn percentiles_reserve_the_values_they_buffer() {
+        use crate::memory_pool::{GreedyMemoryPool, MemoryPool};
+        for grouped in [false, true] {
+            for partitions in [1, 4] {
+                let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024));
+                let agg = median_of_strings(grouped, partitions, pool.clone());
+                // The error surfaces from `execute` or while collecting.
+                let tight = match agg.execute(0).await {
+                    Ok(stream) => collect_stream(stream)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("{e:?}")),
+                    Err(e) => Err(format!("{e:?}")),
+                };
+                assert!(
+                    tight
+                        .as_ref()
+                        .is_err_and(|e| e.contains("ResourceExhausted")),
+                    "grouped={grouped} partitions={partitions}: expected \
+                     ResourceExhausted, got {tight:?}"
+                );
+                assert_eq!(pool.reserved(), 0, "a failed aggregate releases its bytes");
+
+                let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(256 << 20));
+                let agg = median_of_strings(grouped, partitions, pool.clone());
+                let batches = collect_stream(agg.execute(0).await.unwrap()).await.unwrap();
+                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                assert_eq!(rows, if grouped { 4 } else { 1 });
+                assert!(
+                    pool.reserved_peak() > 20_000 * 23,
+                    "grouped={grouped} partitions={partitions}: peak {} does not cover \
+                     the buffered values",
+                    pool.reserved_peak()
+                );
+                assert_eq!(pool.reserved(), 0, "the aggregate releases its bytes");
             }
         }
     }

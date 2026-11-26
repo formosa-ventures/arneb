@@ -2098,6 +2098,9 @@ impl AggrInfo {
 fn agg_spill_enabled() -> bool {
     #[cfg(test)]
     {
+        if let Some(forced) = AGG_SPILL_TEST_OVERRIDE.with(|c| c.get()) {
+            return forced;
+        }
         let enabled = std::env::var("ARNEB_AGG_SPILL")
             .map(|v| {
                 matches!(
@@ -2176,6 +2179,24 @@ fn set_dict_probe_build_for_test(enabled: Option<bool>) {
     DICT_PROBE_BUILD_TEST_OVERRIDE.with(|c| c.set(enabled));
 }
 
+#[cfg(test)]
+thread_local! {
+    static AGG_SPILL_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_agg_spill_for_test(enabled: Option<bool>) {
+    AGG_SPILL_TEST_OVERRIDE.with(|c| c.set(enabled));
+}
+
+// Counts `extract_scalar` calls on this thread, so a test can prove a path
+// builds no per-row `ScalarValue` keys.
+#[cfg(test)]
+thread_local! {
+    static EXTRACT_SCALAR_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // The group's accumulator vector. The group's `Vec<ScalarValue>` lives
 // inside the `GroupKey` that maps to this state, so we don't duplicate
 // it here.
@@ -2198,7 +2219,7 @@ fn group_state_heap_bytes(accs: &[Box<dyn Accumulator>]) -> usize {
 
 /// Total [`GroupedAccumulator::heap_bytes`] of an operator's accumulators.
 fn grouped_heap_bytes(accs: &[Box<dyn GroupedAccumulator>]) -> usize {
-    accs.iter().map(|acc| acc.heap_bytes()).sum()
+    accs.iter().map(|acc| acc.heap_bytes(0)).sum()
 }
 
 fn new_group_state(aggr_info: &[AggrInfo]) -> Result<GroupState, ExecutionError> {
@@ -2557,12 +2578,7 @@ impl HashAggregateExec {
                 .await;
         }
 
-        if agg_spill_enabled() {
-            return self
-                .execute_partitioned_spill_batch_aware(stream, &aggr_info)
-                .await;
-        }
-
+        let spill_enabled = agg_spill_enabled();
         let mut gbh = GroupByHash::with_estimated_groups(self.estimated_groups);
         let mut accs: Vec<Box<dyn GroupedAccumulator>> = aggr_info
             .iter()
@@ -2571,88 +2587,190 @@ impl HashAggregateExec {
             })
             .collect::<Result<_, _>>()?;
 
-        // exec-memory-accounting D3: reserve the growing group state against
-        // the global pool. `try_resize` fails fast (ResourceExhausted) when
-        // the pool refuses — far better than the worker OOM-kill seen on q18
-        // SF30. With the default Unbounded pool this never fails (no behaviour
-        // change). The reservation lives until the method returns (after
-        // `build_output_batch_aware` consumes `gbh`/`accs`), releasing on drop.
-        let consumer =
-            crate::memory_pool::MemoryConsumer::new("HashAggregateExec").with_can_spill(false);
+        let consumer = crate::memory_pool::MemoryConsumer::new("HashAggregateExec")
+            .with_can_spill(spill_enabled);
         let mut reservation = consumer.register(self.memory_pool.clone());
 
         let mut rows_seen = 0usize;
         while let Some(batch_res) = stream.next().await {
             let batch =
                 batch_res.map_err(|e| ExecutionError::upstream("aggregate input stream", e))?;
-            let group_cols: Vec<ArrayRef> = self
-                .group_by
-                .iter()
-                .map(|e| expression::evaluate(e, &batch, None).and_then(|c| group_key_array(&c)))
-                .collect::<Result<_, _>>()?;
-            let aggr_input_cols: Vec<ArrayRef> = aggr_info
-                .iter()
-                .map(|info| {
-                    if info.is_count_star {
-                        count_star_input_array(&count_star_column(&batch))
-                    } else {
-                        info.eval_arg(&batch)
-                            .and_then(|c| materialize_dictionary_array(&c))
-                    }
-                })
-                .collect::<Result<_, _>>()?;
-
-            let group_ids = gbh.get_group_ids(&group_cols)?;
+            let (group_cols, aggr_input_cols) = self.grouped_input_columns(&batch, &aggr_info)?;
+            let admitted_groups = gbh.num_groups();
             rows_seen = rows_seen.saturating_add(batch.num_rows());
-            gbh.adaptive_reserve_after_batch(rows_seen);
+            let group_ids = if spill_enabled {
+                // Check growing key storage incrementally so a large pressure batch
+                // cannot allocate its entire table before we notice the pool limit.
+                let mut ids = Vec::new();
+                let admission = (|| {
+                    for start in (0..batch.num_rows()).step_by(1024) {
+                        let len = (batch.num_rows() - start).min(1024);
+                        let keys = group_cols
+                            .iter()
+                            .map(|c| c.slice(start, len))
+                            .collect::<Vec<_>>();
+                        ids.extend(gbh.get_group_ids(&keys)?);
+                        reservation.try_resize(
+                            gbh.heap_bytes()
+                                + accs
+                                    .iter()
+                                    .map(|a| a.heap_bytes(gbh.num_groups()))
+                                    .sum::<usize>(),
+                        )?;
+                    }
+                    if batch.num_rows() == 0 {
+                        gbh.get_group_ids(&group_cols)?;
+                    }
+                    gbh.adaptive_reserve_after_batch(rows_seen);
+                    let mut bytes = gbh.heap_bytes();
+                    for (acc, col) in accs.iter().zip(&aggr_input_cols) {
+                        bytes += acc.batch_heap_bytes(gbh.num_groups(), &ids, col)?;
+                    }
+                    reservation.try_resize(bytes)
+                })();
+                match admission {
+                    Ok(()) => ids,
+                    Err(ExecutionError::ResourceExhausted(_)) => {
+                        drop(ids);
+                        let resident = if admitted_groups == 0 {
+                            None
+                        } else {
+                            let keys = gbh.build_group_range(0..admitted_groups)?;
+                            let mut table = GroupByHash::new();
+                            table.get_group_ids(&keys)?;
+                            Some(table)
+                        };
+                        drop(gbh);
+                        return self
+                            .execute_partitioned_spill_batch_aware(
+                                stream,
+                                &aggr_info,
+                                resident,
+                                accs,
+                                reservation,
+                                (group_cols, aggr_input_cols),
+                            )
+                            .await;
+                    }
+                    Err(err) => return Err(err),
+                }
+            } else {
+                let ids = gbh.get_group_ids(&group_cols)?;
+                gbh.adaptive_reserve_after_batch(rows_seen);
+                ids
+            };
             let n_groups = gbh.num_groups();
             for (i, acc) in accs.iter_mut().enumerate() {
                 acc.ensure_capacity(n_groups);
                 acc.add_input(&group_ids, &aggr_input_cols[i])?;
             }
-            // Group key/table bytes (exact-ish) + a coarse per-group
-            // accumulator estimate (~16 B/group/aggregate).
-            let state_bytes =
-                gbh.heap_bytes() + n_groups * accs.len() * 16 + grouped_heap_bytes(&accs);
-            reservation.try_resize(state_bytes)?;
+            reservation.try_resize(
+                gbh.heap_bytes() + accs.iter().map(|a| a.heap_bytes(0)).sum::<usize>(),
+            )?;
         }
 
         self.build_output_batch_aware(&gbh, &accs)
+    }
+
+    fn grouped_input_columns(
+        &self,
+        batch: &RecordBatch,
+        aggr_info: &[AggrInfo],
+    ) -> Result<(Vec<ArrayRef>, Vec<ArrayRef>), ExecutionError> {
+        let group_cols: Vec<ArrayRef> = self
+            .group_by
+            .iter()
+            .map(|e| expression::evaluate(e, batch, None).and_then(|c| group_key_array(&c)))
+            .collect::<Result<_, _>>()?;
+        let aggr_input_cols: Vec<ArrayRef> = aggr_info
+            .iter()
+            .map(|info| {
+                if info.is_count_star {
+                    count_star_input_array(&count_star_column(batch))
+                } else {
+                    info.eval_arg(batch)
+                        .and_then(|c| materialize_dictionary_array(&c))
+                }
+            })
+            .collect::<Result<_, _>>()?;
+
+        Ok((group_cols, aggr_input_cols))
     }
 
     async fn execute_partitioned_spill_batch_aware(
         &self,
         mut stream: SendableRecordBatchStream,
         aggr_info: &[AggrInfo],
+        resident: Option<GroupByHash>,
+        mut resident_accs: Vec<Box<dyn GroupedAccumulator>>,
+        mut reservation: crate::memory_pool::MemoryReservation,
+        first: (Vec<ArrayRef>, Vec<ArrayRef>),
     ) -> Result<Vec<RecordBatch>, ExecutionError> {
         const N_PARTITIONS: usize = 64;
-
-        let input_schema = crate::datasource::column_info_to_arrow_schema(&self.input.schema());
+        // Spill evaluated columns so each input expression runs once.
+        let schema = Arc::new(Schema::new(
+            first
+                .0
+                .iter()
+                .chain(&first.1)
+                .enumerate()
+                .map(|(i, c)| Field::new(i.to_string(), c.data_type().clone(), true))
+                .collect::<Vec<_>>(),
+        ));
         let mut writer =
-            PartitionedSpillWriter::new(input_schema.clone(), N_PARTITIONS, "agg_grace_input");
+            PartitionedSpillWriter::new(schema.clone(), N_PARTITIONS, "agg_grace_input");
         let mut input_rows = 0usize;
         let mut input_bytes = 0usize;
-
-        while let Some(batch_res) = stream.next().await {
-            let batch =
-                batch_res.map_err(|e| ExecutionError::upstream("aggregate input stream", e))?;
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            input_rows += batch.num_rows();
-            input_bytes += record_batch_bytes(&batch);
-
-            let group_cols: Vec<ArrayRef> = self
-                .group_by
-                .iter()
-                .map(|e| expression::evaluate(e, &batch, None).and_then(|c| group_key_array(&c)))
-                .collect::<Result<_, _>>()?;
+        let mut pending = Some(first);
+        loop {
+            let (group_cols, inputs) = if let Some(cols) = pending.take() {
+                cols
+            } else if let Some(batch) = stream.next().await {
+                let batch =
+                    batch.map_err(|e| ExecutionError::upstream("aggregate input stream", e))?;
+                self.grouped_input_columns(&batch, aggr_info)?
+            } else {
+                break;
+            };
             let assignments = group_partition_assignments(&group_cols, N_PARTITIONS)?;
             let mut buckets: Vec<Vec<u32>> = (0..N_PARTITIONS).map(|_| Vec::new()).collect();
+            let mut resident_ids = Vec::new();
+            let mut resident_rows = Vec::new();
+            let matches = resident
+                .as_ref()
+                .map(|table| table.lookup_group_ids(&group_cols))
+                .transpose()?;
             for (row, &partition) in assignments.iter().enumerate() {
+                if let Some(id) = matches.as_ref().and_then(|ids| ids[row]) {
+                    resident_rows.push(row as u32);
+                    resident_ids.push(id);
+                    continue;
+                }
                 buckets[partition as usize].push(row as u32);
             }
-            let schema = batch.schema();
+            if !resident_ids.is_empty() && resident_ids.len() == assignments.len() {
+                for (acc, col) in resident_accs.iter_mut().zip(&inputs) {
+                    acc.add_input(&resident_ids, col)?;
+                }
+            } else if !resident_rows.is_empty() {
+                let indices = UInt32Array::from(resident_rows);
+                for (acc, col) in resident_accs.iter_mut().zip(&inputs) {
+                    acc.add_input(&resident_ids, &compute::take(col, &indices, None)?)?;
+                }
+            }
+            reservation.try_resize(
+                resident.as_ref().map_or(0, GroupByHash::heap_bytes)
+                    + resident_accs
+                        .iter()
+                        .map(|acc| acc.heap_bytes(0))
+                        .sum::<usize>(),
+            )?;
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                group_cols.into_iter().chain(inputs).collect(),
+            )?;
+            input_rows += batch.num_rows();
+            input_bytes += record_batch_bytes(&batch);
             for (partition, indices) in buckets.into_iter().enumerate() {
                 if indices.is_empty() {
                     continue;
@@ -2679,7 +2797,13 @@ impl HashAggregateExec {
             "partitioned-agg-spill: starting partition reload"
         );
 
-        let mut output = Vec::new();
+        let mut output = if let Some(table) = resident {
+            self.build_grouped_output(&table, table.num_groups(), &resident_accs)?
+        } else {
+            Vec::new()
+        };
+        drop(resident_accs);
+        drop(reservation);
         for partition in 0..spill_file.n_partitions() {
             let Some(partition_file) = spill_file.take_partition(partition) else {
                 continue;
@@ -2708,33 +2832,15 @@ impl HashAggregateExec {
             let reader = partition_file.open_reader()?;
             for batch_res in reader {
                 let batch = batch_res?;
-                let group_cols: Vec<ArrayRef> = self
-                    .group_by
-                    .iter()
-                    .map(|e| {
-                        expression::evaluate(e, &batch, None).and_then(|c| group_key_array(&c))
-                    })
-                    .collect::<Result<_, _>>()?;
-                let aggr_input_cols: Vec<ArrayRef> = aggr_info
-                    .iter()
-                    .map(|info| {
-                        if info.is_count_star {
-                            count_star_input_array(&count_star_column(&batch))
-                        } else {
-                            info.eval_arg(&batch)
-                                .and_then(|c| materialize_dictionary_array(&c))
-                        }
-                    })
-                    .collect::<Result<_, _>>()?;
-
-                let group_ids = gbh.get_group_ids(&group_cols)?;
+                let (group_cols, aggr_input_cols) = batch.columns().split_at(self.group_by.len());
+                let group_ids = gbh.get_group_ids(group_cols)?;
                 let n_groups = gbh.num_groups();
                 for (i, acc) in accs.iter_mut().enumerate() {
                     acc.ensure_capacity(n_groups);
                     acc.add_input(&group_ids, &aggr_input_cols[i])?;
                 }
                 let state_bytes =
-                    gbh.heap_bytes() + n_groups * accs.len() * 16 + grouped_heap_bytes(&accs);
+                    gbh.heap_bytes() + accs.iter().map(|a| a.heap_bytes(0)).sum::<usize>();
                 reservation.try_resize(state_bytes)?;
             }
 
@@ -2791,41 +2897,41 @@ impl HashAggregateExec {
         Ok(vec![RecordBatch::try_new(arrow_schema, columns)?])
     }
 
-    /// Build the output `RecordBatch` for the grouped batch-aware path.
-    ///
-    /// Group columns come from `GroupByHash::build_group_arrays`, which
-    /// uses the Bigint fast path's flat `Vec<i64>` directly when the
-    /// key is a single Int64 — no per-group `ScalarValue` materialise.
+    /// Materialize group keys and aggregate values in bounded batches.
     fn build_output_batch_aware(
         &self,
         gbh: &GroupByHash,
         accs: &[Box<dyn GroupedAccumulator>],
     ) -> Result<Vec<RecordBatch>, ExecutionError> {
-        let n = gbh.num_groups();
-        if n == 0 {
-            return Ok(vec![]);
-        }
-        let num_aggr_cols = self.aggr_exprs.len();
+        self.build_grouped_output(gbh, gbh.num_groups(), accs)
+    }
 
-        // Group key columns (one ArrayRef per group_by expression).
-        let group_columns: Vec<ArrayRef> = gbh.build_group_arrays()?;
-
-        // Aggregate result columns — still walk per group_id via the
-        // accumulator's per-group `evaluate`; this path is unchanged.
-        let mut aggr_values: Vec<Vec<ScalarValue>> = vec![Vec::with_capacity(n); num_aggr_cols];
-        for g_usize in 0..n {
-            let g = g_usize as u32;
-            for (i, acc) in accs.iter().enumerate() {
-                aggr_values[i].push(acc.evaluate(g)?);
-            }
-        }
-        let columns = self.assemble_output_columns(
-            |i, _| Ok(group_columns[i].clone()),
-            |i, data_type| scalars_to_array(&aggr_values[i], data_type),
-        )?;
-
-        let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.output_schema);
-        Ok(vec![RecordBatch::try_new(arrow_schema, columns)?])
+    fn build_grouped_output(
+        &self,
+        gbh: &GroupByHash,
+        n: usize,
+        accs: &[Box<dyn GroupedAccumulator>],
+    ) -> Result<Vec<RecordBatch>, ExecutionError> {
+        const BATCH_SIZE: usize = 8192;
+        let schema = crate::datasource::column_info_to_arrow_schema(&self.output_schema);
+        (0..n)
+            .step_by(BATCH_SIZE)
+            .map(|start| {
+                let range = start..n.min(start + BATCH_SIZE);
+                let keys = gbh.build_group_range(range.clone())?;
+                let columns = self.assemble_output_columns(
+                    |i, _| Ok(keys[i].clone()),
+                    |i, data_type| {
+                        let values = range
+                            .clone()
+                            .map(|g| accs[i].evaluate(g as u32))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        scalars_to_array(&values, data_type)
+                    },
+                )?;
+                Ok(RecordBatch::try_new(schema.clone(), columns)?)
+            })
+            .collect()
     }
 
     /// Batch-aware multi-partition aggregate. Spawns per-partition
@@ -2953,7 +3059,7 @@ impl HashAggregateExec {
             global_gbh.reserve_groups(final_groups_upper_bound);
         }
 
-        for (partial_gbh, partial_accs, mut partial_reservation) in partials {
+        for (partial_gbh, partial_accs, partial_reservation) in partials {
             // An input partition with zero rows never initialised its key
             // storage, so it yields zero key columns; feeding that to the
             // global hash errors (FlatRow expects one array per key).
@@ -2968,21 +3074,14 @@ impl HashAggregateExec {
             let partial_arrays = partial_gbh.build_group_arrays()?;
             let remap = global_gbh.get_group_ids(&partial_arrays)?;
             let n_global = global_gbh.num_groups();
-            // Merge one accumulator at a time and free its partial state
-            // (and that share of the partial's reservation) right after, so
-            // a partial and its merged copy overlap for one accumulator at
-            // most, in memory and in the pool.
             for (i, pa) in partial_accs.into_iter().enumerate() {
                 final_accs[i].ensure_capacity(n_global);
                 final_accs[i].merge_from(pa.as_ref(), &remap)?;
-                let freed = pa.heap_bytes().min(partial_reservation.size());
-                drop(pa);
-                partial_reservation.shrink(freed);
-                let state_bytes = global_gbh.heap_bytes()
-                    + n_global * final_accs.len() * 16
-                    + grouped_heap_bytes(&final_accs);
-                reservation.try_resize(state_bytes)?;
             }
+            drop(partial_reservation);
+            let state_bytes =
+                global_gbh.heap_bytes() + final_accs.iter().map(|a| a.heap_bytes(0)).sum::<usize>();
+            reservation.try_resize(state_bytes)?;
         }
 
         self.build_output_batch_aware(&global_gbh, &final_accs)
@@ -4392,6 +4491,8 @@ where
 // ===========================================================================
 
 pub(crate) fn extract_scalar(arr: &ArrayRef, index: usize) -> Result<ScalarValue, ExecutionError> {
+    #[cfg(test)]
+    EXTRACT_SCALAR_CALLS.with(|c| c.set(c.get() + 1));
     if matches!(arr.data_type(), ArrowDataType::Dictionary(_, _)) {
         let materialized = materialize_dictionary_array(arr)?;
         return extract_scalar(&materialized, index);
@@ -6299,6 +6400,543 @@ mod tests {
             Err(ExecutionError::ResourceExhausted(_)) => {}
             Err(other) => panic!("expected ResourceExhausted, got {other:?}"),
             Ok(_) => panic!("expected ResourceExhausted under a tight pool, got Ok (no fail-fast)"),
+        }
+    }
+
+    /// Builds `SELECT k, COUNT(v), SUM(v) FROM t GROUP BY k` over `batches`
+    /// of (k INT, v BIGINT) with the given pool.
+    fn count_sum_by_key(
+        batches: Vec<Vec<i32>>,
+        pool: Arc<dyn crate::memory_pool::MemoryPool>,
+    ) -> HashAggregateExec {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batches = batches
+            .into_iter()
+            .map(|keys| {
+                let v: Vec<i64> = keys.iter().map(|&k| i64::from(k)).collect();
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(arrow::array::Int32Array::from(keys)),
+                        Arc::new(arrow::array::Int64Array::from(v)),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let col = |name: &str, data_type| ColumnInfo {
+            name: name.to_string(),
+            data_type,
+            nullable: false,
+        };
+        let source: Arc<dyn DataSource> = Arc::new(InMemoryDataSource::new(
+            vec![col("k", DataType::Int32), col("v", DataType::Int64)],
+            batches,
+        ));
+        let scan: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
+            source,
+            _table_name: "t".to_string(),
+            scan_context: ScanContext::default(),
+            dynamic_filters: Default::default(),
+            dynamic_filters_consumed: Vec::new(),
+            dynamic_filter_collector: None,
+            dynamic_filtering_enabled: false,
+            dynamic_filtering_wait_timeout: std::time::Duration::from_secs(10),
+            scan_task_index: 0,
+            scan_task_count: 1,
+        });
+        let v = || PlanExpr::Column {
+            index: 1,
+            name: "v".to_string(),
+            span: None,
+        };
+        let agg = |name: &str| PlanExpr::Function {
+            order_by: None,
+            name: name.to_string(),
+            args: vec![v()],
+            distinct: false,
+            span: None,
+        };
+        HashAggregateExec {
+            input: scan,
+            group_by: vec![PlanExpr::Column {
+                index: 0,
+                name: "k".to_string(),
+                span: None,
+            }],
+            aggr_exprs: vec![agg("COUNT"), agg("SUM")],
+            output_schema: vec![
+                col("k", DataType::Int32),
+                col("cnt", DataType::Int64),
+                col("sum", DataType::Int64),
+            ],
+            output_order: None,
+            estimated_groups: None,
+            memory_pool: pool,
+        }
+    }
+
+    /// (k, count, sum) per group, sorted by k.
+    async fn count_sum_rows(
+        agg: &HashAggregateExec,
+    ) -> Result<Vec<(i32, i64, i64)>, ExecutionError> {
+        let batches = collect_stream(agg.execute(0).await?)
+            .await
+            .map_err(|e| match e {
+                arneb_common::error::ArnebError::Execution(e) => e,
+                other => ExecutionError::InvalidOperation(other.to_string()),
+            })?;
+        let mut rows = Vec::new();
+        for b in &batches {
+            let k = b.column(0).as_primitive::<datatypes::Int32Type>();
+            let c = b.column(1).as_primitive::<datatypes::Int64Type>();
+            let s = b.column(2).as_primitive::<datatypes::Int64Type>();
+            for i in 0..b.num_rows() {
+                rows.push((k.value(i), c.value(i), s.value(i)));
+            }
+        }
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
+    /// Clears the thread's aggregation-spill override on drop.
+    struct AggSpillGuard;
+    impl Drop for AggSpillGuard {
+        fn drop(&mut self) {
+            set_agg_spill_for_test(None);
+        }
+    }
+
+    /// With aggregation spill enabled, a GROUP BY whose state fits in the
+    /// pool must aggregate in memory: on TPC-DS SF30 the always-spill path
+    /// made q22/q67/q97 3-4x slower although none of them needed to spill.
+    /// Spill writes are refused on this thread, so any spill fails the query.
+    #[tokio::test]
+    async fn agg_spill_on_does_not_spill_when_the_state_fits() {
+        set_agg_spill_for_test(Some(true));
+        let _reset = AggSpillGuard;
+        let _no_spill = crate::spill::forbid_spill_writes_for_test();
+        let keys: Vec<i32> = (0..2000).collect();
+        let agg = count_sum_by_key(
+            vec![keys.clone(), keys],
+            Arc::new(crate::memory_pool::UnboundedMemoryPool::new()),
+        );
+        let rows = count_sum_rows(&agg)
+            .await
+            .expect("an aggregate that fits in memory must not need to spill");
+        assert_eq!(rows.len(), 2000);
+        assert!(rows
+            .iter()
+            .all(|&(k, c, s)| c == 2 && s == 2 * i64::from(k)));
+    }
+
+    /// With aggregation spill enabled and a pool too small for the whole
+    /// group state, the aggregate spills and still returns every group
+    /// once with the right totals. Keys recur across the point where the
+    /// pool runs out, arrive in reverse order, and one batch is repeated.
+    #[tokio::test]
+    async fn agg_spill_on_spills_under_pressure_with_correct_totals() {
+        set_agg_spill_for_test(Some(true));
+        let _reset = AggSpillGuard;
+        let n = 20_000;
+        let first: Vec<i32> = (0..n / 2).collect();
+        let reversed: Vec<i32> = (0..n).rev().collect();
+        let all: Vec<i32> = (0..n).collect();
+        let batches = vec![first, reversed, all.clone(), all];
+        let expected: Vec<(i32, i64, i64)> = (0..n)
+            .map(|k| {
+                let c = if k < n / 2 { 4 } else { 3 };
+                (k, c, c * i64::from(k))
+            })
+            .collect();
+
+        let unbounded = count_sum_by_key(
+            batches.clone(),
+            Arc::new(crate::memory_pool::UnboundedMemoryPool::new()),
+        );
+        assert_eq!(count_sum_rows(&unbounded).await.unwrap(), expected);
+
+        // Far below the ~0.5 MB the 20 000 groups need in memory.
+        let tight = count_sum_by_key(
+            batches,
+            Arc::new(crate::memory_pool::GreedyMemoryPool::new(64 * 1024)),
+        );
+        assert_eq!(count_sum_rows(&tight).await.unwrap(), expected);
+    }
+
+    /// Under pressure the groups admitted before it stay resident and are found
+    /// through the group table, not through per-row `ScalarValue` keys (on q78
+    /// SF30 those keys and their map held ~9 GiB outside the memory pool).
+    #[tokio::test]
+    async fn agg_spill_under_pressure_builds_no_per_row_scalar_keys() {
+        set_agg_spill_for_test(Some(true));
+        let _reset = AggSpillGuard;
+        let n = 20_000;
+        // 100 groups fit in the pool; the next batch does not.
+        let batches = vec![
+            (0..100).collect::<Vec<i32>>(),
+            (0..n).rev().collect(),
+            (0..n).collect(),
+        ];
+        let unbounded = count_sum_by_key(
+            batches.clone(),
+            Arc::new(crate::memory_pool::UnboundedMemoryPool::new()),
+        );
+        let expected = count_sum_rows(&unbounded).await.unwrap();
+
+        let tight = count_sum_by_key(
+            batches,
+            Arc::new(crate::memory_pool::GreedyMemoryPool::new(64 * 1024)),
+        );
+        EXTRACT_SCALAR_CALLS.with(|c| c.set(0));
+        assert_eq!(count_sum_rows(&tight).await.unwrap(), expected);
+        assert_eq!(EXTRACT_SCALAR_CALLS.with(|c| c.get()), 0);
+    }
+
+    /// Counts heap bytes allocated and freed on the current thread, so a test can
+    /// compare an operator's real heap high-water mark with what it reserved.
+    struct ThreadHeapCounter;
+    thread_local! {
+        static THREAD_HEAP: std::cell::Cell<(isize, isize)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    fn thread_heap_add(delta: isize) {
+        let _ = THREAD_HEAP.try_with(|c| {
+            let (cur, peak) = c.get();
+            let cur = cur + delta;
+            c.set((cur, peak.max(cur)));
+        });
+    }
+    #[allow(unsafe_code)]
+    unsafe impl std::alloc::GlobalAlloc for ThreadHeapCounter {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            thread_heap_add(layout.size() as isize);
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            thread_heap_add(-(layout.size() as isize));
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(
+            &self,
+            ptr: *mut u8,
+            layout: std::alloc::Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            thread_heap_add(new_size as isize - layout.size() as isize);
+            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+        }
+    }
+    #[global_allocator]
+    static THREAD_HEAP_COUNTER: ThreadHeapCounter = ThreadHeapCounter;
+
+    /// The aggregate's real heap high-water mark stays within its memory
+    /// reservation plus the output it returns: group state is accounted at its
+    /// real size, and output is not built through an untracked full copy of every
+    /// group (q78 SF30: state ~2-4x its estimate, plus ~5.6 GiB of output scalars).
+    #[tokio::test]
+    async fn aggregate_heap_stays_within_its_reservation() {
+        set_agg_spill_for_test(Some(false));
+        let _reset = AggSpillGuard;
+        let n = 200_000;
+        let pool = Arc::new(crate::memory_pool::GreedyMemoryPool::new(1 << 40));
+        let agg = count_sum_by_key(vec![(0..n).collect(), (0..n).rev().collect()], pool.clone());
+
+        let base = THREAD_HEAP.with(|c| {
+            let (cur, _) = c.get();
+            c.set((cur, cur));
+            cur
+        });
+        let batches = collect_stream(agg.execute(0).await.unwrap()).await.unwrap();
+        let heap_peak = (THREAD_HEAP.with(|c| c.get().1) - base) as usize;
+        let output: usize = batches
+            .iter()
+            .map(crate::memory_pool::batch_memory_size)
+            .sum();
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            n as usize
+        );
+
+        let reserved = crate::memory_pool::MemoryPool::reserved_peak(&*pool);
+        assert!(
+            heap_peak <= reserved * 3 / 2 + output + (1 << 20),
+            "heap peak {heap_peak} B vs reserved peak {reserved} B + output {output} B"
+        );
+    }
+
+    /// Aggregate output comes in batches of at most 8192 rows.
+    #[tokio::test]
+    async fn aggregate_output_is_batched() {
+        set_agg_spill_for_test(Some(false));
+        let _reset = AggSpillGuard;
+        let n = 20_000;
+        let agg = count_sum_by_key(
+            vec![(0..n).collect()],
+            Arc::new(crate::memory_pool::UnboundedMemoryPool::new()),
+        );
+        let batches = collect_stream(agg.execute(0).await.unwrap()).await.unwrap();
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            n as usize
+        );
+        assert!(
+            batches.iter().all(|b| b.num_rows() <= 8192),
+            "{:?}",
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Builds `SELECT k, MAX(s) FROM t GROUP BY k` over `batches` of
+    /// (k INT, s VARCHAR) with the given pool. A group's MAX keeps a copy of
+    /// its longest-sorting string, so its state grows with the strings it
+    /// sees, not only with the number of groups.
+    fn max_string_by_key(
+        batches: Vec<(Vec<i32>, Vec<String>)>,
+        pool: Arc<dyn crate::memory_pool::MemoryPool>,
+    ) -> HashAggregateExec {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new("s", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let batches = batches
+            .into_iter()
+            .map(|(keys, strings)| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(arrow::array::Int32Array::from(keys)),
+                        Arc::new(arrow::array::StringArray::from(strings)),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let col = |name: &str, data_type, nullable| ColumnInfo {
+            name: name.to_string(),
+            data_type,
+            nullable,
+        };
+        let source: Arc<dyn DataSource> = Arc::new(InMemoryDataSource::new(
+            vec![
+                col("k", DataType::Int32, false),
+                col("s", DataType::Utf8, false),
+            ],
+            batches,
+        ));
+        let scan: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
+            source,
+            _table_name: "t".to_string(),
+            scan_context: ScanContext::default(),
+            dynamic_filters: Default::default(),
+            dynamic_filters_consumed: Vec::new(),
+            dynamic_filter_collector: None,
+            dynamic_filtering_enabled: false,
+            dynamic_filtering_wait_timeout: std::time::Duration::from_secs(10),
+            scan_task_index: 0,
+            scan_task_count: 1,
+        });
+        HashAggregateExec {
+            input: scan,
+            group_by: vec![PlanExpr::Column {
+                index: 0,
+                name: "k".to_string(),
+                span: None,
+            }],
+            aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
+                name: "MAX".to_string(),
+                args: vec![PlanExpr::Column {
+                    index: 1,
+                    name: "s".to_string(),
+                    span: None,
+                }],
+                distinct: false,
+                span: None,
+            }],
+            output_schema: vec![
+                col("k", DataType::Int32, false),
+                col("mx", DataType::Utf8, true),
+            ],
+            output_order: None,
+            estimated_groups: None,
+            memory_pool: pool,
+        }
+    }
+
+    /// (k, MAX(s)) per group, sorted by k.
+    async fn max_string_rows(
+        agg: &HashAggregateExec,
+    ) -> Result<Vec<(i32, String)>, ExecutionError> {
+        let batches = collect_stream(agg.execute(0).await?)
+            .await
+            .map_err(|e| match e {
+                arneb_common::error::ArnebError::Execution(e) => e,
+                other => ExecutionError::InvalidOperation(other.to_string()),
+            })?;
+        let mut rows = Vec::new();
+        for b in &batches {
+            let k = b.column(0).as_primitive::<datatypes::Int32Type>();
+            let s = b.column(1).as_string::<i32>();
+            for i in 0..b.num_rows() {
+                rows.push((k.value(i), s.value(i).to_string()));
+            }
+        }
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
+    /// Resets this thread's heap high-water mark and returns the current
+    /// heap level, the base for [`heap_peak_since`].
+    fn heap_mark() -> isize {
+        THREAD_HEAP.with(|c| {
+            let (cur, _) = c.get();
+            c.set((cur, cur));
+            cur
+        })
+    }
+
+    fn heap_peak_since(base: isize) -> usize {
+        (THREAD_HEAP.with(|c| c.get().1) - base).max(0) as usize
+    }
+
+    /// With spill on, a batch whose rows grow group state by more than its
+    /// new groups suggest (here 200 new groups, each with a 1000-byte MAX
+    /// string, against a 64 KiB pool) must spill, not fail the query.
+    #[tokio::test]
+    async fn agg_spill_spills_a_batch_that_grows_state_beyond_its_new_groups() {
+        set_agg_spill_for_test(Some(true));
+        let _reset = AggSpillGuard;
+        let long = |k: i32| format!("{k:05}{}", "x".repeat(995));
+        let batches = vec![
+            ((0..100).collect::<Vec<i32>>(), vec!["a".to_string(); 100]),
+            ((100..300).collect(), (100..300).map(long).collect()),
+        ];
+        let expected = max_string_rows(&max_string_by_key(
+            batches.clone(),
+            Arc::new(crate::memory_pool::UnboundedMemoryPool::new()),
+        ))
+        .await
+        .unwrap();
+        let tight = max_string_by_key(
+            batches,
+            Arc::new(crate::memory_pool::GreedyMemoryPool::new(64 * 1024)),
+        );
+        assert_eq!(max_string_rows(&tight).await.unwrap(), expected);
+    }
+
+    /// Heap peak, reserved peak and output bytes of `GROUP BY k` over
+    /// `n` distinct keys (1 000, then all `n` twice) with spill on and a
+    /// 1 MiB pool.
+    async fn spilling_count_sum_heap(n: i32) -> (usize, usize, usize) {
+        let pool = Arc::new(crate::memory_pool::GreedyMemoryPool::new(1 << 20));
+        let agg = count_sum_by_key(
+            vec![
+                (0..1000).collect(),
+                (0..n).collect(),
+                (0..n).rev().collect(),
+            ],
+            pool.clone(),
+        );
+        let base = heap_mark();
+        let batches = collect_stream(agg.execute(0).await.unwrap()).await.unwrap();
+        let heap_peak = heap_peak_since(base);
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            n as usize
+        );
+        let output = batches
+            .iter()
+            .map(crate::memory_pool::batch_memory_size)
+            .sum();
+        let reserved = crate::memory_pool::MemoryPool::reserved_peak(&*pool);
+        (heap_peak, reserved, output)
+    }
+
+    /// While spilling, the aggregate's heap grows with its input only by what
+    /// it reserved and the output it returns: the batch that runs the pool out
+    /// does not leave its new groups in the resident table outside the pool.
+    /// Compared across two input sizes (100 000 and 400 000 groups against a
+    /// 1 MiB pool), so the spill writers' fixed buffers cancel out.
+    #[tokio::test]
+    async fn spilling_aggregate_heap_grows_only_with_reserved_state_and_output() {
+        set_agg_spill_for_test(Some(true));
+        let _reset = AggSpillGuard;
+        let (small_heap, small_reserved, small_output) = spilling_count_sum_heap(100_000).await;
+        let (large_heap, large_reserved, large_output) = spilling_count_sum_heap(400_000).await;
+        let allowed = small_heap
+            + large_output.saturating_sub(small_output) * 3 / 2
+            + large_reserved.saturating_sub(small_reserved) * 3 / 2
+            + (1 << 20);
+        assert!(
+            large_heap <= allowed,
+            "heap peak {small_heap} -> {large_heap} B; reserved {small_reserved} -> \
+             {large_reserved} B; output {small_output} -> {large_output} B"
+        );
+    }
+
+    /// While spilling, rows of groups that stay resident keep growing their
+    /// state: each later batch lengthens every resident group's MAX string by
+    /// 1000 bytes, to 20 MB in all, against a 4 MiB pool. Resident groups
+    /// cannot be written out, so that growth must be accounted and end in
+    /// ResourceExhausted rather than run past the pool. The same input with
+    /// an unbounded pool returns every group.
+    #[tokio::test]
+    async fn resident_state_growth_while_spilling_is_accounted() {
+        set_agg_spill_for_test(Some(true));
+        let _reset = AggSpillGuard;
+        let resident: Vec<i32> = (0..1000).collect();
+        let mut batches = vec![
+            (resident.clone(), vec!["a".to_string(); 1000]),
+            (
+                (1000..200_000).collect::<Vec<i32>>(),
+                vec!["b".to_string(); 199_000],
+            ),
+        ];
+        for j in 1..=20 {
+            batches.push((resident.clone(), vec!["z".repeat(1000 * j); 1000]));
+        }
+        let unbounded = max_string_rows(&max_string_by_key(
+            batches.clone(),
+            Arc::new(crate::memory_pool::UnboundedMemoryPool::new()),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(unbounded.len(), 200_000);
+        assert!(unbounded[..1000].iter().all(|(_, s)| s.len() == 20_000));
+
+        let tight = max_string_by_key(
+            batches,
+            Arc::new(crate::memory_pool::GreedyMemoryPool::new(4 << 20)),
+        );
+        match max_string_rows(&tight).await {
+            Err(ExecutionError::ResourceExhausted(_)) => {}
+            Ok(rows) => panic!(
+                "20 MB of resident state finished inside a 4 MiB pool ({} rows): not accounted",
+                rows.len()
+            ),
+            Err(other) => panic!("expected ResourceExhausted, got {other:?}"),
+        }
+    }
+
+    /// Without aggregation spill the same tight pool still fails fast.
+    #[tokio::test]
+    async fn agg_spill_off_fails_fast_under_pressure() {
+        set_agg_spill_for_test(Some(false));
+        let _reset = AggSpillGuard;
+        let all: Vec<i32> = (0..20_000).collect();
+        let agg = count_sum_by_key(
+            vec![all],
+            Arc::new(crate::memory_pool::GreedyMemoryPool::new(64 * 1024)),
+        );
+        match count_sum_rows(&agg).await {
+            Err(ExecutionError::ResourceExhausted(_)) => {}
+            other => panic!("expected ResourceExhausted, got {other:?}"),
         }
     }
 

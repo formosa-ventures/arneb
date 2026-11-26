@@ -7133,7 +7133,7 @@ mod tests {
             };
             assert_eq!(rows, expected, "{join_type:?} output rows");
             assert!(
-                allocations <= 1,
+                allocations == 1,
                 "{join_type:?}: {allocations} build-sized bitmaps for 40 probe batches"
             );
         }

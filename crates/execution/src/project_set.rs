@@ -7,9 +7,10 @@ use arneb_common::error::ExecutionError;
 use arneb_common::stream::SendableRecordBatchStream;
 use arneb_common::types::ColumnInfo;
 use arneb_planner::{PlanExpr, SrfKind};
-use arrow::array::{Array, ArrayRef, Int32Array, ListArray, UInt32Array};
+use arrow::array::{Array, ArrayRef, Int32Array, ListArray, StructArray, UInt32Array};
+use arrow::buffer::NullBuffer;
 use arrow::compute;
-use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 
@@ -116,6 +117,44 @@ fn list_len(list: Option<&ListArray>, row: usize) -> usize {
     }
 }
 
+/// The `STRUCT(x, n)` column of `_pg_expandarray`: `x` the element at each
+/// output row's position, `n` its 1-based subscript within its input row's
+/// array; NULL on padded rows.
+fn expand_array_column(
+    list: Option<&ListArray>,
+    positions: &[Option<u32>],
+    take_rows: &UInt32Array,
+    data_type: &ArrowDataType,
+) -> Result<ArrayRef, ExecutionError> {
+    let ArrowDataType::Struct(fields) = data_type else {
+        return Err(ExecutionError::InvalidOperation(format!(
+            "_pg_expandarray: expected a struct output type, got {data_type}"
+        )));
+    };
+    let Some(list) = list else {
+        return Ok(arrow::array::new_null_array(data_type, positions.len()));
+    };
+    let indices = UInt32Array::from(positions.to_vec());
+    let x = compute::take(list.values().as_ref(), &indices, None)?;
+    let x = if x.data_type() != fields[0].data_type() {
+        compute::cast(&x, fields[0].data_type())?
+    } else {
+        x
+    };
+    let offsets = list.value_offsets();
+    let n: Int32Array = positions
+        .iter()
+        .zip(take_rows.values())
+        .map(|(p, row)| p.map(|p| p as i32 - offsets[*row as usize] + 1))
+        .collect();
+    let nulls = NullBuffer::from(positions.iter().map(Option::is_some).collect::<Vec<_>>());
+    Ok(Arc::new(StructArray::try_new(
+        fields.clone(),
+        vec![x, Arc::new(n)],
+        Some(nulls),
+    )?))
+}
+
 fn project_set_batch(
     batch: &RecordBatch,
     srfs: &[(SrfKind, PlanExpr)],
@@ -138,7 +177,7 @@ fn project_set_batch(
             take_rows.push(row as u32);
             for (i, (kind, _)) in srfs.iter().enumerate() {
                 positions[i].push((k < lens[i]).then(|| match kind {
-                    SrfKind::Unnest => {
+                    SrfKind::Unnest | SrfKind::ExpandArray => {
                         let list = lists[i].expect("non-empty array");
                         (list.value_offsets()[row] as usize + k) as u32
                     }
@@ -165,6 +204,9 @@ fn project_set_batch(
                 }
                 None => arrow::array::new_null_array(field.data_type(), positions[i].len()),
             },
+            SrfKind::ExpandArray => {
+                expand_array_column(lists[i], &positions[i], &take_rows, field.data_type())?
+            }
             SrfKind::GenerateSubscripts => Arc::new(Int32Array::from(
                 positions[i]
                     .iter()
@@ -263,6 +305,61 @@ mod tests {
             v.iter().collect::<Vec<_>>(),
             [Some(10), None, None, Some(20), Some(30)]
         );
+    }
+
+    #[test]
+    fn expand_array_yields_element_and_subscript_structs() {
+        // Rows: ([7, 8], [1, 2, 3]), (NULL, NULL); the shorter array pads
+        // with a NULL struct.
+        let mut a = ListBuilder::new(Int64Builder::new());
+        a.values().append_slice(&[0, 0]);
+        a.append(true);
+        a.values().append_slice(&[7, 8]);
+        a.append(true);
+        a.append_null();
+        // Sliced, so the offsets do not start at 0.
+        let a: ArrayRef = Arc::new(a.finish().slice(1, 2));
+        let mut b = ListBuilder::new(Int64Builder::new());
+        b.values().append_slice(&[1, 2, 3]);
+        b.append(true);
+        b.append_null();
+        let b: ArrayRef = Arc::new(b.finish());
+        let in_schema = Arc::new(Schema::new(vec![
+            Field::new("a", a.data_type().clone(), true),
+            Field::new("b", b.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(in_schema.clone(), vec![a, b]).unwrap();
+        let struct_type: ArrowDataType = arneb_common::types::DataType::Struct(vec![
+            ("x".to_string(), arneb_common::types::DataType::Int64),
+            ("n".to_string(), arneb_common::types::DataType::Int32),
+        ])
+        .into();
+        let out_schema = Arc::new(Schema::new(vec![
+            in_schema.field(0).clone(),
+            in_schema.field(1).clone(),
+            Field::new("e", struct_type, true),
+            Field::new("u", ArrowDataType::Int64, true),
+        ]));
+        let srfs = vec![(SrfKind::ExpandArray, col(0)), (SrfKind::Unnest, col(1))];
+        let out = project_set_batch(&batch, &srfs, &out_schema).unwrap();
+        assert_eq!(out.num_rows(), 3);
+        let e = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(
+            (0..3).map(|i| e.is_valid(i)).collect::<Vec<_>>(),
+            [true, true, false]
+        );
+        let x = e.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let n = e.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!((x.value(0), n.value(0)), (7, 1));
+        assert_eq!((x.value(1), n.value(1)), (8, 2));
+        // Read through `(e).x`, the padded row is NULL.
+        let fx = crate::expression::get_field(out.column(2), "X").unwrap();
+        let fx = fx.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(fx.iter().collect::<Vec<_>>(), [Some(7), Some(8), None]);
     }
 
     #[test]

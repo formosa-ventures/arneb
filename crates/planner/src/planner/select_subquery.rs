@@ -764,6 +764,7 @@ fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
         E::Column { .. }
         | E::Literal { .. }
         | E::Parameter { .. }
+        | E::Interval { .. }
         | E::Subquery { .. }
         | E::Exists { .. } => Vec::new(),
         E::BinaryOp { left, right, .. } => vec![left, right],
@@ -810,6 +811,8 @@ fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
             .collect(),
         E::Array { elements, .. } => elements.iter().collect(),
         E::AnyAll { expr, array, .. } => vec![expr, array],
+        E::Subscript { expr, index, .. } => vec![expr, index],
+        E::FieldAccess { expr, .. } => vec![expr],
     }
 }
 
@@ -820,6 +823,7 @@ fn children_mut(expr: &mut ast::Expr) -> Vec<&mut ast::Expr> {
         E::Column { .. }
         | E::Literal { .. }
         | E::Parameter { .. }
+        | E::Interval { .. }
         | E::Subquery { .. }
         | E::Exists { .. } => Vec::new(),
         E::BinaryOp { left, right, .. } => vec![left, right],
@@ -866,6 +870,8 @@ fn children_mut(expr: &mut ast::Expr) -> Vec<&mut ast::Expr> {
             .collect(),
         E::Array { elements, .. } => elements.iter_mut().collect(),
         E::AnyAll { expr, array, .. } => vec![expr, array],
+        E::Subscript { expr, index, .. } => vec![expr, index],
+        E::FieldAccess { expr, .. } => vec![expr],
     }
 }
 

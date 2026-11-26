@@ -2035,7 +2035,8 @@ struct AggrInfo {
     args: Vec<PlanExpr>,
     is_count_star: bool,
     distinct: bool,
-    /// `ARRAY_AGG` only: the ORDER BY keys (possibly none).
+    /// `ARRAY_AGG`: the ORDER BY keys (possibly none); percentiles: the
+    /// WITHIN GROUP key.
     order: Vec<(PlanExpr, bool, bool)>,
 }
 
@@ -2075,6 +2076,20 @@ impl AggrInfo {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             return aggregate::pack_array_agg_input(value, keys);
+        }
+        if self.name.eq_ignore_ascii_case("PERCENTILE_CONT")
+            || self.name.eq_ignore_ascii_case("PERCENTILE_DISC")
+        {
+            // `percentile_*(f, x)`: the fraction and the WITHIN GROUP key.
+            let (key, asc, _) = self.order.first().ok_or_else(|| {
+                ExecutionError::InvalidOperation(format!(
+                    "{} requires WITHIN GROUP (ORDER BY ...)",
+                    self.name
+                ))
+            })?;
+            let fraction = expression::evaluate(&self.args[0], batch, None)?;
+            let value = expression::evaluate(key, batch, None)?;
+            return aggregate::pack_percentile_input(fraction, value, *asc);
         }
         expression::evaluate(&self.args[0], batch, None)
     }
@@ -4457,10 +4472,17 @@ pub(crate) fn scalars_to_array(
     data_type: &ArrowDataType,
 ) -> Result<ArrayRef, ExecutionError> {
     // `ScalarValue` has no 8- or 16-bit integer: TINYINT and SMALLINT
-    // values travel as Int32 and narrow back to the declared type here.
+    // values travel as Int32 and narrow back to the declared type here. A
+    // value out of the type's range is an error, never a silent NULL.
     if matches!(data_type, ArrowDataType::Int8 | ArrowDataType::Int16) {
         let wide = scalars_to_array(values, &ArrowDataType::Int32)?;
-        return Ok(arrow::compute::cast(&wide, data_type)?);
+        let options = arrow::compute::CastOptions {
+            safe: false,
+            ..Default::default()
+        };
+        return Ok(arrow::compute::cast_with_options(
+            &wide, data_type, &options,
+        )?);
     }
     let first_type = values.iter().find(|v| !matches!(v, ScalarValue::Null));
     match first_type {
@@ -4707,6 +4729,20 @@ mod tests {
         assert_eq!(date_arr.value(0), 19000);
         assert!(date_arr.is_null(1));
         assert_eq!(date_arr.value(2), 19500);
+    }
+
+    /// INTEGER scalars narrow to a requested TINYINT/SMALLINT column (the
+    /// scalars carry small integers as INTEGER); out of range is an error.
+    #[test]
+    fn scalars_to_array_narrows_to_small_integers() {
+        let values = vec![ScalarValue::Int32(-7), ScalarValue::Null];
+        let arr = scalars_to_array(&values, &ArrowDataType::Int16).unwrap();
+        assert_eq!(arr.data_type(), &ArrowDataType::Int16);
+        assert_eq!(arr.as_primitive::<datatypes::Int16Type>().value(0), -7);
+        assert!(arr.is_null(1));
+        let arr = scalars_to_array(&values, &ArrowDataType::Int8).unwrap();
+        assert_eq!(arr.data_type(), &ArrowDataType::Int8);
+        assert!(scalars_to_array(&[ScalarValue::Int32(1 << 20)], &ArrowDataType::Int16).is_err());
     }
 
     /// exec-memory-accounting 4.5: a batch decoded from one IPC message body

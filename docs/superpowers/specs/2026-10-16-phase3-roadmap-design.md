@@ -356,6 +356,8 @@ postgresql-dialect reflection run over pgwire with no `pg_catalog`
 fallback, checked in the client smoke on the 1+2 cluster. The Metabase run
 (stage 2b-2, #277) remains.
 
+**Status (2026-11-24, with #277):** G6 stage 2b is done. Stage 2b-2: a fresh Metabase v0.64.8.3 syncs the 1+2 cluster over pgwire (8 tables, 61 columns, the same types as PostgreSQL 17) and answers the 25 query-builder questions, a native `{{variable}}` question and an x-ray with no `pg_catalog` fallback, checked by hand with `scripts/client-smoke/metabase/` (`docs/superpowers/specs/2026-11-21-g6-stage-2b2-metabase-design.md`). It works with pgJDBC's default settings: result columns honor the binary format pgJDBC asks for from a statement's 5th execution on. The remaining gaps are listed in `docs/guide/clients.md`. Left for the production-ready v0.2.x: the P1 SF30 validation (Tier 3) and the production checklist.
+
 **Order:** G1 first, because it makes the soak test and retry results
 unreliable. G4 and G5 before P6 ships, so the chart's rolling upgrade does
 not fail queries. G3 before v0.2.0 is announced.

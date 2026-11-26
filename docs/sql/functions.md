@@ -11,6 +11,7 @@ Unless stated otherwise, a function returns `NULL` when any argument is `NULL`. 
 | [Regular expression](#regular-expression-functions) | `REGEXP_LIKE`, `REGEXP_EXTRACT`, `REGEXP_REPLACE`, `REGEXP_COUNT` |
 | [Math](#math-functions) | `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `TRUNCATE`, `MOD`, `POWER`/`POW`, `SQRT`, `CBRT`, `EXP`, `LN`, `LOG2`, `LOG10`, `LOG`, `SIGN`, `PI`, `E`, `RANDOM`/`RAND`, `DEGREES`, `RADIANS`, `SIN`, `COS`, `TAN`, `ASIN`, `ACOS`, `ATAN`, `ATAN2`, `SINH`, `COSH`, `TANH`, `NAN`, `INFINITY`, `IS_NAN`, `IS_FINITE`, `IS_INFINITE` |
 | [Array and JSON](#array-and-json-functions) | `ARRAY_AGG`, `BOOL_AND`, `UNNEST`, `GENERATE_SUBSCRIPTS`, `JSON_BUILD_OBJECT` (plus `ARRAY[...]` and `= ANY` — see [Expressions](/sql/expressions)) |
+| [Ordered-set aggregates](#ordered-set-aggregates) | `PERCENTILE_CONT`, `PERCENTILE_DISC` (`WITHIN GROUP`) |
 | [Date and time](#date-and-time-functions) | `CURRENT_DATE`, `NOW`/`CURRENT_TIMESTAMP`/`LOCALTIMESTAMP`, `EXTRACT`, `YEAR`, `QUARTER`, `MONTH`, `WEEK`/`WEEK_OF_YEAR`, `DAY`/`DAY_OF_MONTH`, `DAY_OF_WEEK`/`DOW`, `DAY_OF_YEAR`/`DOY`, `YEAR_OF_WEEK`/`YOW`, `HOUR`, `MINUTE`, `SECOND`, `MILLISECOND`, `DATE_TRUNC`, `DATE_ADD`, `DATE_DIFF`, `LAST_DAY_OF_MONTH`, `DATE`, `FROM_UNIXTIME`, `TO_UNIXTIME`, `DATE_FORMAT`, `DATE_PARSE`, `FORMAT_DATETIME` |
 
 ## Conditional Functions
@@ -491,8 +492,9 @@ SELECT r, unnest(a), generate_subscripts(a, 1) FROM (SELECT 1 r, ARRAY[10, 20] a
 ```
 
 Rules and limits:
-- `array_agg` is the only aggregate that accepts `ORDER BY`. `FILTER` and
-  `WITHIN GROUP` are refused on every function. It runs in a single phase
+- `array_agg` is the only aggregate that accepts `ORDER BY`, and the
+  [percentiles](#ordered-set-aggregates) the only ones that accept
+  `WITHIN GROUP`. `FILTER` is refused on every function. `array_agg` runs in a single phase
   (no partial aggregation on workers), and fails at run time over `smallint`,
   `tinyint`, `bytea` and `decimal64` values.
 - `UNNEST` and `GENERATE_SUBSCRIPTS` are accepted only as whole `SELECT`
@@ -502,6 +504,37 @@ Rules and limits:
 - `JSON_BUILD_OBJECT` returns text, not a JSON type.
 - A `smallint` column compared with a literal is widened to a wider integer,
   so the comparison is not pushed into the connector.
+
+## Ordered-Set Aggregates
+
+| Function | Result |
+|---|---|
+| `PERCENTILE_CONT(f) WITHIN GROUP (ORDER BY x [ASC\|DESC])` | The value at fraction `f` of the ordered `x` values, interpolated linearly between the two nearest values. `DOUBLE`. `x` must be numeric. |
+| `PERCENTILE_DISC(f) WITHIN GROUP (ORDER BY x [ASC\|DESC])` | The first `x` value whose position in the ordered values reaches fraction `f`. The type of `x`, which may be any orderable type, such as a date. |
+
+```sql
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY o_totalprice) AS median FROM orders;
+SELECT o_orderstatus,
+       percentile_disc(0.9) WITHIN GROUP (ORDER BY o_totalprice)
+FROM orders GROUP BY o_orderstatus;
+```
+
+These are PostgreSQL's ordered-set aggregates, which Metabase's "Median" and
+"Percentile" use. Trino has `approx_percentile` instead; these are exact.
+
+- `NULL` values of `x` are skipped. A group with no non-`NULL` value gives
+  `NULL`.
+- `DESC` reverses the order, so `percentile_cont(0.25) … DESC` is the 75th
+  percentile.
+- `f` must be a numeric literal between 0 and 1. A parameter, an expression,
+  a `NULL` or an array of fractions is refused. `DISTINCT`, `FILTER` and
+  `OVER` are refused.
+- They run in a single phase (no partial aggregation on workers) and buffer
+  every value of a group, like `array_agg`, and like it they fail at run time
+  over `bytea` and `decimal64` values.
+- Known gap: the buffered values are not counted against the query memory
+  limit, so a large ungrouped percentile (all values on one node) can
+  exhaust memory instead of failing with a memory-limit error.
 
 ## Date and Time Functions
 
@@ -521,8 +554,9 @@ NOW() → TIMESTAMP
 The session's default catalog and schema (Trino's `X-Trino-Catalog` /
 `X-Trino-Schema`, or the server defaults). Written without parentheses, as in
 Trino; the planner replaces them with the value. A column of the same name
-takes precedence. Over pgwire, `current_schema()` and `current_user` are
-answered by the metadata layer.
+takes precedence. Over pgwire the planner also replaces `current_schema()`,
+`current_database()` (the session's catalog), and `current_user`,
+`session_user` and `current_role` (the connection's user).
 
 ```sql
 current_catalog → VARCHAR
@@ -692,6 +726,8 @@ accepted on any function name.
 | `PG_TABLE_IS_VISIBLE(oid)` | `true` |
 | `PG_IS_OTHER_TEMP_SCHEMA(oid)` | `false` |
 | `OBJ_DESCRIPTION(oid[, catalog])`, `COL_DESCRIPTION(oid, column)` | `NULL`, because Arneb stores no comments. |
+| `CURRENT_SCHEMAS(include_implicit)` | The session's search path as a `varchar` array, with `pg_catalog` first when the argument is true: `{pg_catalog,default}` and `{default}` for the default schema. |
+| `FORMAT(template, arg, ...)` | `template` with each `%s` replaced by the next argument's text (`NULL` gives an empty string), each `%I` by the argument quoted as an identifier when it needs quoting (`format('%I', 'Mixed Case')` is `"Mixed Case"`; a `NULL` is an error), each `%L` by the argument as a quoted literal (`NULL` gives `NULL`), and `%%` by `%`. Too few arguments is an error. Positions (`%1$s`) and widths (`%10s`) are refused. Arguments are converted with `CAST(... AS VARCHAR)`, so a boolean prints `true`, not PostgreSQL's `t`. |
 | `CURRENT_SETTING(name[, missing_ok])` | The value of a fixed set of static settings (the ones `SHOW` answers, such as `server_version` and `standard_conforming_strings`). An unknown name is an error, or `NULL` when `missing_ok` is true; `search_path` is per session, so use `SHOW search_path`. |
 | `PG_GET_INDEXDEF(oid[, column, pretty])` | `NULL`, because Arneb has no indexes. |
 | `TO_REGTYPE(name)` | The oid of a built-in type, by `typname` (`int4`) or SQL name (`integer`). `NULL` when there is none. |
@@ -721,4 +757,4 @@ such as `atttypid::regtype`, gives the type's name, as `FORMAT_TYPE` does.
 - **`TRY`** turns every evaluation error into `NULL`; Trino only catches a fixed set of error codes (in practice the same ones scalar evaluation raises).
 - **`GREATEST`/`LEAST` with `NaN`** use IEEE total order (`NaN` is the largest value).
 - **`FORMAT_DATETIME`** fraction widths other than 3, 6 or 9 `S` letters round up to the next of those widths.
-- Not yet available: `LEFT`/`RIGHT` (not Trino functions either), `TO_HEX`/`FROM_HEX` and other `VARBINARY` functions, `SPLIT` / `REGEXP_EXTRACT_ALL` and other array functions beyond those above, `AT TIME ZONE`, `INTERVAL` arithmetic beyond day units, other JSON functions and URL functions.
+- Not yet available: `LEFT`/`RIGHT` (not Trino functions either), `TO_HEX`/`FROM_HEX` and other `VARBINARY` functions, `SPLIT` / `REGEXP_EXTRACT_ALL` and other array functions beyond those above, `AT TIME ZONE`, an `INTERVAL` type (intervals work only in date and timestamp arithmetic, see [Expressions](/sql/expressions#dates-timestamps-and-intervals)), other JSON functions and URL functions.

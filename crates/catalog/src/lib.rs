@@ -363,6 +363,25 @@ pub struct CatalogManager {
     /// `regclass` casts can name, when this manager is that statement's
     /// per-statement view and does not hold the tables itself.
     regclass_relations: Option<Arc<Vec<(String, String)>>>,
+    /// The connection's user, as `current_user` reports it, when the client
+    /// protocol knows it (set by [`CatalogManager::with_session_user`]).
+    session_user: Option<Arc<str>>,
+    /// The privileges `has_*_privilege` report, when this manager is a
+    /// `pg_catalog` statement's per-statement view and cannot derive them
+    /// from its own tables (set by
+    /// [`CatalogManager::with_session_privileges`]).
+    session_privileges: Option<Arc<SessionPrivileges>>,
+}
+
+/// The privileges a session holds on the schemas and tables of its catalog
+/// (PostgreSQL's current database), as `has_schema_privilege` and
+/// `has_table_privilege` report them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionPrivileges {
+    /// The schemas the session may use (`USAGE`).
+    pub schemas: Vec<String>,
+    /// `(schema, table, privileges held)` for every table the session sees.
+    pub tables: Vec<(String, String, Vec<TablePrivilege>)>,
 }
 
 /// A session user and the access rules that apply to them.
@@ -382,6 +401,8 @@ impl CatalogManager {
             qualify_references: false,
             access: None,
             regclass_relations: None,
+            session_user: None,
+            session_privileges: None,
         }
     }
 
@@ -407,6 +428,8 @@ impl CatalogManager {
             qualify_references: true,
             access: self.access.clone(),
             regclass_relations: self.regclass_relations.clone(),
+            session_user: self.session_user.clone(),
+            session_privileges: self.session_privileges.clone(),
         }
     }
 
@@ -424,6 +447,8 @@ impl CatalogManager {
                 rules,
             })),
             regclass_relations: self.regclass_relations.clone(),
+            session_user: self.session_user.clone(),
+            session_privileges: self.session_privileges.clone(),
         }
     }
 
@@ -689,6 +714,8 @@ impl CatalogManager {
             qualify_references: self.qualify_references,
             access: self.access.clone(),
             regclass_relations: self.regclass_relations.clone(),
+            session_user: self.session_user.clone(),
+            session_privileges: self.session_privileges.clone(),
         }
     }
 
@@ -702,6 +729,83 @@ impl CatalogManager {
     /// The relations set by [`CatalogManager::with_regclass_relations`].
     pub fn regclass_relations(&self) -> Option<&[(String, String)]> {
         self.regclass_relations.as_deref().map(Vec::as_slice)
+    }
+
+    /// Returns a view of this manager, sharing its catalogs and keeping
+    /// everything else, whose session user (what `current_user` reports and
+    /// `has_*_privilege` checks against) is `user`.
+    pub fn with_session_user(&self, user: impl Into<Arc<str>>) -> Self {
+        Self {
+            catalogs: Arc::clone(&self.catalogs),
+            default_catalog: self.default_catalog.clone(),
+            default_schema: self.default_schema.clone(),
+            qualify_references: self.qualify_references,
+            access: self.access.clone(),
+            regclass_relations: self.regclass_relations.clone(),
+            session_user: Some(user.into()),
+            session_privileges: self.session_privileges.clone(),
+        }
+    }
+
+    /// The connection's user: the one set by
+    /// [`CatalogManager::with_session_user`], else the user of the access
+    /// view. `None` when neither is known.
+    pub fn session_user(&self) -> Option<&str> {
+        self.session_user
+            .as_deref()
+            .or_else(|| self.access.as_ref().map(|a| a.user.as_str()))
+    }
+
+    /// Sets the privileges [`CatalogManager::session_privileges`] reports,
+    /// for a manager that holds only a statement's `pg_catalog` tables.
+    pub fn with_session_privileges(mut self, privileges: SessionPrivileges) -> Self {
+        self.session_privileges = Some(Arc::new(privileges));
+        self
+    }
+
+    /// The privileges the session holds in its default catalog: the ones
+    /// set by [`CatalogManager::with_session_privileges`], else derived from
+    /// this manager. Every visible schema is usable; a visible table carries
+    /// each of `SELECT`, `INSERT`, `UPDATE` and `DELETE` that the access
+    /// rules grant (all of them without rules).
+    pub async fn session_privileges(&self) -> SessionPrivileges {
+        if let Some(p) = &self.session_privileges {
+            return SessionPrivileges::clone(p);
+        }
+        let catalog = self.default_catalog.clone();
+        let mut privileges = SessionPrivileges::default();
+        for schema in self.visible_schema_names(&catalog).await {
+            for table in self.visible_table_names(&catalog, &schema).await {
+                let held = self.table_privileges_held(&catalog, &schema, &table);
+                privileges.tables.push((schema.clone(), table, held));
+            }
+            privileges.schemas.push(schema);
+        }
+        privileges
+    }
+
+    /// Which of `SELECT`, `INSERT`, `UPDATE` and `DELETE` the session user
+    /// holds on `catalog.schema.table` (all of them without access rules).
+    pub fn table_privileges_held(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Vec<TablePrivilege> {
+        let reference = TableReference {
+            catalog: Some(catalog.to_string()),
+            schema: Some(schema.to_string()),
+            table: table.to_string(),
+        };
+        [
+            TablePrivilege::Select,
+            TablePrivilege::Insert,
+            TablePrivilege::Update,
+            TablePrivilege::Delete,
+        ]
+        .into_iter()
+        .filter(|p| self.check_table_privilege(&reference, *p, "").is_ok())
+        .collect()
     }
 
     /// Returns the default catalog name.
@@ -1791,6 +1895,54 @@ mod tests {
         }
         assert!(!alice.visible_schema_exists("pg", "PUBLIC").await.unwrap());
         assert!(fold_read(&root, "PUBLIC", "SECRET").await.is_ok());
+    }
+
+    /// `session_privileges` lists every visible table with the privileges
+    /// the rules grant; without rules every table holds all four. A set
+    /// snapshot wins over the derived one.
+    #[tokio::test]
+    async fn session_privileges_follow_the_access_rules() {
+        let catalog = MemoryCatalog::new();
+        let public = MemorySchema::new();
+        for name in ["orders", "secret"] {
+            public.register_table(name, Arc::new(MemoryTable::new(vec![])));
+        }
+        catalog.register_schema("public", Arc::new(public));
+        let root = CatalogManager::new("pg", "public");
+        root.register_catalog("pg", Arc::new(catalog));
+        use TablePrivilege::*;
+        let all = vec![Select, Insert, Update, Delete];
+        let mut open = root.session_privileges().await;
+        open.tables.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(open.schemas, ["public"]);
+        assert_eq!(
+            open.tables,
+            [
+                ("public".into(), "orders".into(), all.clone()),
+                ("public".into(), "secret".into(), all.clone()),
+            ]
+        );
+        let rules = r#"{"tables": [
+            {"user": "alice", "table": "secret", "privileges": []},
+            {"user": "alice", "privileges": ["SELECT", "INSERT"]}
+        ]}"#;
+        let alice = root.with_access("alice", Arc::new(AccessRules::from_json(rules).unwrap()));
+        assert_eq!(alice.session_user(), Some("alice"));
+        assert_eq!(
+            alice.session_privileges().await.tables,
+            [("public".into(), "orders".into(), vec![Select, Insert])]
+        );
+        let snapshot = SessionPrivileges {
+            schemas: vec!["s".into()],
+            tables: vec![],
+        };
+        let pinned = root
+            .pinned()
+            .with_session_user("bob")
+            .with_session_privileges(snapshot.clone());
+        assert_eq!(pinned.session_user(), Some("bob"));
+        assert_eq!(pinned.session_privileges().await, snapshot);
+        assert_eq!(root.session_user(), None);
     }
 
     /// An unreachable source is an error, not a missing schema: reads

@@ -13,3 +13,5 @@ serde.workspace = true
 # years) is non-trivial to do by hand and chrono is already in the
 # dependency graph via arrow.
 chrono = { version = "0.4", default-features = false }
+# Validates constant patterns of the `~` regex operators at parse time.
+regex = "1"

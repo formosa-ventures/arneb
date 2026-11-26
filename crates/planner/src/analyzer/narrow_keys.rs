@@ -677,6 +677,11 @@ fn collect_inner_join_equivalence_expr_classes(
             collect_inner_join_equivalence_expr_classes(expr, classes);
             collect_inner_join_equivalence_expr_classes(array, classes);
         }
+        PlanExpr::ArrayElement(pair) => {
+            collect_inner_join_equivalence_expr_classes(&pair.0, classes);
+            collect_inner_join_equivalence_expr_classes(&pair.1, classes);
+        }
+        PlanExpr::GetField(pair) => collect_inner_join_equivalence_expr_classes(&pair.0, classes),
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -751,6 +756,13 @@ fn collect_expr_join_key_blocks(
         PlanExpr::ArrayContains { expr, array, .. } => {
             collect_expr_join_key_blocks(expr, stats, root_outputs, blocked);
             collect_expr_join_key_blocks(array, stats, root_outputs, blocked);
+        }
+        PlanExpr::ArrayElement(pair) => {
+            collect_expr_join_key_blocks(&pair.0, stats, root_outputs, blocked);
+            collect_expr_join_key_blocks(&pair.1, stats, root_outputs, blocked);
+        }
+        PlanExpr::GetField(pair) => {
+            collect_expr_join_key_blocks(&pair.0, stats, root_outputs, blocked)
         }
         PlanExpr::CaseExpr {
             operand,
@@ -985,6 +997,11 @@ fn collect_expr_sources(expr: &PlanExpr, input: &LogicalPlan, sources: &mut Vec<
             collect_expr_sources(expr, input, sources);
             collect_expr_sources(array, input, sources);
         }
+        PlanExpr::ArrayElement(pair) => {
+            collect_expr_sources(&pair.0, input, sources);
+            collect_expr_sources(&pair.1, input, sources);
+        }
+        PlanExpr::GetField(pair) => collect_expr_sources(&pair.0, input, sources),
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -1065,6 +1082,13 @@ fn collect_joined_expr_sources(
         PlanExpr::ArrayContains { expr, array, .. } => {
             collect_joined_expr_sources(expr, left_input, right_input, sources);
             collect_joined_expr_sources(array, left_input, right_input, sources);
+        }
+        PlanExpr::ArrayElement(pair) => {
+            collect_joined_expr_sources(&pair.0, left_input, right_input, sources);
+            collect_joined_expr_sources(&pair.1, left_input, right_input, sources);
+        }
+        PlanExpr::GetField(pair) => {
+            collect_joined_expr_sources(&pair.0, left_input, right_input, sources)
         }
         PlanExpr::CaseExpr {
             operand,
@@ -1440,6 +1464,12 @@ fn rewrite_expr(
         } => crate::map_array_contains(expr, array, negated, span, |e| {
             rewrite_expr(e, stats, root_outputs, blocked)
         }),
+        PlanExpr::ArrayElement(pair) => {
+            crate::map_array_element(pair, |e| rewrite_expr(e, stats, root_outputs, blocked))
+        }
+        PlanExpr::GetField(pair) => {
+            crate::map_get_field(pair, |e| rewrite_expr(e, stats, root_outputs, blocked))
+        }
         PlanExpr::Array {
             elements,
             element_type,
@@ -2524,6 +2554,11 @@ mod tests {
                 assert_expr_schema_lengths_consistent(expr);
                 assert_expr_schema_lengths_consistent(array);
             }
+            PlanExpr::ArrayElement(pair) => {
+                assert_expr_schema_lengths_consistent(&pair.0);
+                assert_expr_schema_lengths_consistent(&pair.1);
+            }
+            PlanExpr::GetField(pair) => assert_expr_schema_lengths_consistent(&pair.0),
             PlanExpr::CaseExpr {
                 operand,
                 when_clauses,
@@ -2643,6 +2678,11 @@ mod tests {
                 assert_expr_subquery_key_types_match(expr);
                 assert_expr_subquery_key_types_match(array);
             }
+            PlanExpr::ArrayElement(pair) => {
+                assert_expr_subquery_key_types_match(&pair.0);
+                assert_expr_subquery_key_types_match(&pair.1);
+            }
+            PlanExpr::GetField(pair) => assert_expr_subquery_key_types_match(&pair.0),
             PlanExpr::CaseExpr {
                 operand,
                 when_clauses,

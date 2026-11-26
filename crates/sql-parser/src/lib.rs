@@ -1653,6 +1653,29 @@ mod tests {
 
     // -- Trino function-syntax lowering (trino-functions-batch1) --
 
+    #[test]
+    fn parse_subscripts_and_field_access() {
+        let Expr::Subscript { expr, index, .. } = first_projection("SELECT (ARRAY[1, 2])[1]")
+        else {
+            panic!("expected Subscript");
+        };
+        assert!(matches!(*expr, Expr::Nested { .. }));
+        assert_eq!(index.to_string(), "1");
+        // `(k.e).x`: a field of a qualified column.
+        let Expr::FieldAccess { expr, field, .. } = first_projection("SELECT (k.e).x FROM k")
+        else {
+            panic!("expected FieldAccess");
+        };
+        assert_eq!(field, "x");
+        assert_eq!(expr.to_string(), "(k.e)");
+        // A chain applies left to right.
+        let e = first_projection("SELECT (f(a)).x[2] FROM t");
+        assert_eq!(e.to_string(), "(f(a)).x[2]");
+        assert!(matches!(e, Expr::Subscript { .. }));
+        let err = parse("SELECT (ARRAY[1, 2])[1:2]").unwrap_err();
+        assert!(err.to_string().contains("slice"), "{err}");
+    }
+
     fn first_projection(sql: &str) -> Expr {
         let stmt = parse(sql).unwrap();
         let Statement::Query { query, .. } = stmt else {
@@ -1751,11 +1774,55 @@ mod tests {
 
     #[test]
     fn function_within_group_is_refused() {
-        match parse("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM t") {
-            Err(ParseError::UnsupportedFeature(msg)) => {
-                assert!(msg.contains("WITHIN GROUP"), "{msg}")
+        for sql in [
+            "SELECT sum(x) WITHIN GROUP (ORDER BY x) FROM t",
+            "SELECT array_agg(x) WITHIN GROUP (ORDER BY x) FROM t",
+        ] {
+            match parse(sql) {
+                Err(ParseError::UnsupportedFeature(msg)) => {
+                    assert!(msg.contains("WITHIN GROUP"), "{msg}")
+                }
+                other => panic!("expected UnsupportedFeature, got {other:?}"),
             }
-            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn percentile_within_group_becomes_fraction_key_and_order_by() {
+        let Expr::Function {
+            name,
+            args,
+            order_by,
+            distinct,
+            ..
+        } = first_projection("SELECT percentile_disc(0.25) WITHIN GROUP (ORDER BY x DESC) FROM t")
+        else {
+            panic!("expected function");
+        };
+        assert_eq!(name, "percentile_disc");
+        assert!(!distinct);
+        assert_eq!(args.len(), 2);
+        assert!(matches!(
+            &args[0],
+            FunctionArg::Unnamed(Expr::Literal { .. })
+        ));
+        assert!(
+            matches!(&args[1], FunctionArg::Unnamed(Expr::Column { col_ref, .. }) if col_ref.name == "x")
+        );
+        assert_eq!(order_by.len(), 1);
+        assert_eq!(order_by[0].asc, Some(false));
+    }
+
+    #[test]
+    fn percentile_needs_one_key_and_no_window() {
+        for sql in [
+            "SELECT percentile_cont(0.5) FROM t",
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x, y) FROM t",
+            "SELECT percentile_cont(0.5, 0.6) WITHIN GROUP (ORDER BY x) FROM t",
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) OVER () FROM t",
+            "SELECT percentile_cont(0.5) FILTER (WHERE x > 1) WITHIN GROUP (ORDER BY x) FROM t",
+        ] {
+            assert!(parse(sql).is_err(), "{sql}");
         }
     }
 
@@ -1828,5 +1895,124 @@ mod tests {
     #[test]
     fn dollar_placeholders_reject_sql_that_does_not_tokenize() {
         assert!(dollar_placeholders("SELECT 'unterminated $1").is_err());
+    }
+
+    // -- Regex operators --
+
+    fn regexp_like_args(e: &Expr) -> &[FunctionArg] {
+        match e {
+            Expr::Function { name, args, .. } if name == "regexp_like" => args,
+            other => panic!("expected regexp_like, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn regex_operators_lower_to_regexp_like() {
+        // `~` -> regexp_like(a, p)
+        let e = first_projection("SELECT a ~ 'x' FROM t");
+        let args = regexp_like_args(&e);
+        assert_eq!(args.len(), 2);
+        assert!(matches!(
+            &args[1],
+            FunctionArg::Unnamed(Expr::Literal { value: ScalarValue::Utf8(s), .. }) if s == "x"
+        ));
+
+        // `~*` with a literal folds the (?i) prefix into the literal.
+        let e = first_projection("SELECT a ~* 'x' FROM t");
+        assert!(matches!(
+            &regexp_like_args(&e)[1],
+            FunctionArg::Unnamed(Expr::Literal { value: ScalarValue::Utf8(s), .. }) if s == "(?i)x"
+        ));
+
+        // `!~` -> NOT regexp_like(..)
+        let e = first_projection("SELECT a !~ 'x' FROM t");
+        let Expr::UnaryOp { op, expr, .. } = &e else {
+            panic!("expected NOT, got {e:?}");
+        };
+        assert_eq!(*op, UnaryOp::Not);
+        regexp_like_args(expr);
+
+        // `!~*` with a non-literal pattern uses CONCAT('(?i)', p).
+        let e = first_projection("SELECT a !~* b FROM t");
+        let Expr::UnaryOp { expr, .. } = &e else {
+            panic!("expected NOT, got {e:?}");
+        };
+        let args = regexp_like_args(expr);
+        match &args[1] {
+            FunctionArg::Unnamed(Expr::Function { name, args, .. }) => {
+                assert_eq!(name, "CONCAT");
+                assert!(matches!(
+                    &args[0],
+                    FunctionArg::Unnamed(Expr::Literal { value: ScalarValue::Utf8(s), .. }) if s == "(?i)"
+                ));
+            }
+            other => panic!("expected CONCAT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn regex_operator_rejects_invalid_constant_pattern() {
+        let err = parse("SELECT a ~ '(' FROM t").unwrap_err().to_string();
+        assert!(err.contains("invalid regular expression in ~"), "{err}");
+    }
+
+    #[test]
+    fn interval_string_forms() {
+        for (sql, value, unit) in [
+            ("SELECT INTERVAL '1 day'", 1, IntervalUnit::Day),
+            ("SELECT INTERVAL '-30 year'", -30, IntervalUnit::Year),
+            ("SELECT INTERVAL '2 months'", 2, IntervalUnit::Month),
+            ("SELECT INTERVAL '-1 months'", -1, IntervalUnit::Month),
+            ("SELECT INTERVAL '3 quarters'", 3, IntervalUnit::Quarter),
+            ("SELECT INTERVAL '1 week'", 1, IntervalUnit::Week),
+            ("SELECT INTERVAL '2 hours'", 2, IntervalUnit::Hour),
+            ("SELECT INTERVAL '5 minute'", 5, IntervalUnit::Minute),
+            ("SELECT INTERVAL '7 seconds'", 7, IntervalUnit::Second),
+            ("SELECT INTERVAL '1' DAY", 1, IntervalUnit::Day),
+            ("SELECT INTERVAL '3' MONTH", 3, IntervalUnit::Month),
+            ("SELECT INTERVAL '-2' HOUR", -2, IntervalUnit::Hour),
+        ] {
+            match first_projection(sql) {
+                Expr::Interval {
+                    value: v, unit: u, ..
+                } => assert_eq!((v, u), (value, unit), "{sql}"),
+                other => panic!("{sql}: expected Interval, got {other:?}"),
+            }
+        }
+        for sql in [
+            "SELECT INTERVAL '1 day 2 hours'",
+            "SELECT INTERVAL '1 fortnight'",
+            "SELECT INTERVAL 'x day'",
+        ] {
+            match parse(sql) {
+                Err(ParseError::UnsupportedFeature(msg)) => {
+                    assert!(msg.contains("interval"), "{sql}: {msg}")
+                }
+                other => panic!("{sql}: expected UnsupportedFeature, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn date_literal_interval_string_still_folds() {
+        // 2000-02-29 is day 11016: month ends clamp.
+        for (sql, days) in [
+            ("SELECT DATE '2000-01-31' + INTERVAL '1 month'", 11016),
+            ("SELECT DATE '2000-01-31' + INTERVAL '1' MONTH", 11016),
+            ("SELECT DATE '2000-03-31' - INTERVAL '1 month'", 11016),
+            ("SELECT DATE '2000-03-31' + INTERVAL '-1 months'", 11016),
+            ("SELECT DATE '2000-03-01' - INTERVAL '1 day'", 11016),
+            ("SELECT DATE '2000-03-07' - INTERVAL '1 week'", 11016),
+            ("SELECT DATE '1999-11-30' + INTERVAL '1 quarter'", 11016),
+            ("SELECT INTERVAL '1 year' + DATE '1999-02-28'", 11016 - 1),
+        ] {
+            match first_projection(sql) {
+                Expr::Literal {
+                    value: ScalarValue::Date32(d),
+                    ..
+                } => assert_eq!(d, days, "{sql}"),
+                other => panic!("{sql}: expected Date32 literal, got {other:?}"),
+            }
+        }
     }
 }

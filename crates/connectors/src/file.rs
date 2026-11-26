@@ -570,7 +570,7 @@ impl ConnectorFactory for FileConnectorFactory {
 /// opening the footer once per split costs more than it saves.
 const MIN_ROWS_PER_SPLIT: u64 = 100_000;
 
-/// How many row-range partitions a registered Parquet file is read as:
+/// How many partitions (splits) a registered Parquet file is read as:
 /// `target` (the planning node's scan parallelism), capped so no split
 /// covers fewer than [`MIN_ROWS_PER_SPLIT`] rows. A file without a known row
 /// count stays a single partition. The result depends only on the file and
@@ -584,8 +584,9 @@ fn parquet_file_splits(row_count: Option<u64>, target: usize) -> usize {
 
 /// A Parquet data source with pre-resolved schema (avoids async in create_data_source).
 ///
-/// A large file is read as `splits` contiguous row ranges, one per
-/// partition, so a scan of a single file (and the join or aggregate fused
+/// A large file is read as `splits` partitions, each a contiguous run of
+/// whole row groups (or of rows when the file has fewer row groups than
+/// splits; see `parquet_scan::split_row_groups`), so a scan of a single file (and the join or aggregate fused
 /// above it) runs on several cores, as Hive and Iceberg scans do.
 struct PreResolvedParquetDataSource {
     store: Arc<dyn ObjectStore>,
@@ -627,12 +628,14 @@ impl DataSource for PreResolvedParquetDataSource {
         // The shared scan Hive and Iceberg use: row-group pruning and
         // `RowFilter` pushdown of the scan's filters and dynamic filter
         // domains, projection, the scan batch size, and this split's row
-        // range. Pruning keeps every split's range over the same rows, so
-        // the splits still cover the file exactly once.
+        // row groups or row range. Pruning keeps every split's range over
+        // the same rows, so the splits still cover the file exactly once.
         let builder = crate::parquet_scan::open_parquet_builder(&self.store, &self.path).await?;
-        let buffer_bytes = crate::parquet_scan::row_group_buffer_bytes(
+        let buffer_bytes = crate::parquet_scan::split_buffer_bytes(
             builder.metadata(),
             ctx.projection.as_deref(),
+            partition,
+            self.splits,
         ) + crate::parquet_pushdown::row_filter_set_bytes(&ctx.filters);
         let stream = crate::parquet_scan::build_split_stream(
             builder,

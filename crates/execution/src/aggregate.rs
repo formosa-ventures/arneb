@@ -1599,12 +1599,18 @@ fn unpack_percentile(
     Ok((shape, packed))
 }
 
-/// Appends row `row`'s value of `packed` to `out` unless it is NULL.
+/// Approximate bytes one buffered percentile value holds.
+fn percentile_value_bytes(value: &ScalarValue) -> usize {
+    std::mem::size_of::<ScalarValue>() + crate::group_key::scalar_heap_bytes(value)
+}
+
+/// Appends row `row`'s value of `packed` to `out` unless it is NULL, and
+/// returns the bytes it added (see [`percentile_value_bytes`]).
 fn push_percentile_value(
     out: &mut Vec<ScalarValue>,
     packed: &arrow::array::StructArray,
     row: usize,
-) -> Result<(), ExecutionError> {
+) -> Result<usize, ExecutionError> {
     let col = packed.column(0);
     if col.is_valid(row) {
         // `ScalarValue` has no TINYINT/SMALLINT: keep them as INTEGER (a
@@ -1618,9 +1624,11 @@ fn push_percentile_value(
             )),
             _ => crate::operator::extract_scalar(col, row)?,
         };
+        let bytes = percentile_value_bytes(&value);
         out.push(value);
+        return Ok(bytes);
     }
-    Ok(())
+    Ok(0)
 }
 
 fn scalar_to_f64(v: &ScalarValue) -> Result<f64, ExecutionError> {
@@ -1683,6 +1691,8 @@ pub(crate) struct PercentileAccumulator {
     continuous: bool,
     shape: Option<PercentileShape>,
     values: Vec<ScalarValue>,
+    /// Approximate heap bytes `values` holds, for memory accounting.
+    bytes: usize,
 }
 
 impl PercentileAccumulator {
@@ -1691,6 +1701,7 @@ impl PercentileAccumulator {
             continuous,
             shape: None,
             values: Vec::new(),
+            bytes: 0,
         }
     }
 }
@@ -1706,7 +1717,7 @@ impl Accumulator for PercentileAccumulator {
             self.shape = shape;
         }
         for row in 0..packed.len() {
-            push_percentile_value(&mut self.values, packed, row)?;
+            self.bytes += push_percentile_value(&mut self.values, packed, row)?;
         }
         Ok(())
     }
@@ -1724,6 +1735,7 @@ impl Accumulator for PercentileAccumulator {
             self.shape = other.shape.clone();
         }
         self.values.extend(other.values.iter().cloned());
+        self.bytes += other.bytes;
         Ok(())
     }
 
@@ -1733,6 +1745,11 @@ impl Accumulator for PercentileAccumulator {
 
     fn reset(&mut self) {
         self.values.clear();
+        self.bytes = 0;
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.bytes
     }
 }
 
@@ -1742,6 +1759,8 @@ pub(crate) struct GroupedPercentileAccumulator {
     continuous: bool,
     shape: Option<PercentileShape>,
     groups: Vec<Vec<ScalarValue>>,
+    /// Sum of the groups' buffered bytes, so `heap_bytes` stays O(1).
+    bytes: usize,
 }
 
 impl GroupedPercentileAccumulator {
@@ -1750,6 +1769,7 @@ impl GroupedPercentileAccumulator {
             continuous,
             shape: None,
             groups: Vec::new(),
+            bytes: 0,
         }
     }
 }
@@ -1767,7 +1787,7 @@ impl GroupedAccumulator for GroupedPercentileAccumulator {
             self.shape = shape;
         }
         for (row, &g) in group_ids.iter().enumerate() {
-            push_percentile_value(&mut self.groups[g as usize], packed, row)?;
+            self.bytes += push_percentile_value(&mut self.groups[g as usize], packed, row)?;
         }
         Ok(())
     }
@@ -1806,7 +1826,12 @@ impl GroupedAccumulator for GroupedPercentileAccumulator {
             }
             self.groups[dest].extend(values.iter().cloned());
         }
+        self.bytes += other.bytes;
         Ok(())
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.bytes
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -2851,6 +2876,48 @@ mod tests {
     }
     use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
     use std::sync::Arc;
+
+    #[test]
+    fn percentiles_report_the_values_they_buffer() {
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["x".repeat(100); 50]));
+        let fraction: ArrayRef = Arc::new(Float64Array::from(vec![0.5; 50]));
+        let packed = pack_percentile_input(fraction, values, true).unwrap();
+        let mut single = PercentileAccumulator::new(false);
+        assert_eq!(Accumulator::heap_bytes(&single), 0);
+        single.update_batch(&packed).unwrap();
+        assert!(Accumulator::heap_bytes(&single) >= 50 * 100);
+        let mut other = PercentileAccumulator::new(false);
+        other.update_batch(&packed).unwrap();
+        let one = Accumulator::heap_bytes(&single);
+        single.merge(&other).unwrap();
+        assert_eq!(Accumulator::heap_bytes(&single), 2 * one);
+        single.reset();
+        assert_eq!(Accumulator::heap_bytes(&single), 0);
+
+        let mut grouped = GroupedPercentileAccumulator::new(true);
+        grouped.ensure_capacity(2);
+        let ids: Vec<u32> = (0..50).map(|i| i % 2).collect();
+        grouped.add_input(&ids, &packed).unwrap();
+        let after_input = GroupedAccumulator::heap_bytes(&grouped);
+        assert_eq!(after_input, one);
+        let mut merged = GroupedPercentileAccumulator::new(true);
+        merged.ensure_capacity(1);
+        merged.merge_from(&grouped, &[0, 0]).unwrap();
+        assert_eq!(GroupedAccumulator::heap_bytes(&merged), after_input);
+    }
+
+    #[test]
+    fn percentile_nulls_add_no_bytes() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(1), None]));
+        let fraction: ArrayRef = Arc::new(Float64Array::from(vec![0.5; 3]));
+        let packed = pack_percentile_input(fraction, values, true).unwrap();
+        let mut single = PercentileAccumulator::new(true);
+        single.update_batch(&packed).unwrap();
+        assert_eq!(
+            Accumulator::heap_bytes(&single),
+            std::mem::size_of::<ScalarValue>()
+        );
+    }
 
     #[test]
     fn count_non_null() {

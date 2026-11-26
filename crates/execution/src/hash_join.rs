@@ -2267,7 +2267,9 @@ impl HashJoinExec {
         // Each join partition builds from one slice of the keys, so none of
         // them has the whole domain to publish cross-fragment (#192). Every
         // partition of the task reports under the same index and only the
-        // first report counts, so partition 0 publishes for all of them.
+        // first report counts, so partition 0 publishes `All` for all of
+        // them. This is the only cross-fragment publish on the per-partition
+        // path: its build paths below never publish a slice.
         if partition == 0 {
             self.publish_all_cross_fragment_dfs();
         }
@@ -2366,12 +2368,6 @@ impl HashJoinExec {
                     Some(compute::concat_batches(&rs, batches.iter())?)
                 };
 
-                // A1.7 (2026-05-27): non-Grace per-partition build
-                // path. Publish cross-fragment DFs here before probe
-                // runs so probe-side scans on the downstream stage
-                // can apply the filter.
-                self.emit_cross_fragment_dfs(right_combined.as_ref());
-
                 let left_combined = if left_batches.is_empty() {
                     None
                 } else if left_batches.len() == 1 {
@@ -2439,11 +2435,6 @@ impl HashJoinExec {
                 right_batches.iter(),
             )?)
         };
-
-        // A1.7 (2026-05-27): non-Grace per-partition no-spill build
-        // path (residual / LEFT joins). Publish before probe so the
-        // downstream consumer scan can apply the filter.
-        self.emit_cross_fragment_dfs(right_combined.as_ref());
 
         let left_stream = self.left.execute(partition).await?;
         let left_batches = collect_stream(left_stream).await.map_err(|e| {
@@ -3432,10 +3423,10 @@ impl HashJoinExec {
 
     /// A1.7 (2026-05-27): publish a cross-fragment Domain to the
     /// coordinator for each declared `DynamicFilterProducer` from
-    /// the build side of this partition. Called from every build
-    /// path (build_state_inner, execute_per_partition's `Single`
-    /// arm, execute_per_partition_no_spill, execute_single_finish,
-    /// execute_single_no_spill). Gated on the feature flag +
+    /// the build side of this partition. Called from the shared-build
+    /// paths (build_state_inner, execute_single_finish,
+    /// execute_single_no_spill); the copartitioned per-partition path
+    /// publishes `All` instead. Gated on the feature flag +
     /// publisher presence + left_filterable + `ARNEB_DISABLE_DF`
     /// kill-switch.
     ///
@@ -3445,20 +3436,29 @@ impl HashJoinExec {
     /// time out on an empty-result query).
     /// True when `emit_cross_fragment_dfs` will publish this join's filters.
     fn publishes_cross_fragment_dfs(&self) -> bool {
-        self.dynamic_filtering_enabled
-            && !self.is_hash_copartitioned()
-            && matches!(self.join_type, ast::JoinType::Inner | ast::JoinType::Right)
-            && std::env::var_os("ARNEB_DISABLE_DF").is_none()
-            && !self.dynamic_filter_producers.is_empty()
+        matches!(self.join_type, ast::JoinType::Inner | ast::JoinType::Right)
             && broadcast_df_enabled()
-            && self.dynamic_filter_publisher.is_some()
+            && self.df_publisher().is_some()
+    }
+
+    /// The cross-fragment publisher, when this join has filters to publish:
+    /// dynamic filtering is on, `ARNEB_DISABLE_DF` is unset, the plan gave
+    /// it producers and the task wired a publisher.
+    fn df_publisher(&self) -> Option<&crate::DynamicFilterPublisherRef> {
+        if !self.dynamic_filtering_enabled
+            || self.dynamic_filter_producers.is_empty()
+            || std::env::var_os("ARNEB_DISABLE_DF").is_some()
+        {
+            return None;
+        }
+        self.dynamic_filter_publisher.as_ref()
     }
 
     fn emit_cross_fragment_dfs(&self, right_combined: Option<&RecordBatch>) {
         if !self.publishes_cross_fragment_dfs() {
             return;
         }
-        let Some(publisher) = &self.dynamic_filter_publisher else {
+        let Some(publisher) = self.df_publisher() else {
             return;
         };
         let domains: Vec<(arneb_common::DynamicFilterId, arneb_common::Domain)> =
@@ -3933,15 +3933,7 @@ impl HashJoinExec {
     /// fragment InList path uses. Each producer's `build_index` is
     /// looked up in `right_keys` to find the matching collector slot.
     fn publish_grace_cross_fragment_dfs(&self, domains_per_slot: &[arneb_common::Domain]) {
-        let df_disabled = std::env::var_os("ARNEB_DISABLE_DF").is_some();
-        if !self.dynamic_filtering_enabled
-            || self.is_hash_copartitioned()
-            || df_disabled
-            || self.dynamic_filter_producers.is_empty()
-        {
-            return;
-        }
-        let Some(publisher) = &self.dynamic_filter_publisher else {
+        let Some(publisher) = self.df_publisher() else {
             return;
         };
         let mut domains: Vec<(arneb_common::DynamicFilterId, arneb_common::Domain)> =
@@ -3985,16 +3977,9 @@ impl HashJoinExec {
     /// partition index. The coordinator resolves a filter once each task has
     /// reported, so a partial slice would become the whole filter and the
     /// probe-side scans would drop rows. The per-partition path publishes
-    /// this instead, and the slice-publishing paths skip copartitioned joins.
+    /// this instead, and never reaches the slice-publishing helpers.
     fn publish_all_cross_fragment_dfs(&self) {
-        let df_disabled = std::env::var_os("ARNEB_DISABLE_DF").is_some();
-        if !self.dynamic_filtering_enabled
-            || df_disabled
-            || self.dynamic_filter_producers.is_empty()
-        {
-            return;
-        }
-        let Some(publisher) = &self.dynamic_filter_publisher else {
+        let Some(publisher) = self.df_publisher() else {
             return;
         };
         let publisher = publisher.clone();
@@ -4011,15 +3996,10 @@ impl HashJoinExec {
         probe_partition: u32,
         right_combined: &RecordBatch,
     ) {
-        let df_disabled = std::env::var_os("ARNEB_DISABLE_DF").is_some();
-        if !self.dynamic_filtering_enabled
-            || df_disabled
-            || self.dynamic_filter_producers.is_empty()
-            || !broadcast_df_enabled()
-        {
+        if !broadcast_df_enabled() {
             return;
         }
-        let Some(publisher) = &self.dynamic_filter_publisher else {
+        let Some(publisher) = self.df_publisher() else {
             return;
         };
         let task_idx = publisher.task_partition_idx();
@@ -4166,17 +4146,15 @@ impl HashJoinExec {
         // contract).
         let left_filterable = matches!(self.join_type, ast::JoinType::Inner | ast::JoinType::Right);
         let df_disabled = std::env::var_os("ARNEB_DISABLE_DF").is_some();
-        if left_filterable && !df_disabled && !df_collectors.is_empty() {
-            match probe_df {
-                ProbeDfInjection::Inject => {
-                    self.inject_grace_dynamic_filters(df_collectors, true);
-                }
-                // A copartitioned build publishes nothing cross-fragment:
-                // `publish_grace_cross_fragment_dfs` returns early for it.
-                ProbeDfInjection::Skip => {}
+        // A copartitioned build (`Skip`) holds one slice of the keys: it
+        // injects nothing into the shared probe subtree and publishes nothing
+        // cross-fragment (`execute_per_partition` already published `All`).
+        if left_filterable && !df_disabled && matches!(probe_df, ProbeDfInjection::Inject) {
+            if df_collectors.is_empty() {
+                self.publish_grace_cross_fragment_dfs(&[]);
+            } else {
+                self.inject_grace_dynamic_filters(df_collectors, true);
             }
-        } else if left_filterable && !df_disabled {
-            self.publish_grace_cross_fragment_dfs(&[]);
         }
 
         match build_result {

@@ -167,8 +167,9 @@ impl Accumulator for CountAccumulator {
         if self.count_star {
             self.count += values.len() as i64;
         } else {
-            // Count non-null values.
-            self.count += (values.len() - values.null_count()) as i64;
+            // Count non-null values. Logical nulls, so a `NullArray`
+            // (`count(NULL)`), which has no validity buffer, counts none.
+            self.count += (values.len() - values.logical_null_count()) as i64;
         }
         Ok(())
     }
@@ -1883,16 +1884,20 @@ impl GroupedAccumulator for GroupedCountAccumulator {
                 self.counts[g as usize] += 1;
             }
         } else {
-            // Skip nulls. Optimised: when the column has no nulls at
-            // all, fall through to the count_star branch.
-            if values.null_count() == 0 {
-                for &g in group_ids {
-                    self.counts[g as usize] += 1;
-                }
-            } else {
-                for (i, &g) in group_ids.iter().enumerate() {
-                    if !values.is_null(i) {
+            // Skip nulls. Logical nulls, so a `NullArray` (`count(NULL)`),
+            // which has no validity buffer, counts none. With no nulls at
+            // all, count every row as the count_star branch does.
+            match values.logical_nulls() {
+                None => {
+                    for &g in group_ids {
                         self.counts[g as usize] += 1;
+                    }
+                }
+                Some(nulls) => {
+                    for (i, &g) in group_ids.iter().enumerate() {
+                        if nulls.is_valid(i) {
+                            self.counts[g as usize] += 1;
+                        }
                     }
                 }
             }
@@ -2702,8 +2707,11 @@ impl Accumulator for DistinctAccumulator {
 
     fn update_batch(&mut self, values: &ArrayRef) -> Result<(), ExecutionError> {
         let mut new_indices: Vec<u32> = Vec::new();
+        // Logical nulls: a `NullArray` (`count(DISTINCT NULL)`) has no
+        // validity buffer, so `is_null` would report none of its rows.
+        let nulls = values.logical_nulls();
         for i in 0..values.len() {
-            if values.is_null(i) {
+            if nulls.as_ref().is_some_and(|n| n.is_null(i)) {
                 continue;
             }
             let scalar = scalar_from_array(values, i)?;
@@ -2844,6 +2852,22 @@ pub(crate) fn scalar_from_array(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `count(NULL)` counts no rows. Arrow's `NullArray` has no validity
+    /// buffer, so its nulls are only visible as logical nulls.
+    #[test]
+    fn count_of_a_null_array_is_zero() {
+        let values: ArrayRef = Arc::new(arrow::array::NullArray::new(3));
+        let mut single = CountAccumulator::new();
+        single.update_batch(&values).unwrap();
+        assert_eq!(single.evaluate().unwrap(), ScalarValue::Int64(0));
+
+        let mut grouped = GroupedCountAccumulator::new();
+        grouped.ensure_capacity(2);
+        grouped.add_input(&[0, 1, 1], &values).unwrap();
+        assert_eq!(grouped.evaluate(0).unwrap(), ScalarValue::Int64(0));
+        assert_eq!(grouped.evaluate(1).unwrap(), ScalarValue::Int64(0));
+    }
 
     /// `array_agg` keeps every input value, so it reports them for memory
     /// accounting, in both its single-group and grouped forms.

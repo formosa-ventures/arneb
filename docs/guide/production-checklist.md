@@ -228,6 +228,7 @@ before relying on the cluster.
   - Groups admitted before memory ran short stay in memory while the rest spill. If their state keeps growing (`MIN`/`MAX` over long strings, `ARRAY_AGG`, percentiles), the query can still run out of memory (#316).
   - A spilling aggregate's 64 spill writers hold about 37 MB of buffers outside the pool (#317). That is small next to a multi-GiB pool, but it adds up when many queries spill at once.
 - **No task-level retry (#248).** A query that loses a task fails, or reruns from the start under `retry_policy = "query"`.
+- **PostgreSQL aggregate pushdown has no switch.** A supported aggregate over one PostgreSQL table runs in PostgreSQL, with its `work_mem` and CPU (see [Aggregate pushdown](/connectors/postgresql#aggregate-pushdown)). A `GROUP BY` on a high-cardinality column moves the whole aggregation into that database, and no catalog option turns this off. Before attaching a production database, check that it can take those queries, or point the catalog at a replica.
 - **Broadcast joins on one core (#283).** A broadcast hash join uses about one core of a multi-core worker, where a hash-partitioned plan uses several.
 - **Large-scale validation.** TPC-H is cell-identical to Trino at SF10 and SF30, but the memory validation at SF30 is still open, and q18 at SF30 can still run out of memory.
 - **Results are materialized for Trino clients.** A Trino-protocol query's result is collected in full before the first page is served, so very large results cost coordinator memory.

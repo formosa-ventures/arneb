@@ -11,7 +11,9 @@ use arneb_common::types::{ColumnInfo, DataType};
 
 use crate::analyzer::assign_dynamic_filter_ids::{assign_for_join, tag_probe_side_consumer};
 use crate::dynamic_filter::DynamicFilterIdAllocator;
-use crate::plan::{DynamicFilterProducer, JoinCondition, LogicalPlan, PlanExpr};
+use crate::plan::{
+    simple_column_projection_indices, DynamicFilterProducer, JoinCondition, LogicalPlan, PlanExpr,
+};
 use arneb_sql_parser::ast::BinaryOp;
 
 // A.4 (2026-05-20): the property-derivation visitor lives in
@@ -164,16 +166,6 @@ fn starts_with_whole_input_operator(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Sort { input, .. } => starts_with_whole_input_operator(input),
         _ => false,
     }
-}
-
-fn simple_column_projection_indices(exprs: &[PlanExpr]) -> Option<Vec<usize>> {
-    exprs
-        .iter()
-        .map(|expr| match expr {
-            PlanExpr::Column { index, .. } => Some(*index),
-            _ => None,
-        })
-        .collect()
 }
 
 fn remap_fragment_partitioning_for_projection(
@@ -4195,7 +4187,7 @@ fn is_decomposable_for_split(aggr_exprs: &[PlanExpr]) -> bool {
 /// at `partial_idx`. SUM / MIN / MAX keep their name (idempotent over
 /// the same operation); COUNT becomes SUM (the partial counted rows;
 /// the final sums the per-partition counts).
-fn build_final_aggr_expr(
+pub fn build_final_aggr_expr(
     original: &PlanExpr,
     partial_idx: usize,
     partial_schema: &[ColumnInfo],

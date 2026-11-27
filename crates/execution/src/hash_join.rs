@@ -1869,14 +1869,16 @@ impl ExecutionPlan for HashJoinExec {
         let parallel = matches!(self.join_type, ast::JoinType::Inner | ast::JoinType::Left);
         let n_left = self.left.output_partitioning().partition_count();
 
-        if std::env::var_os("ARNEB_TRACE_DFPUB").is_some() {
+        if tracing::enabled!(target: arneb_common::DYNAMIC_FILTER_LOG_TARGET, tracing::Level::DEBUG)
+        {
             let prod_ids: Vec<u32> = self
                 .dynamic_filter_producers
                 .iter()
                 .map(|p| p.id.0)
                 .collect();
-            eprintln!(
-                "[DFEXEC] part={partition} jt={:?} n_left={n_left} parallel={parallel} copart={} df_enabled={} producers={:?}",
+            tracing::debug!(
+                target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
+                "join execute part={partition} jt={:?} n_left={n_left} parallel={parallel} copart={} df_enabled={} producers={:?}",
                 self.join_type,
                 self.is_hash_copartitioned(),
                 self.dynamic_filtering_enabled,
@@ -1939,14 +1941,16 @@ impl ExecutionPlan for HashJoinExec {
         // Q09 to OOM. For Single/Multipass we still collect left like
         // before (no streaming probe in the non-Grace path yet).
         let build = self.ensure_built().await?;
-        if std::env::var_os("ARNEB_TRACE_DFPUB").is_some() {
+        if tracing::enabled!(target: arneb_common::DYNAMIC_FILTER_LOG_TARGET, tracing::Level::DEBUG)
+        {
             let side = match &build.side {
                 BuildSide::Single { .. } => "Single",
                 BuildSide::Multipass { .. } => "Multipass",
                 BuildSide::Partitioned { .. } => "Partitioned",
             };
-            eprintln!(
-                "[DFPUB] part={partition} n_left={n_left} build_side={side} df_enabled={} producers={}",
+            tracing::debug!(
+                target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
+                "join build part={partition} n_left={n_left} build_side={side} df_enabled={} producers={}",
                 self.dynamic_filtering_enabled,
                 self.dynamic_filter_producers.len()
             );
@@ -3954,21 +3958,13 @@ impl HashJoinExec {
                 // coordinator rendezvous moving without risking false negatives.
                 None => arneb_common::Domain::All,
             };
-            if std::env::var_os("ARNEB_TRACE_DFPUB").is_some() {
-                let domain_variant = match &domain {
-                    arneb_common::Domain::DistinctValues(values) if values.is_empty() => {
-                        "DistinctValues(empty)"
-                    }
-                    arneb_common::Domain::DistinctValues(_) => "DistinctValues",
-                    arneb_common::Domain::Range { .. } => "Range",
-                    arneb_common::Domain::Bloom(_) => "Bloom",
-                    arneb_common::Domain::All => "All",
-                };
-                eprintln!(
-                    "[DFPUBDOM] grace df_id={:?} build_index={} domain={}",
-                    producer.id, producer.build_index, domain_variant
-                );
-            }
+            tracing::debug!(
+                target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
+                "grace publish df_id={:?} build_index={} domain={}",
+                producer.id,
+                producer.build_index,
+                domain.summary()
+            );
             domains.push((producer.id, domain));
         }
         if !domains.is_empty() {
@@ -4028,15 +4024,10 @@ impl HashJoinExec {
         };
         let task_idx = publisher.task_partition_idx();
         let published = probe_partition == 0;
-        if std::env::var_os("ARNEB_TRACE_DFPUB").is_some() {
-            eprintln!(
-                "[DFPUB] broadcast_publish_decision task_idx={} partition_idx={} probe_partition={} published={}",
-                task_idx,
-                task_idx,
-                probe_partition,
-                if published { "yes" } else { "no" }
-            );
-        }
+        tracing::debug!(
+            target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
+            "broadcast publish decision task_idx={task_idx} probe_partition={probe_partition} published={published}",
+        );
         if !published {
             return;
         }
@@ -4052,17 +4043,16 @@ impl HashJoinExec {
         for producer in &self.dynamic_filter_producers {
             let col = right_combined.column(producer.build_index).clone();
             let domain = crate::dynamic_filter_publisher::build_partition_domain_for_column(&col);
-            if std::env::var_os("ARNEB_TRACE_DFPUB").is_some() {
-                eprintln!(
-                    "[DFPUBDOM] df_id={:?} build_index={} right_cols={} build_rows={} col_len={} domain_empty={}",
-                    producer.id,
-                    producer.build_index,
-                    right_combined.num_columns(),
-                    right_combined.num_rows(),
-                    col.len(),
-                    matches!(&domain, arneb_common::Domain::DistinctValues(v) if v.is_empty())
-                );
-            }
+            tracing::debug!(
+                target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
+                "broadcast publish df_id={:?} build_index={} right_cols={} build_rows={} col_len={} domain={}",
+                producer.id,
+                producer.build_index,
+                right_combined.num_columns(),
+                right_combined.num_rows(),
+                col.len(),
+                domain.summary()
+            );
             let id = producer.id;
             publisher.publish_partition(id, task_idx, domain).await;
         }
@@ -6542,6 +6532,8 @@ mod tests {
     struct CapturingPartitionDynamicFilterPublisher {
         task_idx: u32,
         calls: Arc<Mutex<Vec<(DynamicFilterId, u32, Domain)>>>,
+        /// Signalled on every publish, so a test can wait for one.
+        published: Arc<tokio::sync::Notify>,
     }
 
     #[async_trait]
@@ -6564,6 +6556,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((df_id, partition_idx, domain));
+            self.published.notify_one();
         }
     }
 
@@ -7666,9 +7659,11 @@ mod tests {
         for grace in ["1", "0"] {
             std::env::set_var("ARNEB_GRACE_HJ", grace);
             let calls = Arc::new(Mutex::new(Vec::new()));
+            let published = Arc::new(tokio::sync::Notify::new());
             let publisher = Arc::new(CapturingPartitionDynamicFilterPublisher {
                 task_idx: 0,
                 calls: Arc::clone(&calls),
+                published: Arc::clone(&published),
             });
             let join = HashJoinExec {
                 left: Arc::new(crate::RepartitionExec::new(
@@ -7710,14 +7705,15 @@ mod tests {
             }
             assert_eq!(rows, 2, "ARNEB_GRACE_HJ={grace}: ids 2 and 3 match");
 
-            for _ in 0..50 {
-                if !calls.lock().unwrap().is_empty() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            // Wait for the publish (it may run on a spawned task), then let
+            // every other task this current-thread runtime has queued run,
+            // so a late partial publish would be recorded before the check.
+            tokio::time::timeout(std::time::Duration::from_secs(5), published.notified())
+                .await
+                .unwrap_or_else(|_| panic!("ARNEB_GRACE_HJ={grace}: nothing was published"));
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
             }
-            // Let any late slice publish land before checking.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let calls = calls.lock().unwrap();
             assert_eq!(
                 calls.len(),
@@ -7758,6 +7754,7 @@ mod tests {
             let publisher = Arc::new(CapturingPartitionDynamicFilterPublisher {
                 task_idx,
                 calls: Arc::clone(&calls),
+                published: Default::default(),
             });
             let join = broadcast_df_join(publisher);
 

@@ -13,15 +13,6 @@ use arneb_execution::DynamicFilterPublisher;
 use async_trait::async_trait;
 use std::fmt;
 
-fn dfrpc_domain_variant(domain: &Domain) -> String {
-    match domain {
-        Domain::DistinctValues(values) => format!("DistinctValues(len={})", values.len()),
-        Domain::Range { .. } => "Range".to_string(),
-        Domain::Bloom(_) => "Bloom".to_string(),
-        Domain::All => "All".to_string(),
-    }
-}
-
 /// Concrete publisher used by the worker's `TaskManager`. Each task
 /// gets its own instance because `task_id` is task-scoped.
 pub struct FlightDynamicFilterPublisher {
@@ -56,13 +47,13 @@ impl FlightDynamicFilterPublisher {
         domain: Domain,
     ) {
         tracing::debug!(
-            target: "arneb::dynamic_filter",
+            target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
             "worker publish query_id={} task_id={} partition_idx={} df_id={} domain={}",
             self.query_id,
             self.task_id,
             partition_idx,
             df_id,
-            dfrpc_domain_variant(&domain)
+            domain.summary()
         );
         let req = arneb_rpc::ReportDynamicFilterRequest {
             query_id: self.query_id,
@@ -73,20 +64,16 @@ impl FlightDynamicFilterPublisher {
         };
         match arneb_rpc::report_dynamic_filters(&self.coord_address, &req).await {
             Ok(()) => {
-                if std::env::var_os("ARNEB_TRACE_DFPUB").is_some() {
-                    eprintln!(
-                        "[DFPUB] flight_send df_id={} ok=true query_id={} task_id={} partition_idx={}",
-                        df_id, self.query_id, self.task_id, partition_idx
-                    );
-                }
+                tracing::debug!(
+                    target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
+                    "worker publish sent query_id={} task_id={} partition_idx={} df_id={}",
+                    self.query_id,
+                    self.task_id,
+                    partition_idx,
+                    df_id
+                );
             }
             Err(e) => {
-                if std::env::var_os("ARNEB_TRACE_DFPUB").is_some() {
-                    eprintln!(
-                        "[DFPUB] flight_send df_id={} ok=false query_id={} task_id={} partition_idx={} error={}",
-                        df_id, self.query_id, self.task_id, partition_idx, e
-                    );
-                }
                 tracing::warn!(
                     query_id = %self.query_id,
                     task_id = %self.task_id,

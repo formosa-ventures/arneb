@@ -99,11 +99,11 @@ subscripts, field access, untyped literals) and
 - **One-part intervals only.** `INTERVAL '1 day 2 hours'` and
   `INTERVAL '...' DAY TO SECOND` are refused; `INTERVAL '-30 year'` and
   `INTERVAL '3' MONTH` work.
-- **Medians and percentiles are not memory-accounted.** `percentile_cont`
-  and `percentile_disc` buffer every value of a group on one node, outside
-  the query memory pool, so a large ungrouped median (Metabase's "Median"
-  over a big table) can exhaust the node's memory instead of failing with
-  a memory-limit error.
+- **Medians and percentiles run on one node.** `percentile_cont` and
+  `percentile_disc` buffer every value of a group on one node. The buffered
+  values count against the query memory pool, so a median too large for it
+  (Metabase's "Median" over a big table) fails with a memory-limit error
+  (SQLSTATE 53200) rather than exhausting the node; they do not spill.
 - **Column names of unaliased expressions** are the expression's text
   (`upper(n_name)`, `1 + 1`), where PostgreSQL uses the function name or
   `?column?`. Metabase aliases every column it generates, so this only shows

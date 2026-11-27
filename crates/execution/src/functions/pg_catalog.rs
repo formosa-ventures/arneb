@@ -835,7 +835,8 @@ impl PrivilegeObject {
 /// `schema<US>table<US>letters` entries. Arneb has no column privileges, so
 /// a column privilege is the table's.
 ///
-/// Only the session user's privileges are known, so another `role` fails.
+/// Only the session user's privileges are known, so another `role` fails;
+/// with no session user, any named role fails.
 /// The object is a (possibly quoted, qualified) name or, for a table, an
 /// oid; one that does not exist fails as in PostgreSQL. `privileges` is a
 /// comma-separated list, true when any of them is held. NULL gives NULL.
@@ -908,7 +909,10 @@ impl ScalarFunction for HasPrivilegeFunction {
                 continue;
             }
             let role = roles.value(row);
-            if !session_user.is_empty() && role != session_user {
+            // With no known session user (no login), only the unnamed role
+            // the two-argument form passes is answered: another role's
+            // privileges would otherwise be reported as this session's.
+            if role != session_user {
                 return Err(invalid(format!(
                     "{}: only the session user's privileges are known, not role \"{role}\"",
                     kind.function()
@@ -1122,6 +1126,17 @@ mod tests {
     /// `__has_privilege` over `default.nation` (all four privileges) and
     /// `default.ro` (SELECT only), for session user `alice`.
     fn privilege(kind: &str, role: &str, object: ArrayRef, privileges: &str) -> ArrayRef {
+        privilege_as("alice", kind, role, object, privileges)
+    }
+
+    /// [`privilege`] for session user `session` (empty: no login).
+    fn privilege_as(
+        session: &str,
+        kind: &str,
+        role: &str,
+        object: ArrayRef,
+        privileges: &str,
+    ) -> ArrayRef {
         let n = object.len();
         let col = |v: &str| -> ArrayRef { Arc::new(StringArray::from(vec![v; n])) };
         let tables = format!(
@@ -1135,7 +1150,7 @@ mod tests {
             col(role),
             object,
             col(privileges),
-            col("alice"),
+            col(session),
             col("file"),
             col("default"),
             col(&schemas),
@@ -1203,6 +1218,19 @@ mod tests {
             bools(&privilege("any_column", "alice", objects(), "update")),
             [Some(true), Some(false), Some(false), None]
         );
+    }
+
+    #[test]
+    fn without_a_session_user_only_the_unnamed_role_is_answered() {
+        let nation = || names(&[Some("nation")]);
+        assert_eq!(
+            bools(&privilege_as("", "table", "", nation(), "select")),
+            [Some(true)]
+        );
+        for role in ["someone_else", "alice"] {
+            let e = err(&privilege_as("", "table", role, nation(), "select"));
+            assert!(e.contains(&format!("not role \"{role}\"")), "{role}: {e}");
+        }
     }
 
     #[test]

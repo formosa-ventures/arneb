@@ -10,6 +10,7 @@
 //!
 //! See `docs/connectors/postgresql.md`.
 
+mod aggregate;
 mod catalog;
 mod config;
 mod copy;

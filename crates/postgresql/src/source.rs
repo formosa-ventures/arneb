@@ -10,9 +10,10 @@ use arneb_common::memory_pool::{MemoryConsumer, MemoryReservation};
 use arneb_common::stream::{RecordBatchStream, SendableRecordBatchStream};
 use arneb_common::types::{ColumnInfo, TableReference};
 use arneb_connectors::ConnectorFactory;
-use arneb_execution::{column_info_to_arrow_schema, DataSource, ScanContext};
+use arneb_execution::{column_info_to_arrow_schema, AggregatePushdown, DataSource, ScanContext};
 use arneb_rdbms::{
-    build_select, translate_filters, RemoteTable, SplitPlan, TranslateOptions, Translation,
+    build_aggregate_select, build_select, translate_filters, RemoteTable, SplitPlan,
+    TranslateOptions, Translation,
 };
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -127,12 +128,7 @@ impl PostgresDataSource {
             ctx.limit,
             &PostgresDialect,
         )?;
-        Ok((
-            format!("COPY ({select}) TO STDOUT (FORMAT binary)"),
-            out_schema,
-            kinds,
-            translation,
-        ))
+        Ok((build_copy_sql(&select), out_schema, kinds, translation))
     }
 }
 
@@ -148,6 +144,41 @@ impl DataSource for PostgresDataSource {
 
     fn pushdown_stacked_filters(&self) -> bool {
         true
+    }
+
+    fn pushdown_aggregate(&self, request: &AggregatePushdown<'_>) -> Option<Arc<dyn DataSource>> {
+        let plan = crate::aggregate::plan_aggregate_pushdown(&self.remote, &self.schema, request)?;
+        let count = if request.partial {
+            self.partition_count()
+        } else {
+            1
+        };
+        let statements = (0..count)
+            .map(|partition| {
+                let range = if request.partial {
+                    self.split.range(partition)
+                } else {
+                    None
+                };
+                let select = build_aggregate_select(
+                    &self.remote,
+                    &plan.select,
+                    &plan.group_by,
+                    &plan.filters,
+                    range.as_ref(),
+                    &PostgresDialect,
+                );
+                build_copy_sql(&select)
+            })
+            .collect();
+        Some(Arc::new(PostgresAggregateSource {
+            state: self.state.clone(),
+            table: format!("{}.{}", self.remote.schema, self.remote.name),
+            schema: request.output_schema.to_vec(),
+            kinds: plan.kinds,
+            statements,
+            partial: request.partial,
+        }))
     }
 
     async fn scan(
@@ -181,22 +212,95 @@ impl DataSource for PostgresDataSource {
             sql = %copy_sql,
             "remote query"
         );
-        let schema = column_info_to_arrow_schema(&out_schema);
-        let batch_size = ctx.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
-        let scan = ScanState {
-            state: self.state.clone(),
-            context: format!("postgresql catalog '{}', table '{table}'", self.state.name),
+        Ok(build_copy_stream(
+            &self.state,
+            &table,
+            &out_schema,
+            kinds,
             copy_sql,
-            decoder: CopyDecoder::new(schema.clone(), kinds, batch_size.min(DEFAULT_BATCH_SIZE)),
-            batch_size,
-            copy: None,
-            conn: None,
-            reservation: MemoryConsumer::new("PostgresScan").register(ctx.memory_pool.clone()),
-            done: false,
-        };
-        let inner = futures::stream::try_unfold(scan, ScanState::next).boxed();
-        Ok(Box::pin(PostgresStream { schema, inner }))
+            ctx,
+        ))
     }
+}
+
+#[derive(Debug)]
+struct PostgresAggregateSource {
+    state: Arc<CatalogState>,
+    table: String,
+    schema: Vec<ColumnInfo>,
+    kinds: Vec<(String, Kind)>,
+    statements: Vec<String>,
+    partial: bool,
+}
+
+#[async_trait]
+impl DataSource for PostgresAggregateSource {
+    fn schema(&self) -> Vec<ColumnInfo> {
+        self.schema.clone()
+    }
+
+    fn partition_count(&self) -> usize {
+        self.statements.len()
+    }
+
+    async fn scan(
+        &self,
+        ctx: &ScanContext,
+        partition: usize,
+    ) -> Result<SendableRecordBatchStream, ExecutionError> {
+        let copy_sql = self.statements.get(partition).ok_or_else(|| {
+            ExecutionError::InvalidOperation(format!(
+                "postgresql aggregate partition {partition} out of range for '{}'",
+                self.table
+            ))
+        })?;
+        tracing::debug!(
+            target: "arneb::rdbms",
+            catalog = %self.state.name,
+            table = %self.table,
+            partition,
+            partial = self.partial,
+            sql = %copy_sql,
+            "remote aggregate"
+        );
+        Ok(build_copy_stream(
+            &self.state,
+            &self.table,
+            &self.schema,
+            self.kinds.clone(),
+            copy_sql.clone(),
+            ctx,
+        ))
+    }
+}
+
+fn build_copy_sql(select: &str) -> String {
+    format!("COPY ({select}) TO STDOUT (FORMAT binary)")
+}
+
+fn build_copy_stream(
+    state: &Arc<CatalogState>,
+    table: &str,
+    columns: &[ColumnInfo],
+    kinds: Vec<(String, Kind)>,
+    copy_sql: String,
+    ctx: &ScanContext,
+) -> SendableRecordBatchStream {
+    let schema = column_info_to_arrow_schema(columns);
+    let batch_size = ctx.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
+    let scan = ScanState {
+        state: state.clone(),
+        context: format!("postgresql catalog '{}', table '{table}'", state.name),
+        copy_sql,
+        decoder: CopyDecoder::new(schema.clone(), kinds, batch_size.min(DEFAULT_BATCH_SIZE)),
+        batch_size,
+        copy: None,
+        conn: None,
+        reservation: MemoryConsumer::new("PostgresScan").register(ctx.memory_pool.clone()),
+        done: false,
+    };
+    let inner = futures::stream::try_unfold(scan, ScanState::next).boxed();
+    Box::pin(PostgresStream { schema, inner })
 }
 
 /// A pooled connection that is returned to the pool only after its COPY

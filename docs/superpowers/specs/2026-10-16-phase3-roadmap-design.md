@@ -361,3 +361,11 @@ fallback, checked in the client smoke on the 1+2 cluster. The Metabase run
 **Order:** G1 first, because it makes the soak test and retry results
 unreliable. G4 and G5 before P6 ships, so the chart's rolling upgrade does
 not fail queries. G3 before v0.2.0 is announced.
+
+**Status (2026-11-27, production checklist):** the checklist is in
+`docs/guide/production-checklist.md`. It covers scenario 1's requirements
+and the agent interface. For each item it gives the setting, the default,
+and a check that the setting took effect. It also lists the open issues that
+limit a deployment: #139, #247 (which #258's growth most likely belongs to),
+#248 and #283. Left for the production-ready v0.2.x: the P1 SF30 validation
+(Tier 3), and walking the checklist on a real deployment.

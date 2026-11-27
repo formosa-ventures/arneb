@@ -226,67 +226,30 @@ impl DataSource for ParquetDataSource {
             crate::parquet_scan::ParquetObjectReader::new(self.store.clone(), meta.location)
                 .with_file_size(meta.size);
 
-        let mut builder =
-            parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
-                .await
-                .map_err(|e| {
-                    ExecutionError::InvalidOperation(format!("Parquet reader error: {e}"))
-                })?;
-
-        // Apply row group pruning based on filters.
-        if !ctx.filters.is_empty() {
-            let column_names: Vec<String> =
-                self.column_schema.iter().map(|c| c.name.clone()).collect();
-            let file_meta = builder.metadata().clone();
-            let selected = crate::parquet_pushdown::prune_row_groups(
-                file_meta.row_groups(),
-                &ctx.filters,
-                &column_names,
-            );
-            if selected.len() < file_meta.row_groups().len() {
-                let selection = parquet::arrow::arrow_reader::RowSelection::from(
-                    build_row_selection(file_meta.row_groups(), &selected),
-                );
-                builder = builder.with_row_selection(selection);
-            }
-        }
-
-        // Apply predicate pushdown for within-row-group filtering.
-        if !ctx.filters.is_empty() || !ctx.dynamic_filter_domains.is_empty() {
-            if let Some(row_filter) = crate::parquet_pushdown::build_row_filter_with_dynamic_domains(
-                &ctx.filters,
-                &ctx.dynamic_filter_domains,
-                builder.parquet_schema(),
-            ) {
-                builder = builder.with_row_filter(row_filter);
-            }
-        }
-
-        // Apply projection pushdown: only read requested columns.
-        if let Some(ref projection) = ctx.projection {
-            let mask = parquet::arrow::ProjectionMask::roots(
-                builder.parquet_schema(),
-                projection.iter().copied(),
-            );
-            builder = builder.with_projection(mask);
-        }
-
-        // Default 2048 (override Parquet's built-in 8192) to keep
-        // per-partition in-flight Arrow batches small. Matches the
-        // Hive connector; rationale lives there. Tunable via
-        // `ARNEB_SCAN_BATCH_SIZE` (see `scan_default_batch_size`).
-        let batch_size = ctx.batch_size.unwrap_or_else(scan_default_batch_size);
-        builder = builder.with_batch_size(batch_size);
+        let builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .map_err(|e| ExecutionError::InvalidOperation(format!("Parquet reader error: {e}")))?;
 
         let arrow_schema = builder.schema().clone();
         let buffer_bytes = crate::parquet_scan::row_group_buffer_bytes(
             builder.metadata(),
             ctx.projection.as_deref(),
-        );
+        ) + crate::parquet_pushdown::row_filter_set_bytes(&ctx.filters);
 
-        let stream = builder.build().map_err(|e| {
-            ExecutionError::InvalidOperation(format!("Parquet reader build error: {e}"))
-        })?;
+        // The shared split reader maps `ctx.filters` (table root columns) to
+        // the file's leaf columns before pruning and building the row
+        // filter, so a struct or map column ahead of a filtered column is
+        // safe here too. One split covers the whole file.
+        let stream = crate::parquet_scan::build_split_stream(
+            builder,
+            &self.path,
+            &ctx.filters,
+            &ctx.dynamic_filter_domains,
+            ctx.projection.as_deref(),
+            ctx.batch_size,
+            0,
+            1,
+        )?;
 
         // Phase 3b.7b (2026-05-21): true streaming. Previously this
         // collected every parquet batch into a `Vec<RecordBatch>`
@@ -302,28 +265,6 @@ impl DataSource for ParquetDataSource {
         );
         Ok(Box::pin(stream.with_scan_memory(ctx, buffer_bytes)))
     }
-}
-
-/// Build a RowSelector list from selected row group indices.
-///
-/// Each row group contributes either a "select" or "skip" entry based on
-/// whether its index is in the selected set.
-fn build_row_selection(
-    row_groups: &[parquet::file::metadata::RowGroupMetaData],
-    selected: &[usize],
-) -> Vec<parquet::arrow::arrow_reader::RowSelector> {
-    use parquet::arrow::arrow_reader::RowSelector;
-    let selected_set: std::collections::HashSet<usize> = selected.iter().copied().collect();
-    let mut selectors = Vec::new();
-    for (idx, rg) in row_groups.iter().enumerate() {
-        let num_rows = rg.num_rows() as usize;
-        if selected_set.contains(&idx) {
-            selectors.push(RowSelector::select(num_rows));
-        } else {
-            selectors.push(RowSelector::skip(num_rows));
-        }
-    }
-    selectors
 }
 
 // ---------------------------------------------------------------------------
@@ -624,55 +565,27 @@ impl DataSource for PreResolvedParquetDataSource {
                 self.path, self.splits
             )));
         }
-        let meta = self.store.head(&self.path).await.map_err(|e| {
-            ExecutionError::InvalidOperation(format!(
-                "failed to stat Parquet file '{}': {}",
-                self.path, e
-            ))
-        })?;
-
-        let reader =
-            crate::parquet_scan::ParquetObjectReader::new(self.store.clone(), meta.location)
-                .with_file_size(meta.size);
-
-        let mut builder =
-            parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
-                .await
-                .map_err(|e| {
-                    ExecutionError::InvalidOperation(format!("Parquet reader error: {e}"))
-                })?;
-
-        if self.splits > 1 {
-            let total_rows: usize = builder
-                .metadata()
-                .row_groups()
-                .iter()
-                .map(|rg| rg.num_rows().max(0) as usize)
-                .sum();
-            builder = builder.with_row_selection(crate::parquet_scan::compute_split_selection(
-                total_rows,
-                partition,
-                self.splits,
-            ));
-        }
-
-        if let Some(ref projection) = ctx.projection {
-            let mask = parquet::arrow::ProjectionMask::roots(
-                builder.parquet_schema(),
-                projection.iter().copied(),
-            );
-            builder = builder.with_projection(mask);
-        }
-
-        let arrow_schema = builder.schema().clone();
+        // The shared scan Hive and Iceberg use: row-group pruning and
+        // `RowFilter` pushdown of the scan's filters and dynamic filter
+        // domains, projection, the scan batch size, and this split's row
+        // range. Pruning keeps every split's range over the same rows, so
+        // the splits still cover the file exactly once.
+        let builder = crate::parquet_scan::open_parquet_builder(&self.store, &self.path).await?;
         let buffer_bytes = crate::parquet_scan::row_group_buffer_bytes(
             builder.metadata(),
             ctx.projection.as_deref(),
-        );
-
-        let stream = builder.build().map_err(|e| {
-            ExecutionError::InvalidOperation(format!("Parquet reader build error: {e}"))
-        })?;
+        ) + crate::parquet_pushdown::row_filter_set_bytes(&ctx.filters);
+        let stream = crate::parquet_scan::build_split_stream(
+            builder,
+            &self.path,
+            &ctx.filters,
+            &ctx.dynamic_filter_domains,
+            ctx.projection.as_deref(),
+            ctx.batch_size,
+            partition,
+            self.splits,
+        )?;
+        let arrow_schema = stream.schema().clone();
 
         // Phase 3b.7b (2026-05-21): true streaming. Same change as
         // ParquetDataSource::scan above.
@@ -1438,6 +1351,245 @@ mod tests {
             // 450_000 rows allow at most 4 splits of MIN_ROWS_PER_SPLIT rows.
             assert_eq!(ds.partition_count(), expected, "target {target}");
         }
+    }
+
+    async fn read_ids_with(
+        ds: &Arc<dyn DataSource>,
+        ctx: &ScanContext,
+        partition: usize,
+    ) -> Vec<i32> {
+        let stream = ds.scan(ctx, partition).await.unwrap();
+        let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
+        batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    fn id_cmp(op: arneb_sql_parser::ast::BinaryOp, value: i32) -> arneb_planner::PlanExpr {
+        use arneb_common::types::ScalarValue;
+        use arneb_planner::PlanExpr;
+        PlanExpr::BinaryOp {
+            left: Box::new(PlanExpr::Column {
+                index: 0,
+                name: "id".to_string(),
+                span: None,
+            }),
+            op,
+            right: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Int32(value),
+                span: None,
+            }),
+            span: None,
+        }
+    }
+
+    /// A registered Parquet table's scan applies its filters in the reader:
+    /// row groups outside them are skipped and the rest filtered row by
+    /// row, in every split, and the splits still cover the matches once.
+    #[tokio::test]
+    async fn a_registered_parquet_scan_pushes_its_filters_into_every_split() {
+        let factory = register_ids(450_000).await;
+        for splits in [1, 4] {
+            let ds = factory
+                .create_data_source(&TableReference::table("ids"), &[], &parallelism(splits))
+                .await
+                .unwrap();
+            assert_eq!(ds.partition_count(), splits);
+            // 120_000..=130_000 lies in row groups 2 (100k..150k) only.
+            let ctx = ScanContext::default().with_filters(vec![
+                id_cmp(arneb_sql_parser::ast::BinaryOp::GtEq, 120_000),
+                id_cmp(arneb_sql_parser::ast::BinaryOp::LtEq, 130_000),
+            ]);
+            let mut all = Vec::new();
+            for p in 0..splits {
+                all.extend(read_ids_with(&ds, &ctx, p).await);
+            }
+            all.sort_unstable();
+            assert_eq!(
+                all,
+                (120_000..=130_000).collect::<Vec<_>>(),
+                "{splits} splits"
+            );
+        }
+    }
+
+    /// Filters reach the Parquet pushdown by leaf column, not by table
+    /// column. With a struct (two leaves) ahead of `id`, table column 1 is
+    /// `id` but leaf 1 is `s.b`; a filter on `id` must still test `id`.
+    #[tokio::test]
+    async fn a_filter_after_a_struct_column_tests_its_own_column() {
+        use arrow::array::StructArray;
+        use arrow::datatypes::Fields;
+        use object_store::memory::InMemory;
+        use object_store::PutPayload;
+        use parquet::arrow::arrow_writer::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let rows = 100_000;
+        let ids: Vec<i32> = (0..rows).collect();
+        let struct_fields = Fields::from(vec![
+            Field::new("a", ArrowDataType::Int32, false),
+            Field::new("b", ArrowDataType::Int32, false),
+        ]);
+        // `s.b` never equals any `id`, so a filter on `id` misapplied to
+        // `s.b` would drop every row.
+        let s = StructArray::new(
+            struct_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids.clone())),
+                Arc::new(Int32Array::from(
+                    ids.iter().map(|i| i + 1_000_000).collect::<Vec<_>>(),
+                )),
+            ],
+            None,
+        );
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("s", ArrowDataType::Struct(struct_fields), false),
+            Field::new("id", ArrowDataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(s), Arc::new(Int32Array::from(ids))],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(25_000))
+            .build();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, arrow_schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &ObjectPath::from("data/nested.parquet"),
+                PutPayload::from_bytes(buf.into()),
+            )
+            .await
+            .unwrap();
+        let registry = Arc::new(StorageRegistry::new());
+        registry.register_store("s3://nested-bucket", store.clone());
+        let factory = FileConnectorFactory::new(registry);
+        factory
+            .register_table(
+                "nested",
+                "s3://nested-bucket/data/nested.parquet",
+                FileFormat::Parquet,
+                None,
+            )
+            .await
+            .unwrap();
+        let ds = factory
+            .create_data_source(&TableReference::table("nested"), &[], &parallelism(2))
+            .await
+            .unwrap();
+
+        use arneb_common::types::ScalarValue;
+        use arneb_planner::PlanExpr;
+        let id = || PlanExpr::Column {
+            index: 1,
+            name: "id".to_string(),
+            span: None,
+        };
+        let int = |v: i32| PlanExpr::Literal {
+            value: ScalarValue::Int32(v),
+            span: None,
+        };
+        let filters = vec![
+            PlanExpr::BinaryOp {
+                left: Box::new(id()),
+                op: arneb_sql_parser::ast::BinaryOp::GtEq,
+                right: Box::new(int(60_000)),
+                span: None,
+            },
+            PlanExpr::InList {
+                expr: Box::new(id()),
+                list: vec![int(5), int(60_005), int(70_000)],
+                negated: false,
+                span: None,
+            },
+        ];
+        let ctx = ScanContext::default().with_filters(filters);
+        let mut got = Vec::new();
+        for p in 0..ds.partition_count() {
+            let stream = ds.scan(&ctx, p).await.unwrap();
+            for b in arneb_common::stream::collect_stream(stream).await.unwrap() {
+                let col = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+                got.extend(col.values().iter().copied());
+            }
+        }
+        got.sort_unstable();
+        // The scan may return extra rows (FilterExec above it filters
+        // exactly); it must not lose the matching ones.
+        for want in [60_005, 70_000] {
+            assert!(got.contains(&want), "missing id {want}: {} rows", got.len());
+        }
+        assert!(
+            !got.contains(&5),
+            "row group pruning on `id` keeps id 5 out"
+        );
+
+        let collect_ids = |stream: SendableRecordBatchStream| async move {
+            let mut ids = Vec::new();
+            for b in arneb_common::stream::collect_stream(stream).await.unwrap() {
+                let col = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+                ids.extend(col.values().iter().copied());
+            }
+            ids
+        };
+
+        // A join's dynamic filter on `id` is mapped the same way.
+        let dynamic = ScanContext::default().with_dynamic_filter_domains(vec![
+            arneb_execution::DynamicFilterDomain {
+                column_index: 1,
+                column_name: "id".to_string(),
+                domain: arneb_common::Domain::DistinctValues(vec![
+                    ScalarValue::Int32(60_005),
+                    ScalarValue::Int32(70_000),
+                ]),
+            },
+        ]);
+        let mut got = Vec::new();
+        for p in 0..ds.partition_count() {
+            got.extend(collect_ids(ds.scan(&dynamic, p).await.unwrap()).await);
+        }
+        for want in [60_005, 70_000] {
+            assert!(got.contains(&want), "dynamic filter lost id {want}");
+        }
+
+        // So is a scan through the single-file `ParquetDataSource`.
+        let single = ParquetDataSource::new(store, ObjectPath::from("data/nested.parquet"))
+            .await
+            .unwrap();
+        let got = collect_ids(single.scan(&ctx, 0).await.unwrap()).await;
+        for want in [60_005, 70_000] {
+            assert!(got.contains(&want), "single-file scan lost id {want}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registered_parquet_scan_uses_the_scan_batch_size() {
+        let factory = register_ids(100_000).await;
+        let ds = factory
+            .create_data_source(&TableReference::table("ids"), &[], &parallelism(1))
+            .await
+            .unwrap();
+        let ctx = ScanContext {
+            batch_size: Some(1_000),
+            ..Default::default()
+        };
+        let stream = ds.scan(&ctx, 0).await.unwrap();
+        let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
+        assert!(batches.iter().all(|b| b.num_rows() <= 1_000));
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 100_000);
     }
 
     #[tokio::test]

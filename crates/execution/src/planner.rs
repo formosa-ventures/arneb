@@ -7,9 +7,11 @@ use std::time::Duration;
 
 use arneb_common::error::ExecutionError;
 use arneb_common::inflight_budget::InflightBudget;
-use arneb_planner::{estimated_cardinality, CatalogStats, LogicalPlan, PlanExpr};
+use arneb_planner::{
+    estimated_cardinality, simple_column_projection_indices, CatalogStats, LogicalPlan, PlanExpr,
+};
 
-use crate::datasource::DataSource;
+use crate::datasource::{AggregatePushdown, DataSource};
 use crate::dynamic_filter_collector::DynamicFilterCollector;
 use crate::dynamic_filter_publisher::DynamicFilterPublisherRef;
 use crate::functions::{default_registry, FunctionRegistry};
@@ -17,7 +19,8 @@ use crate::hash_join::{extract_equi_join_keys, is_hash_join_key_type, HashJoinEx
 use crate::memory_pool::{MemoryPool, UnboundedMemoryPool};
 use crate::operator::{
     AggregateOutputColumn, ExecutionPlan, ExplainExec, FilterExec, HashAggregateExec, LimitExec,
-    NestedLoopJoinExec, ProjectionExec, RollupAggregateExec, ScanExec, SortExec, TopKExec,
+    NestedLoopJoinExec, ProjectionExec, RemoteAggregateExec, RollupAggregateExec, ScanExec,
+    SortExec, TopKExec,
 };
 use crate::scan_context::ScanContext;
 
@@ -520,14 +523,7 @@ impl ExecutionContext {
             schema,
         } = node
         {
-            let level: Option<Vec<usize>> = exprs
-                .iter()
-                .map(|e| match e {
-                    PlanExpr::Column { index, .. } => Some(*index),
-                    _ => None,
-                })
-                .collect();
-            let Some(level) = level else {
+            let Some(level) = simple_column_projection_indices(exprs) else {
                 return Ok(None);
             };
             projection = Some(match projection {
@@ -1034,15 +1030,7 @@ impl ExecutionContext {
                     ..
                 } = input.as_ref()
                 {
-                    let column_indices: Option<Vec<usize>> = exprs
-                        .iter()
-                        .map(|e| match e {
-                            arneb_planner::PlanExpr::Column { index, .. } => Some(*index),
-                            _ => None,
-                        })
-                        .collect();
-
-                    if let Some(indices) = column_indices {
+                    if let Some(indices) = simple_column_projection_indices(exprs) {
                         let key = table.to_string();
                         let source = self
                             .data_sources
@@ -1316,6 +1304,11 @@ impl ExecutionContext {
                 aggr_exprs,
                 schema,
             } => {
+                if let Some(remote) =
+                    self.try_pushdown_aggregate(input, group_by, aggr_exprs, schema, false)
+                {
+                    return Ok(remote);
+                }
                 let estimated_groups = self.estimated_groups_for(logical);
                 // Step CP (2026-05-16): combined column-projection
                 // and predicate pushdown for `Aggregate over
@@ -1488,6 +1481,13 @@ impl ExecutionContext {
                 aggr_exprs,
                 schema,
             } => {
+                if matches!(logical, LogicalPlan::PartialAggregate { .. }) {
+                    if let Some(remote) =
+                        self.try_pushdown_aggregate(input, group_by, aggr_exprs, schema, true)
+                    {
+                        return Ok(remote);
+                    }
+                }
                 let estimated_groups = self.estimated_groups_for(logical);
                 // Same multi-partition handling as `Aggregate` above.
                 let input_plan = self.convert(input)?;
@@ -1713,17 +1713,113 @@ impl ExecutionContext {
         }
     }
 
-    /// Step CP column-pruning fast path. Returns `Some(physical_plan)`
-    /// iff the shape is `Aggregate over [Filter over] TableScan` AND
-    /// the union of columns referenced by group_by / aggr_exprs /
-    /// predicate is a strict subset of the table's full schema.
-    ///
-    /// Effect: ScanContext gets a `projection` listing only the used
-    /// indices, and (when present) the rewritten predicate is also
-    /// pushed via `filters` for Parquet row-group / row-level
-    /// pruning. The remaining group_by / aggr_exprs / FilterExec
-    /// predicate are rewritten with the old→new column-index
-    /// mapping. The Aggregate output schema is unchanged.
+    /// Replace an aggregate over a scan when the source can apply both the
+    /// aggregate and every pre-aggregate predicate exactly.
+    fn try_pushdown_aggregate(
+        &self,
+        mut input: &LogicalPlan,
+        group_by: &[PlanExpr],
+        aggregates: &[PlanExpr],
+        schema: &[arneb_common::types::ColumnInfo],
+        partial: bool,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        let (mut group_by, mut aggregates, mut filters) =
+            (group_by.to_vec(), aggregates.to_vec(), Vec::new());
+        let table = loop {
+            match input {
+                LogicalPlan::Filter {
+                    input: child,
+                    predicate,
+                } => {
+                    filters.push(predicate.clone());
+                    input = child;
+                }
+                LogicalPlan::Projection {
+                    input: child,
+                    exprs,
+                    ..
+                } => {
+                    let columns = simple_column_projection_indices(exprs)?
+                        .into_iter()
+                        .enumerate()
+                        .collect();
+                    for expr in group_by
+                        .iter_mut()
+                        .chain(&mut aggregates)
+                        .chain(&mut filters)
+                    {
+                        *expr = rewrite_column_indices(expr, &columns);
+                    }
+                    input = child;
+                }
+                LogicalPlan::TableScan {
+                    table,
+                    dynamic_filters_consumed,
+                    ..
+                } if dynamic_filters_consumed.is_empty() => break table,
+                _ => return None,
+            }
+        };
+        if !partial && self.scan_task_count > 1 {
+            return None;
+        }
+        let key = table.to_string();
+        let source = self
+            .data_sources
+            .get(&key)
+            .or_else(|| self.data_sources.get(&table.table))?;
+        let source = source.pushdown_aggregate(&AggregatePushdown {
+            group_by: &group_by,
+            aggregates: &aggregates,
+            filters: &filters,
+            output_schema: schema,
+            partial,
+        })?;
+        let scan: Arc<dyn ExecutionPlan> = Arc::new(RemoteAggregateExec {
+            scan: self.build_scan_exec(source, key, ScanContext::default(), Vec::new()),
+            partial,
+        });
+        match scan.output_partitioning().partition_count() {
+            0 => None,
+            1 => Some(scan),
+            _ => {
+                // A worker can own several source splits. Preserve the
+                // PartialAggregate contract by merging their states first.
+                let group_count = group_by.len();
+                let group_by = schema[..group_count]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| PlanExpr::Column {
+                        index,
+                        name: column.name.clone(),
+                        span: None,
+                    })
+                    .collect();
+                let aggr_exprs = aggregates
+                    .iter()
+                    .enumerate()
+                    .map(|(i, expr)| {
+                        arneb_planner::fragment::build_final_aggr_expr(
+                            expr,
+                            group_count + i,
+                            schema,
+                        )
+                    })
+                    .collect();
+                Some(Arc::new(HashAggregateExec {
+                    input: scan,
+                    group_by,
+                    aggr_exprs,
+                    output_schema: schema.to_vec(),
+                    output_order: None,
+                    estimated_groups: None,
+                    memory_pool: self.memory_pool.clone(),
+                }))
+            }
+        }
+    }
+
+    /// Prune scan columns for an aggregate over an optional filter and table scan.
     fn try_aggregate_with_scan_pruning(
         &self,
         input: &LogicalPlan,

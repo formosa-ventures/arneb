@@ -47,7 +47,9 @@ pub use aggregate::{
     MaxAccumulator, MinAccumulator, SumAccumulator,
 };
 pub use coalesce::CoalescePartitionsExec;
-pub use datasource::{column_info_to_arrow_schema, DataSource, InMemoryDataSource};
+pub use datasource::{
+    column_info_to_arrow_schema, AggregatePushdown, DataSource, InMemoryDataSource,
+};
 pub use dynamic_filter_collector::DynamicFilterCollector;
 pub use dynamic_filter_publisher::{
     build_partition_domain_for_column, DynamicFilterPublisher, DynamicFilterPublisherRef,

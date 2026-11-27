@@ -247,7 +247,7 @@ services:
       - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
       - pg-data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "arneb", "-d", "arneb"]
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "arneb", "-d", "arneb"]
       interval: 5s
       timeout: 5s
       retries: 12

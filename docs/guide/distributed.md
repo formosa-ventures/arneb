@@ -312,6 +312,14 @@ limits stays on the coordinator, where it adds no extra hop. Set
 `ARNEB_INCLUDE_COORDINATOR=true`) to run that work on the coordinator
 instead.
 
+Moving that work costs one more transfer: the worker stage's whole result
+goes from the worker to the coordinator before it reaches the client. That
+is small when the top of the plan aggregates or limits, but grows with the
+result. A query that sorts tens of thousands of rows and returns them all
+(TPC-H q11 at SF30 returns about 27,000) was 10–15% slower in testing. The
+whole stage also runs on one worker, on top of that worker's share of the
+other stages.
+
 ## Multi-Node Example
 
 Start a coordinator and two workers on a single machine:

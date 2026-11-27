@@ -90,6 +90,7 @@ pub mod coordinator;
 mod drain;
 pub mod dynamic_filter;
 mod fragment_pruning;
+mod liveness;
 pub mod memory_probe;
 pub mod memory_profile;
 mod oauth;
@@ -219,13 +220,56 @@ fn main() -> Result<()> {
     #[cfg(not(target_env = "msvc"))]
     configure_jemalloc_decay();
 
-    tokio::runtime::Builder::new_multi_thread()
+    // Flight is served on its own small runtime (#244), so query operators
+    // that hold every execution thread cannot delay heartbeats, probes or
+    // cancels. Built before the execution runtime so neither starts work
+    // while the other is half built.
+    let control = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(CONTROL_RUNTIME_THREADS)
+        .thread_name("arneb-control")
+        .enable_all()
+        .build()?;
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run())
+        .block_on(run(control.handle().clone()));
+    control.shutdown_background();
+    result
 }
 
-async fn run() -> Result<()> {
+/// Threads of the control runtime that serves Flight. Requests there are
+/// small and their heavy work runs on the execution runtime, so two keep
+/// one free while the other moves a large `do_get` frame.
+const CONTROL_RUNTIME_THREADS: usize = 2;
+
+/// Serve Flight on the `control` runtime, with the work behind requests
+/// on the calling (execution) runtime. Dropping the returned future stops
+/// the server, as it did when Flight ran inline.
+async fn serve_flight_on_control(
+    control: &tokio::runtime::Handle,
+    addr: String,
+    mut state: arneb_rpc::FlightState,
+) -> Result<(), String> {
+    struct AbortOnDrop(tokio::task::AbortHandle);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    state.set_execution_runtime(tokio::runtime::Handle::current());
+    let task = control.spawn(async move {
+        arneb_rpc::start_flight_server(&addr, state)
+            .await
+            .map_err(|e| e.to_string())
+    });
+    let _stop = AbortOnDrop(task.abort_handle());
+    match task.await {
+        Ok(result) => result,
+        Err(e) => Err(format!("flight server task ended: {e}")),
+    }
+}
+
+async fn run(control: tokio::runtime::Handle) -> Result<()> {
     // 1. Parse CLI args
     let args = CliArgs::parse();
     if let Some(Command::HashPassword { iterations }) = args.command {
@@ -308,6 +352,13 @@ async fn run() -> Result<()> {
             .query_retry(|k| std::env::var(k).ok())
             .context("invalid [cluster] retry_policy")?,
         _ => None,
+    };
+    let include_coordinator = match role {
+        ServerRole::Coordinator => config
+            .cluster
+            .include_coordinator(|k| std::env::var(k).ok())
+            .context("invalid [cluster] include_coordinator")?,
+        _ => false,
     };
     // Client-facing TLS ([tls] / ARNEB_TLS_*): one certificate for pgwire and
     // the Trino listener. Workers serve neither, so they skip loading it.
@@ -536,6 +587,10 @@ async fn run() -> Result<()> {
         );
     }
     arneb_rpc::install_cluster_security(cluster_security);
+    if matches!(role, ServerRole::Coordinator) {
+        // #245: a silent worker is probed before its queries fail.
+        liveness::start(node_registry.clone());
+    }
     let query_tracker = Arc::new(arneb_scheduler::QueryTracker::with_history_limit(
         config.observability.query_history_size,
     ));
@@ -727,10 +782,16 @@ async fn run() -> Result<()> {
                 query_retry_attempts = retry.map(|r| r.max_retries),
                 "query retry effective value ([cluster] retry_policy / ARNEB_RETRY_POLICY, query_retry_attempts / ARNEB_QUERY_RETRY_ATTEMPTS)"
             );
+            tracing::info!(
+                target: "arneb::config",
+                include_coordinator,
+                "root-stage placement effective value ([cluster] include_coordinator / ARNEB_INCLUDE_COORDINATOR)"
+            );
             let coord =
                 coordinator::QueryCoordinator::new(node_registry.clone(), df_registry.clone())
                     .with_retry(retry)
-                    .with_task_failures(task_failures.clone());
+                    .with_task_failures(task_failures.clone())
+                    .with_include_coordinator(include_coordinator);
             Some(Arc::new(coord))
         }
         _ => None,
@@ -1454,7 +1515,7 @@ async fn run() -> Result<()> {
             })
         }
         // Flight RPC server (all roles)
-        result = arneb_rpc::start_flight_server(&rpc_addr_clone, flight_state_clone) => {
+        result = serve_flight_on_control(&control, rpc_addr_clone, flight_state_clone) => {
             result.err().map(|e| {
                 tracing::error!(error = %e, "flight server error");
                 anyhow::anyhow!("flight server error: {e}")

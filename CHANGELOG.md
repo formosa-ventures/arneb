@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.2.2](https://github.com/formosa-ventures/arneb/compare/v0.2.1...v0.2.2) (2026-11-23)
+
+
+### Features
+
+* **engine:** arrays, ANY/ALL, array_agg and unnest (G6 2b-1, part 1/2) ([#275](https://github.com/formosa-ventures/arneb/issues/275)) ([74c07e6](https://github.com/formosa-ventures/arneb/commit/74c07e624abf4b67ef88288ff1cb52dd50b144fa))
+* **planner:** GROUPING with several arguments and under a plain GROUP BY ([#288](https://github.com/formosa-ventures/arneb/issues/288)) ([f1d494e](https://github.com/formosa-ventures/arneb/commit/f1d494e21e958d5fbf19c07db03b110332ae7ae1))
+* **planner:** plan IN subqueries in a not-false position ([#287](https://github.com/formosa-ventures/arneb/issues/287)) ([41b5f0f](https://github.com/formosa-ventures/arneb/commit/41b5f0fa395eeaf6e06814b5e1c2b547535a2458))
+
+
+### Bug Fixes
+
+* **cluster:** fail a distributed query as soon as one of its tasks fails ([#281](https://github.com/formosa-ventures/arneb/issues/281)) ([11f94c2](https://github.com/formosa-ventures/arneb/commit/11f94c26bdf8e18fedaa9e5365ba02e14e48f2d7))
+* **cluster:** probe a silent worker before failing its queries ([#293](https://github.com/formosa-ventures/arneb/issues/293)) ([5bbecc6](https://github.com/formosa-ventures/arneb/commit/5bbecc68c92902df2844fa03ca105ac9eb914157))
+* coerce TINYINT and SMALLINT like the other integer types ([#292](https://github.com/formosa-ventures/arneb/issues/292)) ([7538644](https://github.com/formosa-ventures/arneb/commit/75386446d0de9b854afa3015ad7149a27e589916))
+* **execution:** stop spilling before the disk fills ([#280](https://github.com/formosa-ventures/arneb/issues/280)) ([303e1dd](https://github.com/formosa-ventures/arneb/commit/303e1ddf95b1b86d45426617cf75475d440e1895))
+* **protocol:** honor pgwire CancelRequest ([#278](https://github.com/formosa-ventures/arneb/issues/278)) ([b4140d2](https://github.com/formosa-ventures/arneb/commit/b4140d266b436d8fbc6522811055c46b7f973d16))
+
+
+### Performance Improvements
+
+* **connectors:** prepare row-group pruning checks once per file ([#295](https://github.com/formosa-ventures/arneb/issues/295)) ([db27b69](https://github.com/formosa-ventures/arneb/commit/db27b690f0749bde01dd70c30d40862c28bf1a2a))
+* **planner:** fuse the partial aggregate into the join fragment by default, keeping the join's tasks ([#282](https://github.com/formosa-ventures/arneb/issues/282)) ([ea99df0](https://github.com/formosa-ventures/arneb/commit/ea99df04c982655fbab7fd4496142c9fba0f15ef))
+
 ## [0.2.1](https://github.com/formosa-ventures/arneb/compare/v0.2.0...v0.2.1) (2026-11-20)
 
 

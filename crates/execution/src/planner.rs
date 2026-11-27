@@ -780,8 +780,21 @@ impl ExecutionContext {
                     });
                 }
                 let val = crate::operator::extract_scalar(col, 0)?;
-                Ok(PlanExpr::Literal {
+                let literal = PlanExpr::Literal {
                     value: val,
+                    span: *span,
+                };
+                // `ScalarValue` has no 8/16-bit integer: a TINYINT or
+                // SMALLINT result comes back as Int32, so cast it back to
+                // the type the analyzer planned the comparison with.
+                let narrow = match col.data_type() {
+                    arrow::datatypes::DataType::Int8 => arneb_common::types::DataType::Int8,
+                    arrow::datatypes::DataType::Int16 => arneb_common::types::DataType::Int16,
+                    _ => return Ok(literal),
+                };
+                Ok(PlanExpr::Cast {
+                    expr: Box::new(literal),
+                    data_type: narrow,
                     span: *span,
                 })
             }
@@ -914,6 +927,15 @@ impl ExecutionContext {
                     else_result,
                     span: *span,
                 })
+            }
+            PlanExpr::ArrayElement(pair) => {
+                let array = Box::pin(self.resolve_scalar_subqueries(&pair.0)).await?;
+                let index = Box::pin(self.resolve_scalar_subqueries(&pair.1)).await?;
+                Ok(PlanExpr::ArrayElement(Box::new((array, index))))
+            }
+            PlanExpr::GetField(pair) => {
+                let inner = Box::pin(self.resolve_scalar_subqueries(&pair.0)).await?;
+                Ok(PlanExpr::GetField(Box::new((inner, pair.1.clone()))))
             }
             _ => Ok(expr.clone()),
         }
@@ -1851,6 +1873,11 @@ fn collect_column_indices_into(expr: &PlanExpr, out: &mut std::collections::BTre
             collect_column_indices_into(expr, out);
             collect_column_indices_into(array, out);
         }
+        E::ArrayElement(pair) => {
+            collect_column_indices_into(&pair.0, out);
+            collect_column_indices_into(&pair.1, out);
+        }
+        E::GetField(pair) => collect_column_indices_into(&pair.0, out),
         E::Function { args, order_by, .. } => {
             for a in args {
                 collect_column_indices_into(a, out);
@@ -1991,6 +2018,12 @@ fn rewrite_column_indices(expr: &PlanExpr, mapping: &HashMap<usize, usize>) -> P
         } => arneb_planner::map_array_contains_ref(expr, array, *negated, *span, |e| {
             rewrite_column_indices(e, mapping)
         }),
+        E::ArrayElement(pair) => {
+            arneb_planner::map_array_element_ref(pair, |e| rewrite_column_indices(e, mapping))
+        }
+        E::GetField(pair) => {
+            arneb_planner::map_get_field_ref(pair, |e| rewrite_column_indices(e, mapping))
+        }
         E::Array {
             elements,
             element_type,

@@ -251,7 +251,10 @@ CASE WHEN, COALESCE, NULLIF, CAST, BETWEEN, IN, LIKE, IS NULL/NOT NULL, arithmet
 SELECT, EXPLAIN, CREATE TABLE, DROP TABLE, CREATE TABLE AS SELECT, INSERT INTO, DELETE FROM, CREATE VIEW, DROP VIEW
 
 ### Advanced DQL
-CTEs (WITH), UNION ALL/UNION/INTERSECT/EXCEPT, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX OVER, `ROWS UNBOUNDED PRECEDING` frames), GROUP BY with HAVING, GROUP BY ROLLUP with GROUPING, ORDER BY on aggregates/aliases
+CTEs (WITH), UNION ALL/UNION/INTERSECT/EXCEPT, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX OVER, `ROWS UNBOUNDED PRECEDING` frames), GROUP BY with HAVING, GROUP BY ROLLUP with GROUPING (several arguments; also under a plain GROUP BY), ORDER BY on aggregates/aliases
+
+### Arrays
+`ARRAY[...]` literals, `'{...}'::type[]` casts, `= ANY` / `<> ALL`, ARRAY_AGG (with ORDER BY), UNNEST and GENERATE_SUBSCRIPTS in the SELECT list, array parameters and results over pgwire (`docs/sql/advanced.md#arrays`)
 
 ### Scalar Functions (90, Trino semantics — full reference in `docs/sql/functions.md`)
 Conditional: IF (desugared to CASE in the parser), TRY (handled in `expression.rs`), GREATEST, LEAST
@@ -280,7 +283,7 @@ Adding a function: implement `ScalarFunction` in `crates/execution/src/functions
 - M2 federation MVP: RDBMS connector framework + PostgreSQL connector (done, #158), cross-source join (done, #167)
 - M3 survives failure: fault tolerance stage 1 fail-clean (done, #171) + stage 2 query retry (done, #184; off by default), Prometheus metrics + slow-query log (done, #172), query history + `system.runtime.queries` (done, #173), worker drain + version handshake (done, #178/#179), GHCR images + Helm (done, #182)
 - M4 wider federation: MySQL connector, aggregate/TopN/join pushdown
-- Path to production (v0.1.6 → v0.2.0): concurrency fix + soak test, worker drain + version handshake, Helm, authorization, query retry, client smoke + queryable pg_catalog (all done by v0.1.7); the headless agent interface (H1–H6, `docs/superpowers/specs/2026-10-30-headless-agent-interface-design.md`) shipped in v0.2.0 and its acceptance scenario runs on kind in CI (#255); left: G6 stage 2b (arrays, SQLAlchemy reflection, Metabase), P1 SF30 validation, production checklist — see "Path to production" in the roadmap doc
+- Path to production (v0.1.6 → v0.2.0): concurrency fix + soak test, worker drain + version handshake, Helm, authorization, query retry, client smoke + queryable pg_catalog (all done by v0.1.7); the headless agent interface (H1–H6, `docs/superpowers/specs/2026-10-30-headless-agent-interface-design.md`) shipped in v0.2.0 and its acceptance scenario runs on kind in CI (#255); G6 stage 2b is done (arrays in v0.2.2, SQLAlchemy reflection over pgwire in #276, Metabase over pgwire in #277); left: P1 SF30 validation, production checklist — see "Path to production" in the roadmap doc
 
 ### OpenSpec Structure
 

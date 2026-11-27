@@ -146,7 +146,7 @@ claimed are in [benchmark methodology](#benchmark-methodology);
 
 ## Features
 
-- **SQL Support**: SELECT, JOIN (INNER/LEFT/RIGHT/FULL/CROSS), GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET, CASE/COALESCE/NULLIF, CTEs, UNION/INTERSECT/EXCEPT, window functions, subqueries (IN/EXISTS/scalar), DDL/DML (CREATE/DROP TABLE, INSERT, DELETE, views)
+- **SQL Support**: SELECT, JOIN (INNER/LEFT/RIGHT/FULL/CROSS), GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET, CASE/COALESCE/NULLIF, CTEs, UNION/INTERSECT/EXCEPT, window functions, subqueries (IN/EXISTS/scalar), `GROUP BY ROLLUP` with `GROUPING`, arrays (`ARRAY[...]`, `= ANY`, `ARRAY_AGG`, `UNNEST`), DDL/DML (CREATE/DROP TABLE, INSERT, DELETE, views)
 - **90 Trino-compatible Scalar Functions**: conditional (IF, TRY, GREATEST, LEAST), string (SPLIT_PART, STRPOS, LPAD/RPAD, CONCAT_WS, `||`, ...), regex (REGEXP_LIKE/EXTRACT/REPLACE/COUNT), math (SQRT, LN, LOG, TRUNCATE, RANDOM, trig, ...), date/time (DATE_ADD, DATE_DIFF, DATE_TRUNC, DATE_FORMAT, DATE_PARSE, FORMAT_DATETIME, YEAR/MONTH/DAY_OF_WEEK/..., FROM_UNIXTIME, NOW) — see [docs/sql/functions.md](docs/sql/functions.md)
 - **Arrow-native Execution**: Vectorized columnar processing using Apache Arrow
 - **Connectors**: In-memory tables, CSV/Parquet files, S3/GCS/Azure object stores, Hive Metastore catalog (HMS 4.x via `_req` API) with Parquet and ORC tables and partitioned tables (partitions read from HMS, as in Trino), Apache Iceberg tables in the same HMS via table redirection (read-only; field-ID schema evolution), PostgreSQL databases as read-only catalogs with filter/projection/limit pushdown and parallel key-range reads — see [Hive](docs/connectors/hive.md), [PostgreSQL](docs/connectors/postgresql.md)
@@ -158,7 +158,7 @@ claimed are in [benchmark methodology](#benchmark-methodology);
 - **Security**: TLS on both client protocols, password authentication on both, and a shared secret plus TLS on the coordinator–worker Flight RPC — see [Securing the Cluster](docs/guide/distributed.md#securing-the-cluster)
 - **Access Control**: catalog, schema and table read rules per user in Trino's file-based access control format, also deciding whose queries a user sees; hidden objects stay invisible in metadata — see [Access Control](docs/guide/access-control.md)
 - **Admission Control**: a cap on running queries with a FIFO queue behind it, a per-query memory limit on every node (SQLSTATE `53200` / `EXCEEDED_LOCAL_MEMORY_LIMIT`), `statement_timeout`, and cancellation that reaches the workers — see [Admission Control](docs/guide/configuration.md#admission-control)
-- **Worker Failure Handling**: a worker that crashes fails its queries at once, and one that hangs fails them after the heartbeat timeout (default 10 s), each with an error naming the worker; the query's tasks on the other workers are cancelled, and the next queries run on the remaining workers. With `retry_policy = "query"` (off by default) a read-only query that lost a worker re-runs on the rest — see [When a Worker Fails](docs/guide/distributed.md#when-a-worker-fails)
+- **Worker Failure Handling**: a worker that crashes fails its queries at once, and one that stops sending heartbeats fails them once it also misses a liveness probe (about 15 s with the defaults), each with an error naming the worker; a task that fails on any worker fails its query at once; the query's tasks on the other workers are cancelled, and the next queries run on the remaining workers. With `retry_policy = "query"` (off by default) a read-only query that lost a worker re-runs on the rest — see [When a Worker Fails](docs/guide/distributed.md#when-a-worker-fails)
 - **Rolling Upgrades**: on SIGTERM a worker drains (no new queries, running ones finish) and deregisters; workers on a different release are refused by the coordinator — see [Stopping a Worker](docs/guide/distributed.md#stopping-a-worker)
 - **Kubernetes**: multi-arch release images on `ghcr.io/formosa-ventures/arneb` and a Helm chart (`charts/arneb`), checked on kind with TPC-H SF1 in CI — see [Kubernetes](docs/guide/kubernetes.md)
 - **Observability**: Prometheus `/metrics` on the Web UI port (queries by outcome, latency histogram, memory pool, admission queue, worker liveness), a slow-query log, an example Grafana dashboard, and a bounded query history queryable as `system.runtime.queries` over both protocols — see [Observability](docs/guide/observability.md)
@@ -170,10 +170,10 @@ claimed are in [benchmark methodology](#benchmark-methodology);
 
 ## Releases
 
-The latest release is **v0.2.1** <!-- x-release-please-version --> — see the [release notes](https://github.com/formosa-ventures/arneb/releases/latest) and [`CHANGELOG.md`](CHANGELOG.md). Releases are source releases (no prebuilt binaries yet); build one from its tag:
+The latest release is **v0.2.2** <!-- x-release-please-version --> — see the [release notes](https://github.com/formosa-ventures/arneb/releases/latest) and [`CHANGELOG.md`](CHANGELOG.md). Releases are source releases (no prebuilt binaries yet); build one from its tag:
 
 ```bash
-git clone --branch v0.2.1 https://github.com/formosa-ventures/arneb.git  # x-release-please-version
+git clone --branch v0.2.2 https://github.com/formosa-ventures/arneb.git  # x-release-please-version
 cd arneb && cargo build --release
 ```
 

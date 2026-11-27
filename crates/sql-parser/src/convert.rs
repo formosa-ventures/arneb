@@ -578,6 +578,18 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                     span,
                 });
             }
+            // PostgreSQL regex match operators lower to `regexp_like`;
+            // `~*` / `!~*` prefix the pattern with the `(?i)` flag and
+            // `!~` / `!~*` negate the result.
+            if let Some((negated, insensitive, symbol)) = match op {
+                sp::BinaryOperator::PGRegexMatch => Some((false, false, "~")),
+                sp::BinaryOperator::PGRegexIMatch => Some((false, true, "~*")),
+                sp::BinaryOperator::PGRegexNotMatch => Some((true, false, "!~")),
+                sp::BinaryOperator::PGRegexNotIMatch => Some((true, true, "!~*")),
+                _ => None,
+            } {
+                return lower_regex_operator(l, r, negated, insensitive, symbol, span);
+            }
             let bin_op = convert_binary_op(op)?;
             Ok(ast::Expr::BinaryOp {
                 left: Box::new(l),
@@ -1013,10 +1025,49 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 span,
             })
         }
+        sp::Expr::CompoundFieldAccess { root, access_chain } => {
+            convert_compound_access(*root, access_chain, span)
+        }
         other => Err(ParseError::UnsupportedFeature(format!(
             "expression: {other}"
         ))),
     }
+}
+
+/// `root[i]...` and `(root).field...`: array subscripts and composite field
+/// accesses, applied left to right. Slices (`[a:b]`) are refused.
+#[inline(never)]
+fn convert_compound_access(
+    root: sp::Expr,
+    access_chain: Vec<sp::AccessExpr>,
+    span: Span,
+) -> Result<ast::Expr, ParseError> {
+    let mut expr = convert_expr(root)?;
+    for access in access_chain {
+        expr = match access {
+            sp::AccessExpr::Subscript(sp::Subscript::Index { index }) => ast::Expr::Subscript {
+                expr: Box::new(expr),
+                index: Box::new(convert_expr(index)?),
+                span,
+            },
+            sp::AccessExpr::Subscript(sp::Subscript::Slice { .. }) => {
+                return Err(ParseError::UnsupportedFeature(
+                    "array slice (expr[lower:upper])".to_string(),
+                ))
+            }
+            sp::AccessExpr::Dot(sp::Expr::Identifier(ident)) => ast::Expr::FieldAccess {
+                expr: Box::new(expr),
+                field: ident.value,
+                span,
+            },
+            sp::AccessExpr::Dot(other) => {
+                return Err(ParseError::UnsupportedFeature(format!(
+                    "field access .{other}"
+                )))
+            }
+        };
+    }
+    Ok(expr)
 }
 
 /// True for the plain `CEIL(x)` / `FLOOR(x)` form (no `TO <unit>`, no scale).
@@ -1038,90 +1089,146 @@ fn unary_function_call(name: &str, expr: sp::Expr, span: Span) -> Result<ast::Ex
     })
 }
 
-/// Convert `INTERVAL '<n>' <unit>` into an integer literal whose
-/// value is the interval in `<unit>` natural units. Only supports
-/// constant integer-valued intervals with a single leading time
-/// unit (DAY / MONTH / YEAR / HOUR / MINUTE / SECOND), which covers
-/// every interval expression used by the TPC-H reference queries.
-///
-/// The folded integer then participates in arithmetic via Arrow's
-/// numeric kernels — `Date32 - Int32` yields a `Date32` shifted by
-/// that many days, matching SQL `DATE - INTERVAL 'n' DAY` semantics
-/// at the bit level (Date32 is days-since-epoch).
-///
-/// For non-DAY units the folded literal still has unit semantics
-/// (months / hours / etc.); downstream arithmetic must handle the
-/// unit through the typed expression evaluator. TPC-H only uses DAY,
-/// so non-DAY intervals are reported as `UnsupportedFeature` until a
-/// concrete query needs them.
-fn convert_interval(interval: sp::Interval, span: Span) -> Result<ast::Expr, ParseError> {
+/// Lowers `l ~ r` (and the `~*`, `!~`, `!~*` variants) to `regexp_like`.
+/// A constant pattern is validated here so the error names the operator.
+fn lower_regex_operator(
+    l: ast::Expr,
+    r: ast::Expr,
+    negated: bool,
+    insensitive: bool,
+    symbol: &str,
+    span: Span,
+) -> Result<ast::Expr, ParseError> {
+    let literal = |text: String| ast::Expr::Literal {
+        value: ScalarValue::Utf8(text),
+        span,
+    };
+    let pattern = match r {
+        ast::Expr::Literal {
+            value: ScalarValue::Utf8(p),
+            ..
+        } => {
+            let p = if insensitive { format!("(?i){p}") } else { p };
+            if let Err(e) = regex::Regex::new(&p) {
+                return Err(ParseError::UnsupportedFeature(format!(
+                    "invalid regular expression in {symbol}: {e}"
+                )));
+            }
+            literal(p)
+        }
+        other if insensitive => ast::Expr::Function {
+            order_by: vec![],
+            name: "CONCAT".to_string(),
+            args: vec![
+                ast::FunctionArg::Unnamed(literal("(?i)".to_string())),
+                ast::FunctionArg::Unnamed(other),
+            ],
+            distinct: false,
+            span,
+        },
+        other => other,
+    };
+    let call = ast::Expr::Function {
+        order_by: vec![],
+        name: "regexp_like".to_string(),
+        args: vec![
+            ast::FunctionArg::Unnamed(l),
+            ast::FunctionArg::Unnamed(pattern),
+        ],
+        distinct: false,
+        span,
+    };
+    Ok(if negated {
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOp::Not,
+            expr: Box::new(call),
+            span,
+        }
+    } else {
+        call
+    })
+}
+
+/// The signed count and unit of a single-unit interval literal:
+/// `INTERVAL 'n' UNIT` or PostgreSQL's `INTERVAL 'n unit'` /
+/// `INTERVAL '-n units'`. Anything else (multi-part strings such as
+/// `'1 day 2 hours'`, `DAY TO HOUR`, fractions) is refused.
+fn interval_parts(iv: &sp::Interval) -> Result<(i64, ast::IntervalUnit), ParseError> {
+    use ast::IntervalUnit;
     use sp::DateTimeField;
 
-    // Resolve the numeric value from the inner expression. TPC-H
-    // queries spell intervals as `INTERVAL '90' DAY`, where the
-    // value parses to a string literal. We also accept a plain
-    // numeric literal in case other queries use that form.
-    let value_str = match interval.value.as_ref() {
+    let unsupported = |what: String| ParseError::UnsupportedFeature(format!("interval {what}"));
+    let text = match iv.value.as_ref() {
         sp::Expr::Value(v) => match &v.value {
             sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => s.clone(),
             sp::Value::Number(n, _) => n.clone(),
-            other => {
-                return Err(ParseError::UnsupportedFeature(format!(
-                    "interval value: {other:?}"
-                )));
-            }
+            other => return Err(unsupported(format!("value: {other:?}"))),
         },
-        other => {
-            return Err(ParseError::UnsupportedFeature(format!(
-                "interval value expression: {other}"
-            )));
+        other => return Err(unsupported(format!("value expression: {other}"))),
+    };
+    if iv.last_field.is_some() {
+        return Err(unsupported(format!("with a range qualifier: '{text}'")));
+    }
+    let (count, unit) = match &iv.leading_field {
+        Some(field) => {
+            let unit = match field {
+                DateTimeField::Year | DateTimeField::Years => IntervalUnit::Year,
+                DateTimeField::Quarter => IntervalUnit::Quarter,
+                DateTimeField::Month | DateTimeField::Months => IntervalUnit::Month,
+                DateTimeField::Week(None) | DateTimeField::Weeks => IntervalUnit::Week,
+                DateTimeField::Day | DateTimeField::Days => IntervalUnit::Day,
+                DateTimeField::Hour | DateTimeField::Hours => IntervalUnit::Hour,
+                DateTimeField::Minute | DateTimeField::Minutes => IntervalUnit::Minute,
+                DateTimeField::Second | DateTimeField::Seconds => IntervalUnit::Second,
+                other => return Err(unsupported(format!("unit: {other}"))),
+            };
+            (text.trim(), unit)
+        }
+        None => {
+            let mut words = text.split_whitespace();
+            let (Some(count), Some(unit), None) = (words.next(), words.next(), words.next()) else {
+                return Err(unsupported(format!(
+                    "'{text}': only a single 'n unit' interval is supported"
+                )));
+            };
+            let unit = IntervalUnit::from_name(unit)
+                .ok_or_else(|| unsupported(format!("unit: '{unit}' in '{text}'")))?;
+            (count, unit)
         }
     };
-    let n: i64 = value_str.trim().parse().map_err(|_| {
-        ParseError::UnsupportedFeature(format!("interval value not an integer: '{value_str}'"))
-    })?;
+    let value = count
+        .parse::<i64>()
+        .map_err(|_| unsupported(format!("value not an integer: '{text}'")))?;
+    Ok((value, unit))
+}
 
-    let unit = interval.leading_field.ok_or_else(|| {
-        ParseError::UnsupportedFeature("interval without leading unit".to_string())
-    })?;
-
-    match unit {
-        DateTimeField::Day | DateTimeField::Days => {
-            // Days fit in Int32 for all realistic ranges.
-            Ok(ast::Expr::Literal {
-                value: arneb_common::types::ScalarValue::Int32(n as i32),
-                span,
-            })
-        }
-        // Year / Month / Hour / Minute / Second intervals are not
-        // exercised by any TPC-H query in our set; until they are,
-        // surface as unsupported so we don't silently mis-evaluate
-        // a non-DAY interval as days.
-        other => Err(ParseError::UnsupportedFeature(format!(
-            "interval unit: {other:?}"
-        ))),
-    }
+/// Convert an interval literal into [`ast::Expr::Interval`]. The
+/// planner lowers it as an operand of `+`/`-` on a date or timestamp
+/// (a DATE ± DAY interval stays plain integer-day arithmetic, the form
+/// the TPC-H queries plan with) and rejects it anywhere else.
+fn convert_interval(interval: sp::Interval, span: Span) -> Result<ast::Expr, ParseError> {
+    let (value, unit) = interval_parts(&interval)?;
+    Ok(ast::Expr::Interval { value, unit, span })
 }
 
 /// Constant-fold `DATE 'YYYY-MM-DD' ± INTERVAL 'N' UNIT` to a single
-/// `Literal(Date32)`. Returns `None` if the operands aren't both
-/// literals or the date string fails to parse — caller falls back to
-/// normal `BinaryOp` conversion (which will error if no runtime
-/// handler exists for the operand types).
+/// `Literal(Date32)`. Returns `None` if the typed string is not a
+/// parseable DATE literal or the unit is finer than a day — caller
+/// falls back to normal `BinaryOp` conversion, which the planner lowers.
 ///
 /// Calendar arithmetic via `chrono`:
-/// - DAY: `NaiveDate ± Duration::days`
+/// - DAY / WEEK: `NaiveDate ± Duration::days`
 /// - MONTH: `NaiveDate::checked_add/sub_months` (handles month-end
 ///   clipping per ISO/SQL semantics).
-/// - YEAR: same as MONTH × 12.
+/// - QUARTER / YEAR: same as MONTH × 3 / × 12.
 fn try_fold_date_interval(
     ts: &sp::TypedString,
     op: &sp::BinaryOperator,
     iv: &sp::Interval,
     span: Span,
 ) -> Result<Option<ast::Expr>, ParseError> {
+    use ast::IntervalUnit;
     use chrono::{Months, NaiveDate};
-    use sp::DateTimeField;
 
     // Only fold when the typed-string is a DATE literal.
     if !matches!(ts.data_type, sp::DataType::Date) {
@@ -1136,53 +1243,34 @@ fn try_fold_date_interval(
         Err(_) => return Ok(None),
     };
 
-    // Extract the interval value + unit.
-    let value_str = match iv.value.as_ref() {
-        sp::Expr::Value(v) => match &v.value {
-            sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => s.clone(),
-            sp::Value::Number(n, _) => n.clone(),
-            _ => return Ok(None),
-        },
+    let (n, unit) = interval_parts(iv)?;
+    let n = match op {
+        sp::BinaryOperator::Plus => Some(n),
+        sp::BinaryOperator::Minus => n.checked_neg(),
         _ => return Ok(None),
     };
-    let n: i64 = match value_str.trim().parse() {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
+    let shift_months = |months: i64| -> Option<NaiveDate> {
+        let magnitude = Months::new(u32::try_from(months.unsigned_abs()).ok()?);
+        if months >= 0 {
+            date.checked_add_months(magnitude)
+        } else {
+            date.checked_sub_months(magnitude)
+        }
     };
-    let unit = iv.leading_field.as_ref().ok_or_else(|| {
-        ParseError::UnsupportedFeature("interval without leading unit".to_string())
-    })?;
-
+    let shift_days = |days: i64| -> Option<NaiveDate> {
+        date.checked_add_signed(chrono::Duration::try_days(days)?)
+    };
     let new_date = match unit {
-        DateTimeField::Day | DateTimeField::Days => {
-            let delta = chrono::Duration::days(n);
-            match op {
-                sp::BinaryOperator::Plus => date.checked_add_signed(delta),
-                sp::BinaryOperator::Minus => date.checked_sub_signed(delta),
-                _ => return Ok(None),
-            }
-        }
-        DateTimeField::Month | DateTimeField::Months => {
-            let months = Months::new(n as u32);
-            match op {
-                sp::BinaryOperator::Plus => date.checked_add_months(months),
-                sp::BinaryOperator::Minus => date.checked_sub_months(months),
-                _ => return Ok(None),
-            }
-        }
-        DateTimeField::Year | DateTimeField::Years => {
-            let months = Months::new((n * 12) as u32);
-            match op {
-                sp::BinaryOperator::Plus => date.checked_add_months(months),
-                sp::BinaryOperator::Minus => date.checked_sub_months(months),
-                _ => return Ok(None),
-            }
-        }
-        _ => return Ok(None),
+        IntervalUnit::Day => n.and_then(shift_days),
+        IntervalUnit::Week => n.and_then(|n| n.checked_mul(7)).and_then(shift_days),
+        IntervalUnit::Month => n.and_then(shift_months),
+        IntervalUnit::Quarter => n.and_then(|n| n.checked_mul(3)).and_then(shift_months),
+        IntervalUnit::Year => n.and_then(|n| n.checked_mul(12)).and_then(shift_months),
+        IntervalUnit::Hour | IntervalUnit::Minute | IntervalUnit::Second => return Ok(None),
     };
     let new_date = new_date.ok_or_else(|| {
         ParseError::UnsupportedFeature(format!(
-            "date interval arithmetic overflow: {date} {op:?} {n} {unit:?}"
+            "date interval arithmetic overflow: {date} {op:?} {unit:?}"
         ))
     })?;
 
@@ -1195,7 +1283,7 @@ fn try_fold_date_interval(
 }
 
 /// Convert a `sqlparser` [`sp::Function`] into a arneb [`ast::Expr::Function`].
-fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseError> {
+fn convert_function(mut func: sp::Function, span: Span) -> Result<ast::Expr, ParseError> {
     // Identifier quotes are dropped (`"sum"(x)` is `sum(x)`), and so is a
     // `pg_catalog.` qualifier: PostgreSQL's search path always holds
     // pg_catalog, so clients qualify its functions freely.
@@ -1214,10 +1302,18 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
             "FILTER (WHERE ...) on {name}(...)"
         )));
     }
-    if !func.within_group.is_empty() {
+    // Ordered-set aggregates: `percentile_cont(f) WITHIN GROUP (ORDER BY x)`
+    // becomes `percentile_cont(f, x)` with `x` (and its direction) also as
+    // the aggregate's ORDER BY. Every other function refuses WITHIN GROUP.
+    let is_ordered_set = matches!(name_upper.as_str(), "PERCENTILE_CONT" | "PERCENTILE_DISC");
+    let within_group = std::mem::take(&mut func.within_group);
+    if !within_group.is_empty() && !is_ordered_set {
         return Err(ParseError::UnsupportedFeature(format!(
             "WITHIN GROUP on {name}(...)"
         )));
+    }
+    if is_ordered_set {
+        return convert_ordered_set_aggregate(func, name, within_group, span);
     }
 
     // Desugar COALESCE(a, b, ...) → CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ... ELSE last END
@@ -1472,6 +1568,59 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
         args,
         distinct: is_distinct,
         order_by: agg_order_by,
+        span,
+    })
+}
+
+/// `percentile_cont`/`percentile_disc(f) WITHIN GROUP (ORDER BY x)` as
+/// `name(f, x)` with ORDER BY `x`: one fraction, one sort key, and no
+/// DISTINCT, in-argument ORDER BY or OVER.
+fn convert_ordered_set_aggregate(
+    func: sp::Function,
+    name: String,
+    within_group: Vec<sp::OrderByExpr>,
+    span: Span,
+) -> Result<ast::Expr, ParseError> {
+    if func.over.is_some() {
+        return Err(ParseError::UnsupportedFeature(format!(
+            "{name}(...) as a window function"
+        )));
+    }
+    let fraction = match func.args {
+        sp::FunctionArguments::List(arg_list)
+            if arg_list.duplicate_treatment.is_none()
+                && arg_list.clauses.is_empty()
+                && arg_list.args.len() == 1 =>
+        {
+            match convert_function_arg(arg_list.args.into_iter().next().unwrap())? {
+                ast::FunctionArg::Unnamed(e) => e,
+                ast::FunctionArg::Wildcard => {
+                    return Err(ParseError::InvalidSyntax(format!(
+                        "{name} requires a fraction argument"
+                    )))
+                }
+            }
+        }
+        _ => {
+            return Err(ParseError::InvalidSyntax(format!(
+                "{name} takes one fraction argument: {name}(f) WITHIN GROUP (ORDER BY x)"
+            )))
+        }
+    };
+    if within_group.len() != 1 {
+        return Err(ParseError::InvalidSyntax(format!(
+            "{name} requires WITHIN GROUP (ORDER BY x) with exactly one sort key"
+        )));
+    }
+    let key = convert_order_by_expr(within_group.into_iter().next().unwrap())?;
+    Ok(ast::Expr::Function {
+        name,
+        args: vec![
+            ast::FunctionArg::Unnamed(fraction),
+            ast::FunctionArg::Unnamed(key.expr.clone()),
+        ],
+        distinct: false,
+        order_by: vec![key],
         span,
     })
 }

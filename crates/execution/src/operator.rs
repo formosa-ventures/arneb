@@ -1840,7 +1840,13 @@ impl ExecutionPlan for RollupAggregateExec {
         let input_schema = self.input.schema();
         let mut senders = Vec::with_capacity(key_count + 1);
         let mut levels = Vec::with_capacity(key_count + 1);
+        // With no aggregates the grand total level has nothing to compute:
+        // it is one row, whatever the input (added below).
+        let grand_total_only_row = self.aggr_exprs.is_empty();
         for keep in (0..=key_count).rev() {
+            if keep == 0 && grand_total_only_row {
+                continue;
+            }
             let (sender, receiver) = tokio::sync::mpsc::channel(1);
             senders.push(sender);
             let mut level_schema = self.output_schema[..keep].to_vec();
@@ -1888,6 +1894,14 @@ impl ExecutionPlan for RollupAggregateExec {
             return Err(results.swap_remove(index).unwrap_err());
         }
         produced?;
+        if grand_total_only_row {
+            let one_row = RecordBatch::try_new_with_options(
+                Arc::new(arrow::datatypes::Schema::empty()),
+                Vec::new(),
+                &arrow::array::RecordBatchOptions::new().with_row_count(Some(1)),
+            )?;
+            results.push(Ok((0, vec![one_row])));
+        }
         let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.output_schema);
         let mut output = Vec::new();
         for result in results {
@@ -2021,7 +2035,8 @@ struct AggrInfo {
     args: Vec<PlanExpr>,
     is_count_star: bool,
     distinct: bool,
-    /// `ARRAY_AGG` only: the ORDER BY keys (possibly none).
+    /// `ARRAY_AGG`: the ORDER BY keys (possibly none); percentiles: the
+    /// WITHIN GROUP key.
     order: Vec<(PlanExpr, bool, bool)>,
 }
 
@@ -2061,6 +2076,20 @@ impl AggrInfo {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             return aggregate::pack_array_agg_input(value, keys);
+        }
+        if self.name.eq_ignore_ascii_case("PERCENTILE_CONT")
+            || self.name.eq_ignore_ascii_case("PERCENTILE_DISC")
+        {
+            // `percentile_*(f, x)`: the fraction and the WITHIN GROUP key.
+            let (key, asc, _) = self.order.first().ok_or_else(|| {
+                ExecutionError::InvalidOperation(format!(
+                    "{} requires WITHIN GROUP (ORDER BY ...)",
+                    self.name
+                ))
+            })?;
+            let fraction = expression::evaluate(&self.args[0], batch, None)?;
+            let value = expression::evaluate(key, batch, None)?;
+            return aggregate::pack_percentile_input(fraction, value, *asc);
         }
         expression::evaluate(&self.args[0], batch, None)
     }
@@ -2152,6 +2181,82 @@ fn set_dict_probe_build_for_test(enabled: Option<bool>) {
 // it here.
 type GroupState = Vec<Box<dyn Accumulator>>;
 
+/// Approximate bytes one legacy aggregate group adds to its map: the key
+/// entry and one boxed accumulator slot (with a small fixed state) per
+/// aggregate. Accumulator state that grows with the input is counted
+/// separately through [`Accumulator::heap_bytes`].
+fn legacy_group_bytes(key: &GroupKey, n_accs: usize) -> usize {
+    key.entry_bytes()
+        + std::mem::size_of::<GroupState>()
+        + n_accs * (std::mem::size_of::<Box<dyn Accumulator>>() + 16)
+}
+
+/// Total [`Accumulator::heap_bytes`] of one group's accumulators.
+fn group_state_heap_bytes(accs: &[Box<dyn Accumulator>]) -> usize {
+    accs.iter().map(|acc| acc.heap_bytes()).sum()
+}
+
+/// Total [`GroupedAccumulator::heap_bytes`] of an operator's accumulators.
+fn grouped_heap_bytes(accs: &[Box<dyn GroupedAccumulator>]) -> usize {
+    accs.iter().map(|acc| acc.heap_bytes()).sum()
+}
+
+fn new_group_state(aggr_info: &[AggrInfo]) -> Result<GroupState, ExecutionError> {
+    aggr_info
+        .iter()
+        .map(|info| aggregate::create_accumulator(&info.name, info.is_count_star, info.distinct))
+        .collect()
+}
+
+/// Folds row `row` into the legacy group `key`, creating the group when it
+/// is new. Returns how many bytes the group map grew by (see
+/// [`legacy_group_bytes`] and [`Accumulator::heap_bytes`]).
+fn fold_row_into_group(
+    groups: &mut FastHashMap<GroupKey, GroupState>,
+    key: GroupKey,
+    aggr_info: &[AggrInfo],
+    aggr_input_cols: &[ArrayRef],
+    row: usize,
+) -> Result<usize, ExecutionError> {
+    let mut grown = 0;
+    let accumulators = match groups.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            grown += legacy_group_bytes(entry.key(), aggr_info.len());
+            entry.insert(new_group_state(aggr_info)?)
+        }
+    };
+    for (acc_i, acc) in accumulators.iter_mut().enumerate() {
+        let before = acc.heap_bytes();
+        acc.update_batch(&aggr_input_cols[acc_i].slice(row, 1))?;
+        grown += acc.heap_bytes().saturating_sub(before);
+    }
+    Ok(grown)
+}
+
+/// Merges one partial group map into `merged` and returns how many bytes
+/// `merged` grew by.
+fn merge_partial_groups(
+    merged: &mut FastHashMap<GroupKey, GroupState>,
+    partial: FastHashMap<GroupKey, GroupState>,
+    n_accs: usize,
+) -> Result<usize, ExecutionError> {
+    let mut grown = 0;
+    for (key, local_accs) in partial {
+        if let Some(existing) = merged.get_mut(&key) {
+            for (i, acc) in local_accs.iter().enumerate() {
+                let before = existing[i].heap_bytes();
+                existing[i].merge(acc.as_ref())?;
+                grown += existing[i].heap_bytes().saturating_sub(before);
+            }
+        } else {
+            grown += legacy_group_bytes(&key, n_accs) + group_state_heap_bytes(&local_accs);
+            merged.insert(key, local_accs);
+        }
+    }
+    Ok(grown)
+}
+
 impl HashAggregateExec {
     fn input_hash_partitioned_on_group_by(
         &self,
@@ -2205,6 +2310,13 @@ impl HashAggregateExec {
         }
 
         let mut groups: FastHashMap<GroupKey, GroupState> = FastHashMap::default();
+        // The group map and every DISTINCT set reserve against the pool,
+        // so a large DISTINCT aggregate fails with a memory-limit error
+        // instead of growing past the node's memory.
+        let mut reservation = crate::memory_pool::MemoryConsumer::new("HashAggregateExec")
+            .with_can_spill(false)
+            .register(self.memory_pool.clone());
+        let mut state_bytes = 0usize;
 
         while let Some(batch_res) = stream.next().await {
             let batch =
@@ -2232,28 +2344,15 @@ impl HashAggregateExec {
                     .iter()
                     .map(|col| extract_scalar(col, row))
                     .collect::<Result<_, _>>()?;
-                let key = GroupKey(group_values);
-
-                let accumulators = groups.entry(key).or_insert_with(|| {
-                    aggr_info
-                        .iter()
-                        .map(|info| {
-                            aggregate::create_accumulator(
-                                &info.name,
-                                info.is_count_star,
-                                info.distinct,
-                            )
-                            .unwrap()
-                        })
-                        .collect::<Vec<_>>()
-                });
-
-                for (acc_i, acc) in accumulators.iter_mut().enumerate() {
-                    let col = &aggr_input_cols[acc_i];
-                    let slice = col.slice(row, 1);
-                    acc.update_batch(&slice)?;
-                }
+                state_bytes += fold_row_into_group(
+                    &mut groups,
+                    GroupKey(group_values),
+                    &aggr_info,
+                    &aggr_input_cols,
+                    row,
+                )?;
             }
+            reservation.try_resize(state_bytes)?;
         }
 
         self.build_aggregate_output(groups)
@@ -2272,6 +2371,9 @@ impl HashAggregateExec {
                 aggregate::create_accumulator(&info.name, info.is_count_star, info.distinct)
             })
             .collect::<Result<_, _>>()?;
+        let mut reservation = crate::memory_pool::MemoryConsumer::new("HashAggregateExec")
+            .with_can_spill(false)
+            .register(self.memory_pool.clone());
 
         while let Some(batch_res) = stream.next().await {
             let batch =
@@ -2284,6 +2386,7 @@ impl HashAggregateExec {
                 };
                 accumulators[i].update_batch(&col)?;
             }
+            reservation.try_resize(group_state_heap_bytes(&accumulators))?;
         }
 
         let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.output_schema);
@@ -2334,18 +2437,25 @@ impl HashAggregateExec {
             let input = Arc::clone(&self.input);
             let group_by = self.group_by.clone();
             let aggr_info = Arc::clone(&aggr_info);
+            let pool = self.memory_pool.clone();
             handles.push(tokio::spawn(async move {
-                build_partial_groups(input, p, group_by, aggr_info).await
+                build_partial_groups(input, p, group_by, aggr_info, pool).await
             }));
         }
 
-        // Wait for all partials and merge sequentially.
+        // Wait for all partials and merge sequentially. Each partial keeps
+        // its own reservation until it has been merged; the merged state
+        // reserves as it grows.
         let mut merged: FastHashMap<GroupKey, GroupState> = FastHashMap::default();
         let mut global_no_group: Option<GroupState> = None;
         let no_grouping = self.group_by.is_empty();
+        let mut reservation = crate::memory_pool::MemoryConsumer::new("HashAggregateExec.merge")
+            .with_can_spill(false)
+            .register(self.memory_pool.clone());
+        let mut state_bytes = 0usize;
 
         for handle in handles {
-            let partial = handle.await.map_err(|e| {
+            let (partial, partial_reservation) = handle.await.map_err(|e| {
                 ExecutionError::InvalidOperation(format!("aggregate partial task: {e}"))
             })??;
             if no_grouping {
@@ -2360,17 +2470,18 @@ impl HashAggregateExec {
                         global_no_group = Some(local_accs);
                     }
                 }
+                state_bytes = global_no_group
+                    .as_deref()
+                    .map(group_state_heap_bytes)
+                    .unwrap_or(0);
             } else {
-                for (key, local_accs) in partial {
-                    if let Some(existing) = merged.get_mut(&key) {
-                        for (i, acc) in local_accs.iter().enumerate() {
-                            existing[i].merge(acc.as_ref())?;
-                        }
-                    } else {
-                        merged.insert(key, local_accs);
-                    }
-                }
+                state_bytes += merge_partial_groups(&mut merged, partial, aggr_info.len())?;
             }
+            // The partial was consumed by the merge (its groups moved or
+            // folded into `merged`), so its bytes are released before the
+            // merged state is counted: the same state is never counted twice.
+            drop(partial_reservation);
+            reservation.try_resize(state_bytes)?;
         }
 
         if no_grouping {
@@ -2501,7 +2612,8 @@ impl HashAggregateExec {
             }
             // Group key/table bytes (exact-ish) + a coarse per-group
             // accumulator estimate (~16 B/group/aggregate).
-            let state_bytes = gbh.heap_bytes() + n_groups * accs.len() * 16;
+            let state_bytes =
+                gbh.heap_bytes() + n_groups * accs.len() * 16 + grouped_heap_bytes(&accs);
             reservation.try_resize(state_bytes)?;
         }
 
@@ -2621,7 +2733,8 @@ impl HashAggregateExec {
                     acc.ensure_capacity(n_groups);
                     acc.add_input(&group_ids, &aggr_input_cols[i])?;
                 }
-                let state_bytes = gbh.heap_bytes() + n_groups * accs.len() * 16;
+                let state_bytes =
+                    gbh.heap_bytes() + n_groups * accs.len() * 16 + grouped_heap_bytes(&accs);
                 reservation.try_resize(state_bytes)?;
             }
 
@@ -2646,6 +2759,9 @@ impl HashAggregateExec {
         for acc in accs.iter_mut() {
             acc.ensure_capacity(1);
         }
+        let mut reservation = crate::memory_pool::MemoryConsumer::new("HashAggregateExec")
+            .with_can_spill(false)
+            .register(self.memory_pool.clone());
 
         while let Some(batch_res) = stream.next().await {
             let batch =
@@ -2663,6 +2779,7 @@ impl HashAggregateExec {
                 };
                 accs[i].add_input(&group_ids, &col)?;
             }
+            reservation.try_resize(grouped_heap_bytes(&accs))?;
         }
 
         let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.output_schema);
@@ -2754,9 +2871,17 @@ impl HashAggregateExec {
             let group_by = self.group_by.clone();
             let aggr_info = Arc::clone(&aggr_info);
             let estimated_groups = partition_estimated_groups(self.estimated_groups, n);
+            let pool = self.memory_pool.clone();
             handles.push(tokio::spawn(async move {
-                build_partial_groups_batch_aware(input, p, group_by, aggr_info, estimated_groups)
-                    .await
+                build_partial_groups_batch_aware(
+                    input,
+                    p,
+                    group_by,
+                    aggr_info,
+                    estimated_groups,
+                    pool,
+                )
+                .await
             }));
         }
 
@@ -2777,9 +2902,10 @@ impl HashAggregateExec {
                 acc.ensure_capacity(1);
             }
             for h in handles {
-                let (_partial_gbh, partial_accs) = h.await.map_err(|e| {
-                    ExecutionError::InvalidOperation(format!("aggregate partial task: {e}"))
-                })??;
+                let (_partial_gbh, partial_accs, _partial_reservation) =
+                    h.await.map_err(|e| {
+                        ExecutionError::InvalidOperation(format!("aggregate partial task: {e}"))
+                    })??;
                 let remap = vec![0u32; 1];
                 for (i, pa) in partial_accs.iter().enumerate() {
                     final_accs[i].merge_from(pa.as_ref(), &remap)?;
@@ -2822,12 +2948,12 @@ impl HashAggregateExec {
         if agg_presize_adaptive_enabled() {
             let final_groups_upper_bound = partials
                 .iter()
-                .map(|(partial_gbh, _)| partial_gbh.num_groups())
+                .map(|(partial_gbh, _, _)| partial_gbh.num_groups())
                 .sum();
             global_gbh.reserve_groups(final_groups_upper_bound);
         }
 
-        for (partial_gbh, partial_accs) in partials {
+        for (partial_gbh, partial_accs, mut partial_reservation) in partials {
             // An input partition with zero rows never initialised its key
             // storage, so it yields zero key columns; feeding that to the
             // global hash errors (FlatRow expects one array per key).
@@ -2842,12 +2968,21 @@ impl HashAggregateExec {
             let partial_arrays = partial_gbh.build_group_arrays()?;
             let remap = global_gbh.get_group_ids(&partial_arrays)?;
             let n_global = global_gbh.num_groups();
-            for (i, pa) in partial_accs.iter().enumerate() {
+            // Merge one accumulator at a time and free its partial state
+            // (and that share of the partial's reservation) right after, so
+            // a partial and its merged copy overlap for one accumulator at
+            // most, in memory and in the pool.
+            for (i, pa) in partial_accs.into_iter().enumerate() {
                 final_accs[i].ensure_capacity(n_global);
                 final_accs[i].merge_from(pa.as_ref(), &remap)?;
+                let freed = pa.heap_bytes().min(partial_reservation.size());
+                drop(pa);
+                partial_reservation.shrink(freed);
+                let state_bytes = global_gbh.heap_bytes()
+                    + n_global * final_accs.len() * 16
+                    + grouped_heap_bytes(&final_accs);
+                reservation.try_resize(state_bytes)?;
             }
-            let state_bytes = global_gbh.heap_bytes() + n_global * final_accs.len() * 16;
-            reservation.try_resize(state_bytes)?;
         }
 
         self.build_output_batch_aware(&global_gbh, &final_accs)
@@ -2896,9 +3031,17 @@ impl HashAggregateExec {
             let group_by = self.group_by.clone();
             let aggr_info = Arc::clone(&aggr_info);
             let estimated_groups = partition_estimated_groups(self.estimated_groups, n);
+            let pool = self.memory_pool.clone();
             handles.push(tokio::spawn(async move {
-                build_partial_groups_batch_aware(input, p, group_by, aggr_info, estimated_groups)
-                    .await
+                build_partial_groups_batch_aware(
+                    input,
+                    p,
+                    group_by,
+                    aggr_info,
+                    estimated_groups,
+                    pool,
+                )
+                .await
             }));
         }
 
@@ -2919,12 +3062,12 @@ impl HashAggregateExec {
         if agg_presize_adaptive_enabled() {
             let final_groups_upper_bound = partials
                 .iter()
-                .map(|(partial_gbh, _)| partial_gbh.num_groups())
+                .map(|(partial_gbh, _, _)| partial_gbh.num_groups())
                 .sum();
             global_gbh.reserve_groups(final_groups_upper_bound);
         }
 
-        for (partial_gbh, partial_accs) in partials {
+        for (partial_gbh, partial_accs, _partial_reservation) in partials {
             // Empty input partition: no groups, no key columns — skip.
             if partial_gbh.num_groups() == 0 {
                 continue;
@@ -3058,23 +3201,30 @@ async fn build_partial_groups(
     partition: usize,
     group_by: Vec<PlanExpr>,
     aggr_info: Arc<Vec<AggrInfo>>,
-) -> Result<FastHashMap<GroupKey, GroupState>, ExecutionError> {
+    memory_pool: Arc<dyn crate::memory_pool::MemoryPool>,
+) -> Result<
+    (
+        FastHashMap<GroupKey, GroupState>,
+        crate::memory_pool::MemoryReservation,
+    ),
+    ExecutionError,
+> {
     let mut stream = input.execute(partition).await?;
 
     let mut groups: FastHashMap<GroupKey, GroupState> = FastHashMap::default();
     let no_grouping = group_by.is_empty();
+    let mut reservation = crate::memory_pool::MemoryConsumer::new("HashAggregateExec.partial")
+        .with_can_spill(false)
+        .register(memory_pool);
 
     if no_grouping {
         // Use an empty `GroupKey` as the single bucket.
-        let bucket = groups.entry(GroupKey(Vec::new())).or_insert_with(|| {
-            aggr_info
-                .iter()
-                .map(|info| {
-                    aggregate::create_accumulator(&info.name, info.is_count_star, info.distinct)
-                        .unwrap()
-                })
-                .collect::<Vec<_>>()
-        });
+        let bucket = match groups.entry(GroupKey(Vec::new())) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(new_group_state(&aggr_info)?)
+            }
+        };
         while let Some(batch_res) = stream.next().await {
             let batch = batch_res.map_err(|e| {
                 ExecutionError::upstream(
@@ -3090,9 +3240,12 @@ async fn build_partial_groups(
                 };
                 bucket[i].update_batch(&col)?;
             }
+            reservation.try_resize(group_state_heap_bytes(bucket))?;
         }
-        return Ok(groups);
+        return Ok((groups, reservation));
     }
+
+    let mut state_bytes = 0usize;
 
     while let Some(batch_res) = stream.next().await {
         let batch = batch_res.map_err(|e| {
@@ -3123,25 +3276,18 @@ async fn build_partial_groups(
                 .iter()
                 .map(|col| extract_scalar(col, row))
                 .collect::<Result<_, _>>()?;
-            let key = GroupKey(group_values);
-            let accumulators = groups.entry(key).or_insert_with(|| {
-                aggr_info
-                    .iter()
-                    .map(|info| {
-                        aggregate::create_accumulator(&info.name, info.is_count_star, info.distinct)
-                            .unwrap()
-                    })
-                    .collect::<Vec<_>>()
-            });
-            for (acc_i, acc) in accumulators.iter_mut().enumerate() {
-                let col = &aggr_input_cols[acc_i];
-                let slice = col.slice(row, 1);
-                acc.update_batch(&slice)?;
-            }
+            state_bytes += fold_row_into_group(
+                &mut groups,
+                GroupKey(group_values),
+                &aggr_info,
+                &aggr_input_cols,
+                row,
+            )?;
         }
+        reservation.try_resize(state_bytes)?;
     }
 
-    Ok(groups)
+    Ok((groups, reservation))
 }
 
 /// Batch-aware counterpart to [`build_partial_groups`]. Returns a
@@ -3154,8 +3300,22 @@ async fn build_partial_groups_batch_aware(
     group_by: Vec<PlanExpr>,
     aggr_info: Arc<Vec<AggrInfo>>,
     estimated_groups: Option<usize>,
-) -> Result<(GroupByHash, Vec<Box<dyn GroupedAccumulator>>), ExecutionError> {
+    memory_pool: Arc<dyn crate::memory_pool::MemoryPool>,
+) -> Result<
+    (
+        GroupByHash,
+        Vec<Box<dyn GroupedAccumulator>>,
+        crate::memory_pool::MemoryReservation,
+    ),
+    ExecutionError,
+> {
     let mut stream = input.execute(partition).await?;
+    // Only the accumulators' growing state reserves here (see
+    // `GroupedAccumulator::heap_bytes`); the group table is reserved once
+    // merged, as before.
+    let mut reservation = crate::memory_pool::MemoryConsumer::new("HashAggregateExec.partial")
+        .with_can_spill(false)
+        .register(memory_pool);
 
     let mut gbh = GroupByHash::with_estimated_groups(estimated_groups);
     let mut accs: Vec<Box<dyn GroupedAccumulator>> = aggr_info
@@ -3191,8 +3351,9 @@ async fn build_partial_groups_batch_aware(
                 };
                 accs[i].add_input(&group_ids, &col)?;
             }
+            reservation.try_resize(grouped_heap_bytes(&accs))?;
         }
-        return Ok((gbh, accs));
+        return Ok((gbh, accs, reservation));
     }
 
     let mut rows_seen = 0usize;
@@ -3226,9 +3387,10 @@ async fn build_partial_groups_batch_aware(
             acc.ensure_capacity(n_groups);
             acc.add_input(&group_ids, &aggr_input_cols[i])?;
         }
+        reservation.try_resize(grouped_heap_bytes(&accs))?;
     }
 
-    Ok((gbh, accs))
+    Ok((gbh, accs, reservation))
 }
 
 // ===========================================================================
@@ -4309,6 +4471,19 @@ pub(crate) fn scalars_to_array(
     values: &[ScalarValue],
     data_type: &ArrowDataType,
 ) -> Result<ArrayRef, ExecutionError> {
+    // `ScalarValue` has no 8- or 16-bit integer: TINYINT and SMALLINT
+    // values travel as Int32 and narrow back to the declared type here. A
+    // value out of the type's range is an error, never a silent NULL.
+    if matches!(data_type, ArrowDataType::Int8 | ArrowDataType::Int16) {
+        let wide = scalars_to_array(values, &ArrowDataType::Int32)?;
+        let options = arrow::compute::CastOptions {
+            safe: false,
+            ..Default::default()
+        };
+        return Ok(arrow::compute::cast_with_options(
+            &wide, data_type, &options,
+        )?);
+    }
     let first_type = values.iter().find(|v| !matches!(v, ScalarValue::Null));
     match first_type {
         None => Ok(array::new_null_array(data_type, values.len())),
@@ -4554,6 +4729,20 @@ mod tests {
         assert_eq!(date_arr.value(0), 19000);
         assert!(date_arr.is_null(1));
         assert_eq!(date_arr.value(2), 19500);
+    }
+
+    /// INTEGER scalars narrow to a requested TINYINT/SMALLINT column (the
+    /// scalars carry small integers as INTEGER); out of range is an error.
+    #[test]
+    fn scalars_to_array_narrows_to_small_integers() {
+        let values = vec![ScalarValue::Int32(-7), ScalarValue::Null];
+        let arr = scalars_to_array(&values, &ArrowDataType::Int16).unwrap();
+        assert_eq!(arr.data_type(), &ArrowDataType::Int16);
+        assert_eq!(arr.as_primitive::<datatypes::Int16Type>().value(0), -7);
+        assert!(arr.is_null(1));
+        let arr = scalars_to_array(&values, &ArrowDataType::Int8).unwrap();
+        assert_eq!(arr.data_type(), &ArrowDataType::Int8);
+        assert!(scalars_to_array(&[ScalarValue::Int32(1 << 20)], &ArrowDataType::Int16).is_err());
     }
 
     /// exec-memory-accounting 4.5: a batch decoded from one IPC message body
@@ -7136,6 +7325,264 @@ mod tests {
             })
             .collect();
         assert_eq!(all, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    /// `COUNT(DISTINCT v)` over 20 000 distinct strings, optionally grouped
+    /// by `k = i % 4`, read from `partitions` input partitions.
+    fn count_distinct_strings(
+        grouped: bool,
+        partitions: usize,
+        memory_pool: Arc<dyn crate::memory_pool::MemoryPool>,
+    ) -> HashAggregateExec {
+        let aggr = PlanExpr::Function {
+            name: "COUNT".to_string(),
+            args: vec![PlanExpr::Column {
+                index: 1,
+                name: "v".to_string(),
+                span: None,
+            }],
+            distinct: true,
+            order_by: None,
+            span: None,
+        };
+        let count = ColumnInfo {
+            name: "cnt".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        aggregate_strings(grouped, partitions, memory_pool, aggr, count)
+    }
+
+    /// `percentile_disc(0.5) WITHIN GROUP (ORDER BY v)` over the same input
+    /// as [`count_distinct_strings`].
+    fn median_of_strings(
+        grouped: bool,
+        partitions: usize,
+        memory_pool: Arc<dyn crate::memory_pool::MemoryPool>,
+    ) -> HashAggregateExec {
+        let v = PlanExpr::Column {
+            index: 1,
+            name: "v".to_string(),
+            span: None,
+        };
+        let aggr = PlanExpr::Function {
+            name: "PERCENTILE_DISC".to_string(),
+            args: vec![PlanExpr::Literal {
+                value: ScalarValue::Float64(0.5),
+                span: None,
+            }],
+            distinct: false,
+            order_by: Some(Box::new(vec![arneb_planner::SortExpr {
+                expr: v,
+                asc: true,
+                nulls_first: false,
+            }])),
+            span: None,
+        };
+        let median = ColumnInfo {
+            name: "median".to_string(),
+            data_type: DataType::Utf8,
+            nullable: true,
+        };
+        aggregate_strings(grouped, partitions, memory_pool, aggr, median)
+    }
+
+    /// `aggr` (output column `out`) over 20 000 distinct strings `v`,
+    /// optionally grouped by `k = i % 4`, read from `partitions` input
+    /// partitions.
+    fn aggregate_strings(
+        grouped: bool,
+        partitions: usize,
+        memory_pool: Arc<dyn crate::memory_pool::MemoryPool>,
+        aggr: PlanExpr,
+        out: ColumnInfo,
+    ) -> HashAggregateExec {
+        let columns = vec![
+            ColumnInfo {
+                name: "k".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "v".to_string(),
+                data_type: DataType::Utf8,
+                nullable: false,
+            },
+        ];
+        let arrow_schema = crate::datasource::column_info_to_arrow_schema(&columns);
+        let rows_per_partition = 20_000 / partitions;
+        let batches = (0..partitions)
+            .map(|p| {
+                let range = p * rows_per_partition..(p + 1) * rows_per_partition;
+                let keys: Vec<i32> = range.clone().map(|i| (i % 4) as i32).collect();
+                let values: Vec<String> = range.map(|i| format!("distinct-value-{i:08}")).collect();
+                vec![RecordBatch::try_new(
+                    arrow_schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(keys)),
+                        Arc::new(arrow::array::StringArray::from(values)),
+                    ],
+                )
+                .unwrap()]
+            })
+            .collect();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(PartitionedBatchInput {
+            columns: columns.clone(),
+            batches,
+            partitioning: crate::partitioning::Partitioning::UnknownPartitioning(partitions),
+        });
+        HashAggregateExec {
+            input,
+            group_by: if grouped {
+                vec![PlanExpr::Column {
+                    index: 0,
+                    name: "k".to_string(),
+                    span: None,
+                }]
+            } else {
+                Vec::new()
+            },
+            aggr_exprs: vec![aggr],
+            output_schema: if grouped {
+                vec![columns[0].clone(), out]
+            } else {
+                vec![out]
+            },
+            output_order: None,
+            estimated_groups: None,
+            memory_pool,
+        }
+    }
+
+    /// Every DISTINCT aggregate path (single partition and parallel, with
+    /// and without GROUP BY) reserves its distinct values against the pool:
+    /// it fails with ResourceExhausted under a tight pool instead of growing
+    /// untracked.
+    #[tokio::test]
+    async fn distinct_aggregates_fail_fast_under_a_tight_pool() {
+        use crate::memory_pool::{GreedyMemoryPool, MemoryPool};
+        for grouped in [false, true] {
+            for partitions in [1, 4] {
+                let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024));
+                let agg = count_distinct_strings(grouped, partitions, pool.clone());
+                match agg.execute(0).await {
+                    Err(ExecutionError::ResourceExhausted(_)) => {}
+                    Err(other) => panic!(
+                        "grouped={grouped} partitions={partitions}: expected \
+                         ResourceExhausted, got {other:?}"
+                    ),
+                    Ok(_) => panic!(
+                        "grouped={grouped} partitions={partitions}: 20 000 distinct strings \
+                         fit in a 64 KiB pool, so the distinct set is not reserved"
+                    ),
+                }
+                assert_eq!(pool.reserved(), 0, "a failed aggregate releases its bytes");
+            }
+        }
+    }
+
+    /// Percentiles buffer every value of a group: under a tight pool they
+    /// fail with ResourceExhausted instead of growing untracked, and with
+    /// room their peak reservation covers the values.
+    #[tokio::test]
+    async fn percentiles_reserve_the_values_they_buffer() {
+        use crate::memory_pool::{GreedyMemoryPool, MemoryPool};
+        for grouped in [false, true] {
+            for partitions in [1, 4] {
+                let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024));
+                let agg = median_of_strings(grouped, partitions, pool.clone());
+                // The error surfaces from `execute` or while collecting.
+                let tight = match agg.execute(0).await {
+                    Ok(stream) => collect_stream(stream)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("{e:?}")),
+                    Err(e) => Err(format!("{e:?}")),
+                };
+                assert!(
+                    tight
+                        .as_ref()
+                        .is_err_and(|e| e.contains("ResourceExhausted")),
+                    "grouped={grouped} partitions={partitions}: expected \
+                     ResourceExhausted, got {tight:?}"
+                );
+                assert_eq!(pool.reserved(), 0, "a failed aggregate releases its bytes");
+
+                let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(256 << 20));
+                let agg = median_of_strings(grouped, partitions, pool.clone());
+                let batches = collect_stream(agg.execute(0).await.unwrap()).await.unwrap();
+                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                assert_eq!(rows, if grouped { 4 } else { 1 });
+                assert!(
+                    pool.reserved_peak() > 20_000 * 23,
+                    "grouped={grouped} partitions={partitions}: peak {} does not cover \
+                     the buffered values",
+                    pool.reserved_peak()
+                );
+                assert_eq!(pool.reserved(), 0, "the aggregate releases its bytes");
+            }
+        }
+    }
+
+    /// With room in the pool, the DISTINCT aggregate returns the right
+    /// counts, its peak reservation covers the distinct values, and every
+    /// byte is released afterwards.
+    #[tokio::test]
+    async fn distinct_aggregates_reserve_their_values_and_release_them() {
+        use crate::memory_pool::{GreedyMemoryPool, MemoryPool};
+        for grouped in [false, true] {
+            for partitions in [1, 4] {
+                let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(256 << 20));
+                let agg = count_distinct_strings(grouped, partitions, pool.clone());
+                let batches = collect_stream(agg.execute(0).await.unwrap()).await.unwrap();
+                let counts: Vec<i64> = batches
+                    .iter()
+                    .flat_map(|b| {
+                        let column = b.column(b.num_columns() - 1);
+                        let counts = column.as_any().downcast_ref::<Int64Array>().unwrap();
+                        counts.values().to_vec()
+                    })
+                    .collect();
+                let expected = if grouped {
+                    vec![5_000; 4]
+                } else {
+                    vec![20_000]
+                };
+                assert_eq!(
+                    counts, expected,
+                    "grouped={grouped} partitions={partitions}"
+                );
+                // 20 000 strings of 23 bytes each, plus their set entries.
+                assert!(
+                    pool.reserved_peak() > 20_000 * 23,
+                    "grouped={grouped} partitions={partitions}: peak {} does not cover \
+                     the distinct values",
+                    pool.reserved_peak()
+                );
+                assert_eq!(pool.reserved(), 0, "the aggregate releases its bytes");
+            }
+        }
+    }
+
+    /// Merging parallel partials does not count the same state twice: the
+    /// parallel peak stays within 10% of the single-partition peak (it was
+    /// 25% over when each partial stayed reserved through its merge).
+    #[tokio::test]
+    async fn a_parallel_distinct_merge_counts_its_state_once() {
+        use crate::memory_pool::{GreedyMemoryPool, MemoryPool};
+        for grouped in [false, true] {
+            let peak = |partitions| async move {
+                let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(256 << 20));
+                let agg = count_distinct_strings(grouped, partitions, pool.clone());
+                collect_stream(agg.execute(0).await.unwrap()).await.unwrap();
+                pool.reserved_peak()
+            };
+            let (single, parallel) = (peak(1).await, peak(4).await);
+            assert!(
+                parallel * 10 < single * 11,
+                "grouped={grouped}: parallel peak {parallel} vs single {single}"
+            );
+        }
     }
 }
 

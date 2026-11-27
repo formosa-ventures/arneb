@@ -27,7 +27,6 @@ pub(crate) type MetadataResult = Result<MetadataResponse, String>;
 pub(crate) async fn try_handle_metadata(
     sql: &str,
     catalog_manager: &CatalogManager,
-    user: Option<&str>,
 ) -> Option<MetadataResult> {
     let lower = sql.trim().to_lowercase();
 
@@ -36,23 +35,19 @@ pub(crate) async fn try_handle_metadata(
         return Some(handle_version());
     }
 
-    // information_schema
-    if lower.contains("information_schema.tables") {
-        return Some(handle_info_tables(catalog_manager).await);
-    }
-    if lower.contains("information_schema.columns") {
-        return Some(handle_info_columns(catalog_manager).await);
-    }
-    if lower.contains("information_schema.schemata") {
-        return Some(handle_info_schemata(catalog_manager).await);
-    }
-
-    // current_database(), current_schema(), current_user
-    if lower.contains("current_database()")
-        || lower.contains("current_schema()")
-        || lower.contains("current_user")
-    {
-        return Some(handle_current_info(&lower, catalog_manager, user));
+    // information_schema: the fixed whole-table results, reached only as
+    // the fallback for a statement naming these tables that the engine
+    // could not run (the handler sends those to the engine first).
+    if crate::pg_catalog::references_information_schema(sql) {
+        if lower.contains("information_schema.tables") {
+            return Some(handle_info_tables(catalog_manager).await);
+        }
+        if lower.contains("information_schema.columns") {
+            return Some(handle_info_columns(catalog_manager).await);
+        }
+        if lower.contains("information_schema.schemata") {
+            return Some(handle_info_schemata(catalog_manager).await);
+        }
     }
 
     // Transactions: every statement is read-only and autocommitted, so
@@ -145,7 +140,7 @@ fn make_result(schema: Arc<Schema>, batch: RecordBatch) -> MetaResult {
 // ---------------------------------------------------------------------------
 
 /// The PostgreSQL version Arneb reports (`server_version`).
-const PG_SERVER_VERSION: &str = "14.0";
+const PG_SERVER_VERSION: &str = arneb_common::pg_settings::SERVER_VERSION;
 
 /// The parameters sent at startup. They agree with [`show_value`]:
 /// drivers read `server_version` from here (psycopg2, JDBC) and others
@@ -582,37 +577,6 @@ async fn handle_info_schemata(catalog_manager: &CatalogManager) -> MetaResult {
 }
 
 // ---------------------------------------------------------------------------
-// current_database() / current_schema() / current_user
-// ---------------------------------------------------------------------------
-
-fn handle_current_info(
-    lower: &str,
-    catalog_manager: &CatalogManager,
-    user: Option<&str>,
-) -> MetaResult {
-    // current_schema() reflects the connection's search_path; current_user
-    // is the connection's user; current_database() is the default catalog.
-    let (name, value) = if lower.contains("current_schema()") {
-        ("current_schema", catalog_manager.default_schema())
-    } else if lower.contains("current_database()") {
-        ("current_database", catalog_manager.default_catalog())
-    } else {
-        ("current_user", user.unwrap_or(""))
-    };
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        name,
-        ArrowDataType::Utf8,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(StringArray::from(vec![value.to_string()]))],
-    )
-    .map_err(|e| e.to_string())?;
-    make_result(schema, batch)
-}
-
-// ---------------------------------------------------------------------------
 // SET / SHOW / RESET — session commands
 // ---------------------------------------------------------------------------
 
@@ -634,22 +598,10 @@ fn transaction_tag(lower: &str) -> Option<&'static str> {
     }
 }
 
-/// PostgreSQL's value for a setting clients commonly read with `SHOW`.
+/// PostgreSQL's value for a setting clients commonly read with `SHOW`
+/// (the same table `current_setting()` reads); empty when Arneb has none.
 fn show_value(name: &str) -> &'static str {
-    match name {
-        "server_version" => PG_SERVER_VERSION,
-        "server_version_num" => "140000",
-        "standard_conforming_strings" | "integer_datetimes" => "on",
-        "transaction isolation level" | "default_transaction_isolation" => "read committed",
-        "transaction_read_only" | "default_transaction_read_only" | "is_superuser" => "off",
-        "client_encoding" | "server_encoding" => "UTF8",
-        "datestyle" => "ISO, YMD",
-        "intervalstyle" => "postgres",
-        "timezone" => "Etc/UTC",
-        "max_identifier_length" => "63",
-        "lc_collate" | "lc_ctype" => "C",
-        _ => "",
-    }
+    arneb_common::pg_settings::server_setting(name).unwrap_or("")
 }
 
 fn handle_show(lower: &str) -> MetaResult {

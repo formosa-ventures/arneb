@@ -23,6 +23,11 @@ type FlightBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, FlightErr
 /// How many times a stream that broke on a transport error is reopened
 /// before the error is surfaced (#139).
 const MAX_RESUME_ATTEMPTS: usize = 3;
+
+/// First wait before asking again for a task output that is not ready yet;
+/// it doubles on each miss up to 2 s.
+const FIRST_FETCH_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Client that fetches RecordBatches from a remote Arrow Flight server.
 #[derive(Debug, Clone)]
 pub struct ExchangeClient {
@@ -76,7 +81,11 @@ impl ExchangeClient {
         partition_id: usize,
     ) -> Result<SendableRecordBatchStream, ExecutionError> {
         let ticket_text = format!("{task_id}:{partition_id}");
-        let mut backoff = std::time::Duration::from_millis(50);
+        // A task registers its output buffer as soon as its physical plan
+        // is built, a few ms after submission, and the consumer of the
+        // last-submitted stage (the coordinator) asks right away. Start
+        // small so that first miss costs ms, not a 50 ms sleep per stage.
+        let mut backoff = FIRST_FETCH_BACKOFF;
         let backoff_max = std::time::Duration::from_secs(2);
 
         // Grace period for the NotFound case (task not yet started on

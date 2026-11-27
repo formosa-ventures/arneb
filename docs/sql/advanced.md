@@ -246,7 +246,11 @@ ORDER BY COUNT(*) DESC;
 `GROUP BY ROLLUP(a, b)` adds subtotal rows: it groups by `(a, b)`, then by
 `(a)`, then over all rows, with the rolled-up keys set to NULL.
 `GROUPING(x)` is 1 on rows where `x` was rolled up and 0 otherwise, which
-tells a subtotal's NULL apart from a NULL key value.
+tells a subtotal's NULL apart from a NULL key value. With several arguments,
+`GROUPING(x, y)` is Trino's bit set: one bit per argument, the first
+argument the most significant, so it equals `GROUPING(x) * 2 + GROUPING(y)`.
+Under a plain `GROUP BY` every key is grouped and `GROUPING` is 0. Each
+argument must be a grouping key.
 
 ```sql
 SELECT
@@ -264,12 +268,31 @@ Limits:
 - `ROLLUP(...)` must be the whole GROUP BY clause: one ROLLUP, not mixed
   with plain keys, and no composite elements such as `ROLLUP((a, b), c)`.
 - `CUBE` and `GROUPING SETS` are not supported.
-- `GROUPING` takes one argument and works only with `ROLLUP`; Trino's
-  multi-argument form and `GROUPING` over a plain GROUP BY are rejected.
+
+## Arrays
+
+Arneb has one-dimensional arrays with PostgreSQL's syntax, so clients that
+read or send arrays over pgwire (SQLAlchemy's reflection, Metabase, ORMs)
+work as they do against PostgreSQL.
+
+| Form | Example | Reference |
+|------|---------|-----------|
+| `ARRAY[...]` literal | `SELECT ARRAY[1, 2.5]` → `{1,2.5}` | [Expressions](/sql/expressions#array-constructor-and-any-all) |
+| Array text cast | `SELECT '{1,NULL,3}'::int[]` | [Expressions](/sql/expressions#array-constructor-and-any-all) |
+| `= ANY` / `<> ALL` | `WHERE x = ANY (ARRAY[1, 2])`, `WHERE id = ANY ($1)` | [Expressions](/sql/expressions#array-constructor-and-any-all) |
+| `ARRAY_AGG` | `array_agg(name ORDER BY name DESC)` | [Functions](/sql/functions#array-and-json-functions) |
+| `UNNEST`, `GENERATE_SUBSCRIPTS` | `SELECT unnest(ARRAY[1, 2, 3])` | [Functions](/sql/functions#array-and-json-functions) |
+
+Not yet supported: `UNNEST` in `FROM` (`CROSS JOIN UNNEST`), `WITH
+ORDINALITY`, array functions such as `cardinality`, and multi-dimensional
+arrays.
 
 ## Aggregate Functions
 
-COUNT, SUM, AVG, MIN and MAX, plus Trino's variance family:
+COUNT, SUM, AVG, MIN and MAX; `BOOL_AND` and `BOOL_OR` (NULL inputs are
+skipped, and a group with none left is NULL); `ARRAY_AGG` (see
+[Array and JSON functions](/sql/functions#array-and-json-functions)); and
+Trino's variance family:
 
 | Function | Result |
 |----------|--------|

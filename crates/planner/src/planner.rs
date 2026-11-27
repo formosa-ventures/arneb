@@ -13,6 +13,9 @@ use crate::plan::{
     null_extend, JoinCondition, LogicalPlan, PlanExpr, SortExpr, SrfKind, WindowFunctionDef,
 };
 
+mod select_subquery;
+use select_subquery::SELECT_SUBQUERY_QUALIFIER;
+
 static CTE_SELF_AGG_WINDOW_TEST_OVERRIDE: OnceLock<std::sync::Mutex<Option<bool>>> =
     OnceLock::new();
 
@@ -48,6 +51,10 @@ pub struct QueryPlanner<'a> {
     /// scope. Scoping is enforced via snapshot-restore around each
     /// `plan_query` call.
     cte_plans: std::sync::Mutex<std::collections::HashMap<String, LogicalPlan>>,
+    /// `$N` placeholders found in LIMIT/OFFSET. They leave no node in the
+    /// plan, so the analyzer never sees them; they are seeded into the
+    /// analyzer context as int8, which is what PostgreSQL reports.
+    limit_params: std::sync::Mutex<std::collections::HashMap<usize, DataType>>,
 }
 
 /// Tracks the available columns from resolved tables during planning.
@@ -60,6 +67,10 @@ struct PlanningContext {
     /// their table qualifier, and left out of `*`, so the joined column
     /// appears once (the left copy), as in PostgreSQL and Trino.
     merged: std::collections::HashSet<usize>,
+    /// The `GROUP BY` keys of the aggregate whose output this context
+    /// describes (empty otherwise), for `GROUPING(...)` under a plain
+    /// `GROUP BY`.
+    group_by: Vec<ast::Expr>,
 }
 
 impl PlanningContext {
@@ -67,6 +78,7 @@ impl PlanningContext {
         Self {
             columns: Vec::new(),
             merged: std::collections::HashSet::new(),
+            group_by: Vec::new(),
         }
     }
 
@@ -211,6 +223,7 @@ impl<'a> QueryPlanner<'a> {
         Self {
             catalog,
             cte_plans: std::sync::Mutex::new(std::collections::HashMap::new()),
+            limit_params: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -239,6 +252,9 @@ impl<'a> QueryPlanner<'a> {
     ) -> Result<(LogicalPlan, AnalyzerContext), PlanError> {
         let plan = self.plan_statement_inner(stmt).await?;
         let mut ctx = AnalyzerContext::new();
+        if let Ok(limit_params) = self.limit_params.lock() {
+            ctx.param_types.extend(limit_params.clone());
+        }
         // Populate per-query statistics for cost-based passes. Walks
         // every `TableScan` in the plan, asks each `TableProvider` for
         // its statistics, and seeds `AnalyzerContext::catalog_stats`.
@@ -512,8 +528,8 @@ impl<'a> QueryPlanner<'a> {
         }
 
         // LIMIT / OFFSET
-        let limit = self.eval_limit_expr(query.limit.as_deref())?;
-        let offset = self.eval_limit_expr(query.offset.as_deref())?;
+        let limit = self.eval_limit_expr(query.limit.as_deref()).await?;
+        let offset = self.eval_limit_expr(query.offset.as_deref()).await?;
         if limit.is_some() || offset.is_some() {
             plan = LogicalPlan::Limit {
                 input: Box::new(plan),
@@ -549,7 +565,9 @@ impl<'a> QueryPlanner<'a> {
                 }
             } else if !matches!(input, LogicalPlan::Aggregate { .. }) {
                 let (_, from_ctx) = self.plan_from(&body.from).await?;
-                if input_ctx.columns.len() == from_ctx.columns.len() {
+                // Columns appended above the FROM (decorrelated SELECT-list
+                // subqueries) leave the FROM columns as a prefix.
+                if input_ctx.columns.len() >= from_ctx.columns.len() {
                     for (col, source) in input_ctx.columns.iter_mut().zip(from_ctx.columns) {
                         col.0 = source.0;
                     }
@@ -888,6 +906,7 @@ impl<'a> QueryPlanner<'a> {
                 };
                 ctx.columns.push((qualifier, col.clone()));
             }
+            ctx.group_by = group_by_ast.clone();
 
             // HAVING (applied after aggregation)
             // Rewrite aggregate expressions in HAVING to column references
@@ -902,10 +921,28 @@ impl<'a> QueryPlanner<'a> {
             }
         }
 
+        // 3a. Correlated scalar subqueries in the SELECT list: each becomes
+        // a LEFT JOIN below the projection, and the item reads its columns.
+        let decorrelated_items;
+        let select_items: &[ast::SelectItem] = match Box::pin(self.rewrite_select_list_subqueries(
+            &body.projection,
+            &ctx,
+            has_aggregates.then_some(group_by_ast.len()),
+        ))
+        .await?
+        {
+            Some((items, joins)) => {
+                plan = Box::pin(self.attach_select_subquery_joins(plan, &mut ctx, joins)).await?;
+                decorrelated_items = items;
+                &decorrelated_items
+            }
+            None => &body.projection,
+        };
+
         // 3b. Window functions: computed after WHERE / GROUP BY / HAVING and
         // before the projection (ORDER BY / LIMIT are applied above it).
         let mut window_calls = Vec::new();
-        for item in &body.projection {
+        for item in select_items {
             if let ast::SelectItem::UnnamedExpr(expr)
             | ast::SelectItem::ExprWithAlias { expr, .. } = item
             {
@@ -923,16 +960,15 @@ impl<'a> QueryPlanner<'a> {
         // whole SELECT items: evaluated by a ProjectSet below the projection,
         // which then reads each one as a column.
         let srf_items;
-        let projection_items = if body.projection.iter().any(|i| srf_call(i).is_some()) {
+        let projection_items = if select_items.iter().any(|i| srf_call(i).is_some()) {
             let num_group_by = has_aggregates.then_some(group_by_ast.len());
             let (set_plan, items) =
-                Box::pin(self.plan_project_set(plan, &mut ctx, &body.projection, num_group_by))
-                    .await?;
+                Box::pin(self.plan_project_set(plan, &mut ctx, select_items, num_group_by)).await?;
             plan = set_plan;
             srf_items = items;
             &srf_items
         } else {
-            &body.projection
+            select_items
         };
 
         // 4. Projection (SELECT list)
@@ -1104,6 +1140,38 @@ impl<'a> QueryPlanner<'a> {
         Ok(plan)
     }
 
+    /// `generate_subscripts`' dimension must be a constant that folds to 1
+    /// (`1`, `1::INTEGER`, ...): Arneb arrays have one dimension. Out of line
+    /// so `plan_project_set`'s future stays small.
+    #[inline(never)]
+    async fn check_generate_subscripts_dim(
+        &self,
+        dim: &ast::Expr,
+        ctx: &PlanningContext,
+    ) -> Result<(), PlanError> {
+        let planned = Box::pin(self.plan_expr(dim, ctx)).await?;
+        let is_one = |e: &PlanExpr| {
+            matches!(
+                e,
+                PlanExpr::Literal {
+                    value: ScalarValue::Int32(1) | ScalarValue::Int64(1),
+                    ..
+                }
+            )
+        };
+        match crate::optimizer::fold_constants(planned) {
+            Ok(e) if is_one(&e) => Ok(()),
+            // `1::SMALLINT`: there is no SMALLINT literal, so the fold keeps
+            // the (range-checked) cast over a BIGINT literal.
+            Ok(PlanExpr::Cast {
+                expr,
+                data_type: DataType::Int8 | DataType::Int16,
+                ..
+            }) if is_one(&expr) => Ok(()),
+            _ => Err(generate_subscripts_dim_error()),
+        }
+    }
+
     /// Plans the SELECT items that are set-returning function calls into a
     /// `ProjectSet` above `plan`. Each SRF becomes a column appended to `ctx`
     /// (under [`SRF_QUALIFIER`]), and the returned SELECT list reads it as a
@@ -1126,6 +1194,11 @@ impl<'a> QueryPlanner<'a> {
                 continue;
             };
             let array = srf_array_argument(kind, call)?;
+            if let Some(dim) =
+                generate_subscripts_dim(call).filter(|_| kind == SrfKind::GenerateSubscripts)
+            {
+                self.check_generate_subscripts_dim(dim, ctx).await?;
+            }
             let array = match num_group_by {
                 Some(n) => self.rewrite_aggregates_as_columns(array, ctx, n),
                 None => array.clone(),
@@ -1173,12 +1246,19 @@ impl<'a> QueryPlanner<'a> {
                 },
                 span: arneb_sql_parser::Span::empty(),
             };
+            let (ast::SelectItem::UnnamedExpr(item_expr)
+            | ast::SelectItem::ExprWithAlias {
+                expr: item_expr, ..
+            }) = item
+            else {
+                unreachable!("srf_call matches expression items");
+            };
             let alias = match item {
                 ast::SelectItem::ExprWithAlias { alias, .. } => alias.clone(),
-                _ => kind.name().to_string(),
+                _ => srf_item_field(item_expr).unwrap_or(kind.name()).to_string(),
             };
             rewritten.push(ast::SelectItem::ExprWithAlias {
-                expr: reference,
+                expr: replace_srf_call(item_expr, reference),
                 alias,
             });
         }
@@ -1566,6 +1646,85 @@ impl<'a> QueryPlanner<'a> {
         })
     }
 
+    /// `GROUPING(k1, ..., kn)`, as in Trino: a BIGINT bit set with one bit per
+    /// argument, the first argument the most significant, set when that key
+    /// is rolled up (not part of the row's grouping). Under `ROLLUP` each
+    /// key's bit is its `GROUPING(key)` marker column; under a plain
+    /// `GROUP BY` every key is always grouped, so its bit is 0. An argument
+    /// that is not a grouping key is an error.
+    async fn plan_grouping(
+        &self,
+        args: &[ast::FunctionArg],
+        ctx: &PlanningContext,
+        span: Option<arneb_sql_parser::Span>,
+    ) -> Result<PlanExpr, PlanError> {
+        if args.is_empty() {
+            return Err(PlanError::invalid_expression(
+                "GROUPING requires at least one grouping expression",
+            ));
+        }
+        let mut bits = Vec::with_capacity(args.len());
+        for arg in args {
+            let ast::FunctionArg::Unnamed(key) = arg else {
+                return Err(PlanError::invalid_expression(
+                    "GROUPING takes grouping expressions as arguments",
+                ));
+            };
+            let marker = format!("GROUPING({})", format_ast_unqualified(key));
+            if let Some((index, (_, col))) = ctx
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, (_, col))| col.name.eq_ignore_ascii_case(&marker))
+            {
+                bits.push(Some(PlanExpr::Column {
+                    index,
+                    name: col.name.clone(),
+                    span,
+                }));
+                continue;
+            }
+            // Not a ROLLUP key: it must be a key of a plain GROUP BY.
+            if ctx.group_by.is_empty() || !self.is_group_by_expr(key, &ctx.group_by) {
+                return Err(PlanError::invalid_expression(format!(
+                    "GROUPING argument {} is not a grouping expression",
+                    format_ast_unqualified(key)
+                )));
+            }
+            bits.push(None);
+        }
+        let n = bits.len();
+        let literal = |value: i64| PlanExpr::Literal {
+            value: ScalarValue::Int64(value),
+            span,
+        };
+        let mut result: Option<PlanExpr> = None;
+        for (i, bit) in bits.into_iter().enumerate() {
+            let Some(marker) = bit else { continue };
+            let weight = 1i64 << (n - 1 - i);
+            let term = if weight == 1 {
+                marker
+            } else {
+                PlanExpr::BinaryOp {
+                    left: Box::new(marker),
+                    op: ast::BinaryOp::Multiply,
+                    right: Box::new(literal(weight)),
+                    span,
+                }
+            };
+            result = Some(match result {
+                None => term,
+                Some(acc) => PlanExpr::BinaryOp {
+                    left: Box::new(acc),
+                    op: ast::BinaryOp::Plus,
+                    right: Box::new(term),
+                    span,
+                },
+            });
+        }
+        Ok(result.unwrap_or_else(|| literal(0)))
+    }
+
     /// Decorrelate `<expr> IN (subquery)` / `<expr> NOT IN (subquery)`.
     /// Currently only the **uncorrelated** form is supported — the
     /// subquery may reference its own FROM tables but not the outer
@@ -1934,20 +2093,44 @@ impl<'a> QueryPlanner<'a> {
             };
         }
 
+        self.build_aggregate_leftjoin_spec(
+            filtered_inner,
+            &inner_ctx,
+            correlations,
+            &proj_expr,
+            empty_value,
+            &suffix.to_string(),
+        )
+        .await
+    }
+
+    /// Group a filtered correlated subquery input by its inner correlation
+    /// keys and project `[corr_key_0, ..., value]` over the aggregates of
+    /// `proj_expr`. `correlations` are `(outer, inner)` pairs. `None` when
+    /// the projection has no aggregate.
+    async fn build_aggregate_leftjoin_spec(
+        &self,
+        filtered_inner: LogicalPlan,
+        inner_ctx: &PlanningContext,
+        correlations: Vec<(ast::Expr, ast::Expr)>,
+        proj_expr: &ast::Expr,
+        empty_value: ast::Expr,
+        suffix: &str,
+    ) -> Result<Option<LeftJoinSpec>, PlanError> {
         // Decorrelate by GROUP BY-ing on every inner correlation
         // column. Multi-correlation (Q20) lands here naturally — the
         // outer LEFT JOIN later AND-s all the key pairs.
         let mut group_by_exprs: Vec<PlanExpr> = Vec::with_capacity(correlations.len());
         let mut inner_corr_infos: Vec<ColumnInfo> = Vec::with_capacity(correlations.len());
         for (_, inner_ast) in &correlations {
-            let p = self.plan_expr(inner_ast, &inner_ctx).await?;
-            inner_corr_infos.push(self.expr_to_column_info(&p, &inner_ctx));
+            let p = self.plan_expr(inner_ast, inner_ctx).await?;
+            inner_corr_infos.push(self.expr_to_column_info(&p, inner_ctx));
             group_by_exprs.push(p);
         }
 
         // Collect aggregates referenced by the projection expression.
         let mut aggrs: Vec<PlanExpr> = Vec::new();
-        self.extract_aggregates(&proj_expr, &inner_ctx, &mut aggrs)
+        self.extract_aggregates(proj_expr, inner_ctx, &mut aggrs)
             .await?;
         if aggrs.is_empty() {
             // No aggregate ⇒ the scalar subquery isn't a single-row
@@ -1957,7 +2140,7 @@ impl<'a> QueryPlanner<'a> {
 
         let mut agg_schema: Vec<ColumnInfo> = inner_corr_infos.clone();
         for a in &aggrs {
-            agg_schema.push(self.expr_to_column_info(a, &inner_ctx));
+            agg_schema.push(self.expr_to_column_info(a, inner_ctx));
         }
         let agg_plan = LogicalPlan::Aggregate {
             input: Box::new(filtered_inner),
@@ -1972,7 +2155,7 @@ impl<'a> QueryPlanner<'a> {
         }
         let num_group_by = correlations.len();
         let rewritten_proj =
-            self.rewrite_aggregates_as_columns(&proj_expr, &post_agg_ctx, num_group_by);
+            self.rewrite_aggregates_as_columns(proj_expr, &post_agg_ctx, num_group_by);
         let projected_scalar = self.plan_expr(&rewritten_proj, &post_agg_ctx).await?;
         let value_name = format!("__corr_scalar_{suffix}");
         let scalar_info = ColumnInfo {
@@ -2164,7 +2347,10 @@ impl<'a> QueryPlanner<'a> {
 
         // Multiple FROM items → implicit CROSS JOIN
         for twj in &from[1..] {
-            let (right_plan, right_ctx) = self.plan_table_with_joins(twj).await?;
+            let (right_plan, right_ctx) = self
+                .plan_table_with_joins(twj)
+                .await
+                .map_err(|e| select_subquery::lateral_reference_error(e, &ctx))?;
             ctx.columns.extend(right_ctx.columns);
             plan = LogicalPlan::Join {
                 left: Box::new(plan),
@@ -2186,7 +2372,10 @@ impl<'a> QueryPlanner<'a> {
         let (mut plan, mut ctx) = self.plan_table_factor(&twj.relation).await?;
 
         for join in &twj.joins {
-            let (right_plan, right_ctx) = self.plan_table_factor(&join.relation).await?;
+            let (right_plan, right_ctx) = self
+                .plan_table_factor(&join.relation)
+                .await
+                .map_err(|e| select_subquery::lateral_reference_error(e, &ctx))?;
             let left_len = ctx.columns.len();
             let using = match &join.condition {
                 ast::JoinCondition::Using(columns) => {
@@ -2435,7 +2624,8 @@ impl<'a> QueryPlanner<'a> {
                 );
                 // The parser reads a bare `current_schema` as a column.
                 if resolved.is_err() && col_ref.table.is_none() {
-                    if let Some(literal) = session_literal(self.catalog, &col_ref.name, node_span)
+                    if let Some(literal) =
+                        session_literal(self.catalog, &col_ref.name, false, node_span)
                     {
                         return Ok(literal);
                     }
@@ -2453,12 +2643,39 @@ impl<'a> QueryPlanner<'a> {
             }),
             ast::Expr::BinaryOp {
                 left, op, right, ..
-            } => Ok(PlanExpr::BinaryOp {
-                left: Box::new(self.plan_expr(left, ctx).await?),
-                op: *op,
-                right: Box::new(self.plan_expr(right, ctx).await?),
-                span: node_span,
-            }),
+            } => {
+                // `x ± INTERVAL` and `INTERVAL + x`: lowered by `x`'s type.
+                let interval = match (as_interval(left), op, as_interval(right)) {
+                    (None, ast::BinaryOp::Plus | ast::BinaryOp::Minus, Some((value, unit, span))) => {
+                        Some((left.as_ref(), value, unit, span, false))
+                    }
+                    (Some((value, unit, span)), ast::BinaryOp::Plus, None) => {
+                        Some((right.as_ref(), value, unit, span, true))
+                    }
+                    _ => None,
+                };
+                if let Some((operand, value, unit, interval_span, interval_first)) = interval {
+                    let operand = self.plan_expr(operand, ctx).await?;
+                    return plan_interval_arithmetic(
+                        operand,
+                        IntervalOperand {
+                            op: *op,
+                            value,
+                            unit,
+                            span: interval_span,
+                            first: interval_first,
+                        },
+                        ctx,
+                        node_span,
+                    );
+                }
+                Ok(PlanExpr::BinaryOp {
+                    left: Box::new(self.plan_expr(left, ctx).await?),
+                    op: *op,
+                    right: Box::new(self.plan_expr(right, ctx).await?),
+                    span: node_span,
+                })
+            }
             ast::Expr::UnaryOp { op, expr, .. } => Ok(PlanExpr::UnaryOp {
                 op: *op,
                 expr: Box::new(self.plan_expr(expr, ctx).await?),
@@ -2483,32 +2700,18 @@ impl<'a> QueryPlanner<'a> {
                     ));
                 }
                 if name.eq_ignore_ascii_case("GROUPING") {
-                    if let [ast::FunctionArg::Unnamed(key)] = args.as_slice() {
-                        let marker = format!("GROUPING({})", format_ast_unqualified(key));
-                        if let Some((index, (_, col))) = ctx
-                            .columns
-                            .iter()
-                            .enumerate()
-                            .find(|(_, (_, col))| col.name.eq_ignore_ascii_case(&marker))
-                        {
-                            return Ok(PlanExpr::Column {
-                                index,
-                                name: col.name.clone(),
-                                span: node_span,
-                            });
-                        }
-                    }
-                    return Err(PlanError::invalid_expression(
-                        "GROUPING requires one ROLLUP grouping expression",
-                    ));
+                    return self.plan_grouping(args, ctx, node_span).await;
                 }
                 if args.is_empty() {
-                    if let Some(literal) = session_literal(self.catalog, name, node_span) {
+                    if let Some(literal) = session_literal(self.catalog, name, true, node_span) {
                         return Ok(literal);
                     }
                 }
                 if name.eq_ignore_ascii_case("regclass") {
-                    return regclass_literal(self.catalog, args, node_span);
+                    return Box::pin(self.plan_regclass(args, ctx, node_span)).await;
+                }
+                if name.eq_ignore_ascii_case("json_build_object") && !args.len().is_multiple_of(2) {
+                    return Err(odd_json_build_object_args(node_span));
                 }
                 if name.eq_ignore_ascii_case("regtype") {
                     return match args.as_slice() {
@@ -2581,11 +2784,30 @@ impl<'a> QueryPlanner<'a> {
                     };
                     plan_args.push(plan_arg);
                 }
+                if name.eq_ignore_ascii_case("current_schemas") {
+                    if plan_args.len() != 1 {
+                        return Err(current_schemas_arity_error(plan_args.len(), node_span));
+                    }
+                    // The session's search path, as `current_schema` reads it.
+                    plan_args.push(PlanExpr::Literal {
+                        value: ScalarValue::Utf8(self.catalog.default_schema().to_string()),
+                        span: None,
+                    });
+                }
+                if let Some(kind) = privilege_object_kind(name) {
+                    return Box::pin(self.plan_has_privilege(kind, name, plan_args, node_span))
+                        .await;
+                }
                 let plan_order_by = if order_by.is_empty() {
                     None
                 } else {
                     Some(Box::new(self.plan_call_order_by(order_by, ctx).await?))
                 };
+                if is_percentile(name) {
+                    let schema: Vec<ColumnInfo> =
+                        ctx.columns.iter().map(|(_, col)| col.clone()).collect();
+                    check_percentile_call(name, &plan_args, &schema, node_span)?;
+                }
                 Ok(PlanExpr::Function {
                     name: name.clone(),
                     args: plan_args,
@@ -2634,14 +2856,22 @@ impl<'a> QueryPlanner<'a> {
             }
             ast::Expr::Cast {
                 expr, data_type, ..
-            } => Ok(PlanExpr::Cast {
-                expr: Box::new(self.plan_expr(expr, ctx).await?),
-                data_type: data_type.clone(),
-                span: node_span,
-            }),
+            } => {
+                if is_regclass_to_text(expr, data_type) {
+                    return Box::pin(self.plan_regclass_name(expr, ctx, node_span)).await;
+                }
+                Ok(PlanExpr::Cast {
+                    expr: Box::new(self.plan_expr(expr, ctx).await?),
+                    data_type: data_type.clone(),
+                    span: node_span,
+                })
+            }
             ast::Expr::Nested { expr: inner, .. } => self.plan_expr(inner, ctx).await,
             ast::Expr::Subquery { query, .. } => {
-                let subplan = self.plan_query(query).await?;
+                let subplan = self
+                    .plan_query(query)
+                    .await
+                    .map_err(|e| select_subquery::outer_reference_error(e, ctx))?;
                 Ok(PlanExpr::ScalarSubquery {
                     subplan: Box::new(subplan),
                     span: node_span,
@@ -2725,6 +2955,13 @@ impl<'a> QueryPlanner<'a> {
                 type_hint: None,
                 span: node_span,
             }),
+            ast::Expr::Interval { .. } => Err(interval_outside_arithmetic(node_span)),
+            ast::Expr::Subscript { expr, index, .. } => {
+                Box::pin(self.plan_subscript(expr, index, ctx)).await
+            }
+            ast::Expr::FieldAccess { expr, field, .. } => {
+                Box::pin(self.plan_field_access(expr, field, ctx)).await
+            }
         }
     }
 
@@ -2741,7 +2978,12 @@ impl<'a> QueryPlanner<'a> {
             match item {
                 ast::SelectItem::UnnamedExpr(expr) => {
                     let plan_expr = self.plan_expr(expr, ctx).await?;
-                    let col_info = self.expr_to_column_info(&plan_expr, ctx);
+                    let mut col_info = self.expr_to_column_info(&plan_expr, ctx);
+                    if matches!(plan_expr, PlanExpr::Literal { .. }) {
+                        if let Some(name) = session_function_name(expr) {
+                            col_info.name = name;
+                        }
+                    }
                     exprs.push(plan_expr);
                     schema.push(col_info);
                 }
@@ -2757,6 +2999,7 @@ impl<'a> QueryPlanner<'a> {
                     for (i, (q, col)) in ctx.columns.iter().enumerate() {
                         if q.as_deref() == Some(WINDOW_QUALIFIER)
                             || q.as_deref() == Some(SRF_QUALIFIER)
+                            || q.as_deref() == Some(SELECT_SUBQUERY_QUALIFIER)
                             || ctx.merged.contains(&i)
                         {
                             continue;
@@ -2923,6 +3166,7 @@ impl<'a> QueryPlanner<'a> {
                     for (i, (q, col)) in ctx.columns.iter().enumerate() {
                         if q.as_deref() == Some(WINDOW_QUALIFIER)
                             || q.as_deref() == Some(SRF_QUALIFIER)
+                            || q.as_deref() == Some(SELECT_SUBQUERY_QUALIFIER)
                             || ctx.merged.contains(&i)
                         {
                             continue;
@@ -3020,6 +3264,35 @@ impl<'a> QueryPlanner<'a> {
         false
     }
 
+    /// `array[index]`. The operand and index types are checked by the
+    /// type-coercion pass. Out of line so the recursive `plan_expr` future
+    /// stays small.
+    async fn plan_subscript(
+        &self,
+        array: &ast::Expr,
+        index: &ast::Expr,
+        ctx: &PlanningContext,
+    ) -> Result<PlanExpr, PlanError> {
+        let array = self.plan_expr(array, ctx).await?;
+        let index = self.plan_expr(index, ctx).await?;
+        Ok(PlanExpr::ArrayElement(Box::new((array, index))))
+    }
+
+    /// `(expr).field`: an unknown field of a typed struct operand is a
+    /// plan-time error. Out of line so the recursive `plan_expr` future
+    /// stays small.
+    async fn plan_field_access(
+        &self,
+        expr: &ast::Expr,
+        field: &str,
+        ctx: &PlanningContext,
+    ) -> Result<PlanExpr, PlanError> {
+        let planned = self.plan_expr(expr, ctx).await?;
+        let schema: Vec<ColumnInfo> = ctx.columns.iter().map(|(_, c)| c.clone()).collect();
+        crate::analyzer::check_get_field(plan_expr_type(&planned, &schema).as_ref(), field)?;
+        Ok(PlanExpr::GetField(Box::new((planned, field.to_string()))))
+    }
+
     /// `expr = ANY (array)` / `expr <> ALL (array)` over an array-valued
     /// expression. Out of line so the recursive `plan_expr` future stays small.
     async fn plan_any_all(
@@ -3072,6 +3345,10 @@ impl<'a> QueryPlanner<'a> {
             ast::Expr::AnyAll { expr, array, .. } => {
                 self.contains_aggregate(expr) || self.contains_aggregate(array)
             }
+            ast::Expr::Subscript { expr, index, .. } => {
+                self.contains_aggregate(expr) || self.contains_aggregate(index)
+            }
+            ast::Expr::FieldAccess { expr, .. } => self.contains_aggregate(expr),
             ast::Expr::Case {
                 operand,
                 conditions,
@@ -3300,6 +3577,16 @@ impl<'a> QueryPlanner<'a> {
                 array: Box::new(self.rewrite_aggregates_as_columns(array, ctx, num_group_by)),
                 span: *span,
             },
+            ast::Expr::Subscript { expr, index, span } => ast::Expr::Subscript {
+                expr: Box::new(self.rewrite_aggregates_as_columns(expr, ctx, num_group_by)),
+                index: Box::new(self.rewrite_aggregates_as_columns(index, ctx, num_group_by)),
+                span: *span,
+            },
+            ast::Expr::FieldAccess { expr, field, span } => ast::Expr::FieldAccess {
+                expr: Box::new(self.rewrite_aggregates_as_columns(expr, ctx, num_group_by)),
+                field: field.clone(),
+                span: *span,
+            },
             ast::Expr::Function {
                 name,
                 args,
@@ -3448,10 +3735,16 @@ impl<'a> QueryPlanner<'a> {
                     self.extract_aggregates(e, ctx, out).await?;
                 }
             }
-            ast::Expr::AnyAll { expr, array, .. } => {
+            ast::Expr::AnyAll { expr, array, .. }
+            | ast::Expr::Subscript {
+                expr, index: array, ..
+            } => {
                 for e in [&**expr, &**array] {
                     self.extract_aggregates(e, ctx, out).await?;
                 }
+            }
+            ast::Expr::FieldAccess { expr, .. } => {
+                self.extract_aggregates(expr, ctx, out).await?;
             }
             // `rank() OVER (ORDER BY sum(x))`: the inner aggregate is
             // computed by the Aggregate node below the Window.
@@ -3540,6 +3833,12 @@ impl<'a> QueryPlanner<'a> {
                 data_type: inferred_type(),
                 nullable: true,
             },
+            // PostgreSQL names `(expr).field` after the field.
+            PlanExpr::GetField(pair) => ColumnInfo {
+                name: pair.1.clone(),
+                data_type: inferred_type(),
+                nullable: true,
+            },
             _ => ColumnInfo {
                 name: expr.to_string(),
                 data_type: inferred_type(),
@@ -3557,36 +3856,64 @@ impl<'a> QueryPlanner<'a> {
         ctx
     }
 
-    /// Evaluate a LIMIT/OFFSET expression to a usize.
-    fn eval_limit_expr(&self, expr: Option<&ast::Expr>) -> Result<Option<usize>, PlanError> {
-        match expr {
-            None => Ok(None),
-            Some(ast::Expr::Literal {
-                value: ScalarValue::Int64(n),
-                ..
-            }) => {
-                if *n < 0 {
-                    return Err(PlanError::invalid_expression(
-                        "LIMIT/OFFSET must be non-negative".to_string(),
-                    ));
-                }
-                Ok(Some(*n as usize))
+    /// Evaluate a LIMIT/OFFSET expression to a usize. Any constant that
+    /// folds to an integer is accepted, such as `3`, `CAST(3 AS INTEGER)`
+    /// or `$1::INTEGER` with the parameter already substituted.
+    async fn eval_limit_expr(&self, expr: Option<&ast::Expr>) -> Result<Option<usize>, PlanError> {
+        let Some(expr) = expr else {
+            return Ok(None);
+        };
+        let not_constant = || {
+            PlanError::invalid_expression(
+                "LIMIT/OFFSET must be a constant integer expression".to_string(),
+            )
+        };
+        let planned = self
+            .plan_expr(expr, &PlanningContext::new())
+            .await
+            .map_err(|_| not_constant())?;
+        let folded = crate::optimizer::fold_constants(planned)?;
+        // Describe plans the statement before Bind with its placeholders
+        // still in place, and only reports the output columns. Execution
+        // substitutes the bound text first, so it never reaches this arm.
+        let param_index = |e: &PlanExpr| match e {
+            PlanExpr::Parameter { index, .. } => Some(*index),
+            _ => None,
+        };
+        let placeholder = param_index(&folded).or_else(|| match &folded {
+            PlanExpr::Cast { expr, .. } => param_index(expr),
+            _ => None,
+        });
+        if let Some(index) = placeholder {
+            if let Ok(mut limit_params) = self.limit_params.lock() {
+                limit_params.insert(index, DataType::Int64);
             }
-            Some(ast::Expr::Literal {
-                value: ScalarValue::Int32(n),
-                ..
-            }) => {
-                if *n < 0 {
-                    return Err(PlanError::invalid_expression(
-                        "LIMIT/OFFSET must be non-negative".to_string(),
-                    ));
-                }
-                Ok(Some(*n as usize))
-            }
-            Some(_) => Err(PlanError::invalid_expression(
-                "LIMIT/OFFSET must be an integer literal".to_string(),
-            )),
+            return Ok(None);
         }
+        // `1::SMALLINT` keeps its range-checked cast over the literal.
+        let value = match &folded {
+            PlanExpr::Literal { value, .. } => value,
+            PlanExpr::Cast { expr, .. } => match &**expr {
+                PlanExpr::Literal { value, .. } => value,
+                _ => return Err(not_constant()),
+            },
+            _ => return Err(not_constant()),
+        };
+        let n = match value {
+            ScalarValue::Int32(n) => i64::from(*n),
+            ScalarValue::Int64(n) => *n,
+            _ => {
+                return Err(PlanError::invalid_expression(
+                    "LIMIT/OFFSET must be an integer".to_string(),
+                ))
+            }
+        };
+        if n < 0 {
+            return Err(PlanError::invalid_expression(
+                "LIMIT/OFFSET must be non-negative".to_string(),
+            ));
+        }
+        Ok(Some(n as usize))
     }
 }
 
@@ -3602,6 +3929,8 @@ fn is_aggregate_function(name: &str) -> bool {
             | "BOOL_OR"
             | "BOOL_AND"
             | "ARRAY_AGG"
+            | "PERCENTILE_CONT"
+            | "PERCENTILE_DISC"
             | "STDDEV_SAMP"
             | "STDDEV"
             | "STDDEV_POP"
@@ -3646,6 +3975,125 @@ fn apply_semi_join(input: LogicalPlan, spec: SemiJoinSpec) -> LogicalPlan {
             probe_side_filter_ids: Vec::new(),
         },
     }
+}
+
+/// The interval side of `x ± INTERVAL` / `INTERVAL + x`.
+struct IntervalOperand {
+    op: ast::BinaryOp,
+    value: i64,
+    unit: ast::IntervalUnit,
+    span: arneb_sql_parser::Span,
+    /// The interval is the left operand (`INTERVAL + x`).
+    first: bool,
+}
+
+/// The count, unit and span of an interval literal, looking through
+/// parentheses: `d + (INTERVAL '1 day')`.
+fn as_interval(expr: &ast::Expr) -> Option<(i64, ast::IntervalUnit, arneb_sql_parser::Span)> {
+    match expr {
+        ast::Expr::Interval { value, unit, span } => Some((*value, *unit, *span)),
+        ast::Expr::Nested { expr, .. } => as_interval(expr),
+        _ => None,
+    }
+}
+
+fn interval_outside_arithmetic(span: Option<arneb_sql_parser::Span>) -> PlanError {
+    PlanError::UnsupportedExpression {
+        message: "interval outside date/timestamp arithmetic".to_string(),
+        location: span.map(|s| s.start),
+    }
+}
+
+/// Lowers `x ± INTERVAL` by the planned type of `x`:
+/// - DATE ± days stays integer-day arithmetic (`d - 90`), the form
+///   TPC-H plans with, so it is still DATE;
+/// - DATE ± years/quarters/months/weeks is `date_add(unit, ±n, d)`, DATE;
+/// - DATE ± hours/minutes/seconds is
+///   `date_add(unit, ±n, CAST(d AS TIMESTAMP))`, TIMESTAMP;
+/// - TIMESTAMP ± any unit is `date_add(unit, ±n, ts)`, TIMESTAMP.
+///
+/// Any other operand type is unsupported.
+#[inline(never)]
+fn plan_interval_arithmetic(
+    operand: PlanExpr,
+    interval: IntervalOperand,
+    ctx: &PlanningContext,
+    span: Option<arneb_sql_parser::Span>,
+) -> Result<PlanExpr, PlanError> {
+    use ast::IntervalUnit;
+    let schema: Vec<ColumnInfo> = ctx.columns.iter().map(|(_, col)| col.clone()).collect();
+    let operand_type = plan_expr_type(&operand, &schema);
+    let out_of_range = || PlanError::UnsupportedExpression {
+        message: format!("interval value out of range: {}", interval.value),
+        location: Some(interval.span.start),
+    };
+    let target = match (&operand_type, interval.unit) {
+        // An operand of unknown type (a parameter on the describe path)
+        // keeps the integer-day form a DAY interval always had.
+        (Some(DataType::Date32) | None, IntervalUnit::Day) => {
+            let days = PlanExpr::Literal {
+                value: ScalarValue::Int32(
+                    i32::try_from(interval.value).map_err(|_| out_of_range())?,
+                ),
+                span: Some(interval.span),
+            };
+            let (left, right) = if interval.first {
+                (days, operand)
+            } else {
+                (operand, days)
+            };
+            return Ok(PlanExpr::BinaryOp {
+                left: Box::new(left),
+                op: interval.op,
+                right: Box::new(right),
+                span,
+            });
+        }
+        (
+            Some(DataType::Date32),
+            IntervalUnit::Hour | IntervalUnit::Minute | IntervalUnit::Second,
+        ) => PlanExpr::Cast {
+            expr: Box::new(operand),
+            data_type: DataType::Timestamp {
+                unit: arneb_common::types::TimeUnit::Microsecond,
+                timezone: None,
+            },
+            span: None,
+        },
+        (Some(DataType::Date32 | DataType::Timestamp { .. }), _) => operand,
+        (other, _) => {
+            return Err(PlanError::UnsupportedExpression {
+                message: format!(
+                    "interval arithmetic needs a DATE or TIMESTAMP operand, got {}",
+                    other
+                        .as_ref()
+                        .map_or_else(|| "an unknown type".to_string(), |t| t.to_string())
+                ),
+                location: span.map(|s| s.start),
+            });
+        }
+    };
+    let count = match interval.op {
+        ast::BinaryOp::Minus => interval.value.checked_neg().ok_or_else(out_of_range)?,
+        _ => interval.value,
+    };
+    Ok(PlanExpr::Function {
+        name: "date_add".to_string(),
+        args: vec![
+            PlanExpr::Literal {
+                value: ScalarValue::Utf8(interval.unit.name().to_string()),
+                span: None,
+            },
+            PlanExpr::Literal {
+                value: ScalarValue::Int64(count),
+                span: Some(interval.span),
+            },
+            target,
+        ],
+        distinct: false,
+        order_by: None,
+        span,
+    })
 }
 
 fn contains_nested_subquery(expr: &ast::Expr) -> bool {
@@ -4268,6 +4716,12 @@ fn rewrite_expr_after_column_insert(
         } => crate::map_array_contains(expr, array, negated, span, |e| {
             rewrite_expr_after_column_insert(e, inserted_index, scalar_subplan, scalar_replacement)
         }),
+        PlanExpr::ArrayElement(pair) => crate::map_array_element(pair, |e| {
+            rewrite_expr_after_column_insert(e, inserted_index, scalar_subplan, scalar_replacement)
+        }),
+        PlanExpr::GetField(pair) => crate::map_get_field(pair, |e| {
+            rewrite_expr_after_column_insert(e, inserted_index, scalar_subplan, scalar_replacement)
+        }),
         PlanExpr::Array { .. } => rewrite_array_after_column_insert(
             expr,
             inserted_index,
@@ -4600,12 +5054,48 @@ fn srf_call(item: &ast::SelectItem) -> Option<(SrfKind, &ast::Expr)> {
     else {
         return None;
     };
-    let mut expr = expr;
-    while let ast::Expr::Nested { expr: inner, .. } = expr {
-        expr = inner;
-    }
+    srf_call_expr(expr)
+}
+
+/// The SRF call `expr` is, possibly parenthesized and under field accesses
+/// (`(_pg_expandarray(a)).n`).
+fn srf_call_expr(expr: &ast::Expr) -> Option<(SrfKind, &ast::Expr)> {
     match expr {
+        ast::Expr::Nested { expr: inner, .. } | ast::Expr::FieldAccess { expr: inner, .. } => {
+            srf_call_expr(inner)
+        }
         ast::Expr::Function { name, .. } => SrfKind::from_name(name).map(|kind| (kind, expr)),
+        _ => None,
+    }
+}
+
+/// `expr` with its SRF call (see [`srf_call_expr`]) replaced by `column`,
+/// keeping the field accesses above it.
+fn replace_srf_call(expr: &ast::Expr, column: ast::Expr) -> ast::Expr {
+    match expr {
+        ast::Expr::Nested { expr: inner, span } => ast::Expr::Nested {
+            expr: Box::new(replace_srf_call(inner, column)),
+            span: *span,
+        },
+        ast::Expr::FieldAccess {
+            expr: inner,
+            field,
+            span,
+        } => ast::Expr::FieldAccess {
+            expr: Box::new(replace_srf_call(inner, column)),
+            field: field.clone(),
+            span: *span,
+        },
+        _ => column,
+    }
+}
+
+/// The outermost field an SRF SELECT item reads (`n` for
+/// `(_pg_expandarray(a)).n`), PostgreSQL's name for the column.
+fn srf_item_field(expr: &ast::Expr) -> Option<&str> {
+    match expr {
+        ast::Expr::Nested { expr, .. } => srf_item_field(expr),
+        ast::Expr::FieldAccess { field, .. } => Some(field),
         _ => None,
     }
 }
@@ -4637,19 +5127,47 @@ fn srf_array_argument(kind: SrfKind, call: &ast::Expr) -> Result<&ast::Expr, Pla
             message: "unnest takes exactly one array argument".to_string(),
             location: None,
         }),
+        // The dimension is checked once planned: any constant folding to 1.
         (
             SrfKind::GenerateSubscripts,
-            [ast::FunctionArg::Unnamed(array), ast::FunctionArg::Unnamed(ast::Expr::Literal {
-                value: ScalarValue::Int64(1) | ScalarValue::Int32(1),
-                ..
-            })],
+            [ast::FunctionArg::Unnamed(array), ast::FunctionArg::Unnamed(_)],
         ) => Ok(array),
-        (SrfKind::GenerateSubscripts, _) => Err(PlanError::UnsupportedExpression {
-            message: "generate_subscripts is supported only as generate_subscripts(array, 1): \
-                      arrays have dimension 1"
-                .to_string(),
+        (SrfKind::GenerateSubscripts, _) => Err(generate_subscripts_dim_error()),
+        (SrfKind::ExpandArray, [ast::FunctionArg::Unnamed(array)]) => Ok(array),
+        (SrfKind::ExpandArray, _) => Err(PlanError::UnsupportedExpression {
+            message: "_pg_expandarray takes exactly one array argument".to_string(),
             location: None,
         }),
+    }
+}
+
+/// The dimension argument of a `generate_subscripts(array, dim)` call.
+fn generate_subscripts_dim(call: &ast::Expr) -> Option<&ast::Expr> {
+    match call {
+        ast::Expr::Function { args, .. } => match args.as_slice() {
+            [_, ast::FunctionArg::Unnamed(dim)] => Some(dim),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn generate_subscripts_dim_error() -> PlanError {
+    PlanError::UnsupportedExpression {
+        message: "generate_subscripts is supported only as generate_subscripts(array, 1): \
+                  arrays have dimension 1"
+            .to_string(),
+        location: None,
+    }
+}
+
+/// `current_schemas` takes exactly one boolean argument (PostgreSQL). Out of
+/// line so `plan_expr`'s recursive frame stays small.
+#[inline(never)]
+fn current_schemas_arity_error(args: usize, span: Option<arneb_sql_parser::Span>) -> PlanError {
+    PlanError::UnsupportedExpression {
+        message: format!("function current_schemas takes exactly one boolean argument, got {args}"),
+        location: span.map(|s| s.start),
     }
 }
 
@@ -4685,7 +5203,12 @@ fn collect_window_calls(expr: &ast::Expr, out: &mut Vec<ast::Expr>) {
         | E::IsNull { expr, .. }
         | E::IsNotNull { expr, .. }
         | E::Cast { expr, .. }
-        | E::Nested { expr, .. } => collect_window_calls(expr, out),
+        | E::Nested { expr, .. }
+        | E::FieldAccess { expr, .. } => collect_window_calls(expr, out),
+        E::Subscript { expr, index, .. } => {
+            collect_window_calls(expr, out);
+            collect_window_calls(index, out);
+        }
         E::Between {
             expr, low, high, ..
         } => {
@@ -4742,7 +5265,12 @@ fn walk_columns(expr: &ast::Expr, cb: &mut impl FnMut(&ast::ColumnRef)) {
         | E::IsNull { expr, .. }
         | E::IsNotNull { expr, .. }
         | E::Cast { expr, .. }
-        | E::Nested { expr, .. } => walk_columns(expr, cb),
+        | E::Nested { expr, .. }
+        | E::FieldAccess { expr, .. } => walk_columns(expr, cb),
+        E::Subscript { expr, index, .. } => {
+            walk_columns(expr, cb);
+            walk_columns(index, cb);
+        }
         E::Between {
             expr, low, high, ..
         } => {
@@ -4928,6 +5456,23 @@ fn group_by_qualifier(expr: &ast::Expr) -> Option<String> {
     }
 }
 
+/// An aggregate call's `ORDER BY`, written as `PlanExpr`'s Display writes it
+/// (direction and NULLS placement spelled out, with `plan_call_order_by`'s
+/// defaults), so `find_aggregate_index` matches the aggregate's output name.
+fn write_call_order_by_unqualified(out: &mut String, order_by: &[ast::OrderByExpr]) {
+    for (i, ob) in order_by.iter().enumerate() {
+        out.push_str(if i == 0 { " ORDER BY " } else { ", " });
+        write_ast_unqualified(out, &ob.expr);
+        let asc = ob.asc.unwrap_or(true);
+        out.push_str(if asc { " ASC" } else { " DESC" });
+        out.push_str(if ob.nulls_first.unwrap_or(!asc) {
+            " NULLS FIRST"
+        } else {
+            " NULLS LAST"
+        });
+    }
+}
+
 /// Format an AST expression, stripping column qualifiers and unwrapping
 /// parenthesized `Nested` nodes. Produces a string that matches the
 /// Display of an equivalent `PlanExpr`:
@@ -4973,6 +5518,7 @@ fn write_ast_unqualified(out: &mut String, expr: &ast::Expr) {
             name,
             args,
             distinct,
+            order_by,
             ..
         } => {
             let _ = write!(out, "{name}(");
@@ -4990,6 +5536,7 @@ fn write_ast_unqualified(out: &mut String, expr: &ast::Expr) {
                     }
                 }
             }
+            write_call_order_by_unqualified(out, order_by);
             let _ = write!(out, ")");
         }
         ast::Expr::IsNull { expr, .. } => {
@@ -5050,6 +5597,16 @@ fn write_ast_unqualified(out: &mut String, expr: &ast::Expr) {
             );
             write_ast_unqualified(out, array);
             let _ = write!(out, ")");
+        }
+        ast::Expr::Subscript { expr, index, .. } => {
+            write_ast_unqualified(out, expr);
+            let _ = write!(out, "[");
+            write_ast_unqualified(out, index);
+            let _ = write!(out, "]");
+        }
+        ast::Expr::FieldAccess { expr, field, .. } => {
+            write_ast_unqualified(out, expr);
+            let _ = write!(out, ".{field}");
         }
         ast::Expr::Array { elements, .. } => {
             let _ = write!(out, "ARRAY[");
@@ -5125,17 +5682,23 @@ fn using_pairs(
 }
 
 /// A session function the planner folds to a literal: `current_catalog` and
-/// `current_schema` (Trino's niladic forms), from the session's defaults.
-/// `None` for any other name.
+/// `current_schema` (Trino's niladic forms) and `current_database()` (a
+/// call, `call`), from the session's defaults; `current_user`,
+/// `session_user` and `current_role` from the session's user when the
+/// catalog knows it. `None` for any other name.
 fn session_literal(
     catalog: &CatalogManager,
     name: &str,
+    call: bool,
     span: Option<arneb_sql_parser::Span>,
 ) -> Option<PlanExpr> {
-    let value = if name.eq_ignore_ascii_case("current_catalog") {
+    let is = |n: &str| name.eq_ignore_ascii_case(n);
+    let value = if is("current_catalog") || (call && is("current_database")) {
         catalog.default_catalog()
-    } else if name.eq_ignore_ascii_case("current_schema") {
+    } else if is("current_schema") {
         catalog.default_schema()
+    } else if is("current_user") || is("session_user") || is("current_role") {
+        catalog.session_user()?
     } else {
         return None;
     };
@@ -5143,6 +5706,224 @@ fn session_literal(
         value: ScalarValue::Utf8(value.to_string()),
         span,
     })
+}
+
+/// The column name PostgreSQL gives an unaliased niladic session function
+/// (`current_catalog`, `current_database()`, ...) that the planner folds to
+/// a literal: the function's name, not the literal's text.
+fn session_function_name(expr: &ast::Expr) -> Option<String> {
+    let (name, call) = match expr {
+        ast::Expr::Column { col_ref, .. } if col_ref.table.is_none() => (&col_ref.name, false),
+        ast::Expr::Function { name, args, .. } if args.is_empty() => (name, true),
+        _ => return None,
+    };
+    let lower = name.to_ascii_lowercase();
+    let folds = matches!(
+        lower.as_str(),
+        "current_catalog" | "current_schema" | "current_user" | "session_user" | "current_role"
+    ) || (call && lower == "current_database");
+    folds.then_some(lower)
+}
+
+/// The object kind `__has_privilege` checks for a privilege function.
+fn privilege_object_kind(name: &str) -> Option<&'static str> {
+    [
+        ("has_table_privilege", "table"),
+        ("has_any_column_privilege", "any_column"),
+        ("has_schema_privilege", "schema"),
+    ]
+    .into_iter()
+    .find(|(n, _)| name.eq_ignore_ascii_case(n))
+    .map(|(_, kind)| kind)
+}
+
+/// `CAST(<regclass expr> AS TEXT)`: the operand is a `regclass` conversion
+/// (possibly parenthesized) and the target a string type.
+fn is_regclass_to_text(expr: &ast::Expr, target: &DataType) -> bool {
+    if !matches!(target, DataType::Utf8 | DataType::LargeUtf8) {
+        return false;
+    }
+    match expr {
+        ast::Expr::Nested { expr, .. } => is_regclass_to_text(expr, target),
+        ast::Expr::Function { name, .. } => name.eq_ignore_ascii_case("regclass"),
+        _ => false,
+    }
+}
+
+fn odd_json_build_object_args(span: Option<arneb_sql_parser::Span>) -> PlanError {
+    PlanError::UnsupportedExpression {
+        message: "json_build_object requires an even number of arguments".to_string(),
+        location: span.map(|s| s.start),
+    }
+}
+
+impl QueryPlanner<'_> {
+    /// `<expr>::regclass`. A string literal folds to its oid at plan time
+    /// (no existence check). A text expression becomes
+    /// `__regclass_oid(name, ...)`, which checks the name exists when it
+    /// runs; anything else is already the oid.
+    #[inline(never)]
+    async fn plan_regclass(
+        &self,
+        args: &[ast::FunctionArg],
+        ctx: &PlanningContext,
+        span: Option<arneb_sql_parser::Span>,
+    ) -> Result<PlanExpr, PlanError> {
+        let [ast::FunctionArg::Unnamed(operand)] = args else {
+            return Err(PlanError::UnsupportedExpression {
+                message: "regclass takes one argument".to_string(),
+                location: span.map(|s| s.start),
+            });
+        };
+        if matches!(
+            operand,
+            ast::Expr::Literal {
+                value: ScalarValue::Utf8(_),
+                ..
+            }
+        ) {
+            return regclass_literal(self.catalog, args, span);
+        }
+        let planned = self.plan_expr(operand, ctx).await?;
+        let ctx_schema: Vec<ColumnInfo> = ctx.columns.iter().map(|(_, c)| c.clone()).collect();
+        match plan_expr_type(&planned, &ctx_schema) {
+            Some(DataType::Utf8 | DataType::LargeUtf8) => {
+                let mut call_args = vec![planned];
+                call_args.extend(self.regclass_scope(span).await);
+                Ok(PlanExpr::Function {
+                    order_by: None,
+                    name: "__regclass_oid".to_string(),
+                    args: call_args,
+                    distinct: false,
+                    span,
+                })
+            }
+            Some(DataType::Int64) => Ok(planned),
+            _ => Ok(PlanExpr::Cast {
+                expr: Box::new(planned),
+                data_type: DataType::Int64,
+                span,
+            }),
+        }
+    }
+
+    /// `CAST(<regclass expr> AS TEXT)`: the relation's name, from the
+    /// statement's catalog (`__regclass_name`).
+    #[inline(never)]
+    async fn plan_regclass_name(
+        &self,
+        operand: &ast::Expr,
+        ctx: &PlanningContext,
+        span: Option<arneb_sql_parser::Span>,
+    ) -> Result<PlanExpr, PlanError> {
+        let mut call_args = vec![self.plan_expr(operand, ctx).await?];
+        call_args.extend(self.regclass_scope(span).await);
+        Ok(PlanExpr::Function {
+            order_by: None,
+            name: "__regclass_name".to_string(),
+            args: call_args,
+            distinct: false,
+            span,
+        })
+    }
+
+    /// `has_table_privilege`, `has_any_column_privilege` or
+    /// `has_schema_privilege` (`([role,] object, privilege)`) as
+    /// `__has_privilege`, with the session's user and privileges as
+    /// literals: the runtime check cannot reach the catalog.
+    #[inline(never)]
+    async fn plan_has_privilege(
+        &self,
+        kind: &str,
+        name: &str,
+        mut args: Vec<PlanExpr>,
+        span: Option<arneb_sql_parser::Span>,
+    ) -> Result<PlanExpr, PlanError> {
+        let literal = |v: String| PlanExpr::Literal {
+            value: ScalarValue::Utf8(v),
+            span,
+        };
+        let session_user = self.catalog.session_user().unwrap_or_default().to_string();
+        match args.len() {
+            2 => args.insert(0, literal(session_user.clone())),
+            3 => {}
+            n => {
+                return Err(PlanError::UnsupportedExpression {
+                    message: format!("function {name} takes 2 or 3 arguments, got {n}"),
+                    location: span.map(|s| s.start),
+                })
+            }
+        }
+        let privileges = self.catalog.session_privileges().await;
+        let schemas = privileges
+            .schemas
+            .join(&arneb_common::pg_oid::RELATION_ENTRY_SEP.to_string());
+        let field = arneb_common::pg_oid::RELATION_FIELD_SEP;
+        let tables = privileges
+            .tables
+            .iter()
+            .map(|(schema, table, held)| {
+                let letters: String = arneb_common::pg_oid::TABLE_PRIVILEGE_LETTERS
+                    .iter()
+                    .filter(|(_, p)| held.iter().any(|h| h.to_string() == *p))
+                    .map(|(letter, _)| *letter)
+                    .collect();
+                format!("{schema}{field}{table}{field}{letters}")
+            })
+            .collect::<Vec<_>>()
+            .join(&arneb_common::pg_oid::RELATION_ENTRY_SEP.to_string());
+        let mut call_args = vec![literal(kind.to_string())];
+        call_args.extend(args);
+        call_args.extend([
+            literal(session_user),
+            literal(self.catalog.default_catalog().to_string()),
+            literal(self.catalog.default_schema().to_string()),
+            literal(schemas),
+            literal(tables),
+        ]);
+        Ok(PlanExpr::Function {
+            order_by: None,
+            name: "__has_privilege".to_string(),
+            args: call_args,
+            distinct: false,
+            span,
+        })
+    }
+
+    /// The literal arguments the runtime `regclass` functions take after
+    /// their operand: the session catalog and default schema, and the
+    /// relations the statement's catalog lists (see
+    /// [`arneb_common::pg_oid::RELATION_ENTRY_SEP`]).
+    async fn regclass_scope(&self, span: Option<arneb_sql_parser::Span>) -> Vec<PlanExpr> {
+        let database = self.catalog.default_catalog().to_string();
+        let mut list = String::new();
+        let mut push = |schema: &str, table: &str| {
+            if !list.is_empty() {
+                list.push(arneb_common::pg_oid::RELATION_ENTRY_SEP);
+            }
+            list.push_str(schema);
+            list.push(arneb_common::pg_oid::RELATION_FIELD_SEP);
+            list.push_str(table);
+        };
+        if let Some(relations) = self.catalog.regclass_relations() {
+            for (schema, table) in relations {
+                push(schema, table);
+            }
+        } else {
+            for schema in self.catalog.visible_schema_names(&database).await {
+                for table in self.catalog.visible_table_names(&database, &schema).await {
+                    push(&schema, &table);
+                }
+            }
+        }
+        [database, self.catalog.default_schema().to_string(), list]
+            .into_iter()
+            .map(|v| PlanExpr::Literal {
+                value: ScalarValue::Utf8(v),
+                span,
+            })
+            .collect()
+    }
 }
 
 /// `'<name>'::regclass` as the relation's oid (pg-catalog-tables), resolved
@@ -5179,9 +5960,94 @@ fn regclass_literal(
     })
 }
 
-/// Aggregate `ORDER BY` is accepted only in `array_agg`.
+/// `percentile_cont` / `percentile_disc`, the ordered-set aggregates.
+fn is_percentile(name: &str) -> bool {
+    name.eq_ignore_ascii_case("PERCENTILE_CONT") || name.eq_ignore_ascii_case("PERCENTILE_DISC")
+}
+
+/// Validates `percentile_*(f, x)` (the parser's form of `percentile_*(f)
+/// WITHIN GROUP (ORDER BY x)`): `f` is a constant number in [0, 1] (the
+/// executor casts it to DOUBLE); `percentile_cont` needs a numeric `x`.
+fn check_percentile_call(
+    name: &str,
+    args: &[PlanExpr],
+    schema: &[ColumnInfo],
+    span: Option<arneb_sql_parser::Span>,
+) -> Result<(), PlanError> {
+    let location = span.map(|s| s.start);
+    let [fraction, key] = args else {
+        return Err(PlanError::InvalidExpression {
+            message: format!("{name} requires WITHIN GROUP (ORDER BY ...)"),
+            location,
+        });
+    };
+    let value = match fraction {
+        PlanExpr::Literal { value, .. } => scalar_as_f64(value),
+        PlanExpr::UnaryOp {
+            op: ast::UnaryOp::Minus,
+            expr,
+            ..
+        } => match &**expr {
+            PlanExpr::Literal { value, .. } => scalar_as_f64(value).map(|v| -v),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(value) = value else {
+        return Err(PlanError::InvalidExpression {
+            message: format!("{name} requires a constant numeric fraction"),
+            location,
+        });
+    };
+    if !(0.0..=1.0).contains(&value) {
+        return Err(PlanError::InvalidExpression {
+            message: format!("percentile value {value} is not between 0 and 1"),
+            location,
+        });
+    }
+    if name.eq_ignore_ascii_case("PERCENTILE_CONT") {
+        let numeric = match plan_expr_type(key, schema) {
+            None => true,
+            Some(t) => matches!(
+                t,
+                DataType::Null
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Decimal128 { .. }
+            ),
+        };
+        if !numeric {
+            return Err(PlanError::InvalidExpression {
+                message: format!("{name} requires a numeric WITHIN GROUP expression"),
+                location,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A numeric literal as `f64`.
+fn scalar_as_f64(value: &ScalarValue) -> Option<f64> {
+    match value {
+        ScalarValue::Int32(v) => Some(f64::from(*v)),
+        ScalarValue::Int64(v) => Some(*v as f64),
+        ScalarValue::Float32(v) => Some(f64::from(*v)),
+        ScalarValue::Float64(v) => Some(*v),
+        ScalarValue::Decimal128 { value, scale, .. } => {
+            Some(*value as f64 / 10f64.powi(i32::from(*scale)))
+        }
+        _ => None,
+    }
+}
+
+/// Aggregate `ORDER BY` is accepted only in `array_agg`, and as the
+/// `WITHIN GROUP` key of `percentile_cont` / `percentile_disc`.
 fn check_aggregate_order_by(name: &str) -> Result<(), PlanError> {
-    if name.eq_ignore_ascii_case("ARRAY_AGG") {
+    if name.eq_ignore_ascii_case("ARRAY_AGG") || is_percentile(name) {
         Ok(())
     } else {
         Err(PlanError::invalid_expression(format!(
@@ -5231,6 +6097,27 @@ mod tests {
             panic!("expected Array");
         };
         assert!(matches!(elements[1], PlanExpr::Column { index: 3, .. }));
+    }
+
+    #[test]
+    fn column_insert_shifts_columns_inside_subscripts_and_field_access() {
+        let col = |index: usize| PlanExpr::Column {
+            index,
+            name: format!("c{index}"),
+            span: None,
+        };
+        let element = PlanExpr::ArrayElement(Box::new((col(2), col(0))));
+        let field = PlanExpr::GetField(Box::new((element, "x".to_string())));
+        let shifted = shift_plan_expr_columns(field, 1);
+        let PlanExpr::GetField(pair) = &shifted else {
+            panic!("expected GetField, got {shifted}");
+        };
+        assert_eq!(pair.1, "x");
+        let PlanExpr::ArrayElement(inner) = &pair.0 else {
+            panic!("expected ArrayElement");
+        };
+        assert!(matches!(inner.0, PlanExpr::Column { index: 3, .. }));
+        assert!(matches!(inner.1, PlanExpr::Column { index: 0, .. }));
     }
 
     const Q15_SQL: &str = include_str!("../../../benchmarks/tpch/queries/q15.sql");
@@ -5369,6 +6256,152 @@ mod tests {
             .lock()
             .expect("CTE self-agg window override lock poisoned") = None;
         plan
+    }
+
+    /// The projection expressions of `sql` over the q15 `lineitem`
+    /// fixture (`l_shipdate DATE`).
+    async fn lineitem_projection(sql: &str) -> Result<Vec<PlanExpr>, PlanError> {
+        let catalog = q15_catalog();
+        let planner = QueryPlanner::new(&catalog);
+        let stmt = arneb_sql_parser::parse(sql).expect("parse");
+        match planner.plan_statement(&stmt).await? {
+            LogicalPlan::Projection { exprs, .. } => Ok(exprs),
+            other => panic!("expected a projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interval_day_on_untyped_operand_keeps_integer_days() {
+        let parameter = || PlanExpr::Parameter {
+            index: 1,
+            type_hint: None,
+            span: None,
+        };
+        let interval = |unit| IntervalOperand {
+            op: ast::BinaryOp::Minus,
+            value: 90,
+            unit,
+            span: arneb_sql_parser::Span::empty(),
+            first: false,
+        };
+        let ctx = PlanningContext::new();
+        let planned =
+            plan_interval_arithmetic(parameter(), interval(ast::IntervalUnit::Day), &ctx, None)
+                .unwrap();
+        match planned {
+            PlanExpr::BinaryOp {
+                left, op, right, ..
+            } => {
+                assert_eq!(op, ast::BinaryOp::Minus);
+                assert!(matches!(*left, PlanExpr::Parameter { index: 1, .. }));
+                assert!(matches!(
+                    *right,
+                    PlanExpr::Literal {
+                        value: ScalarValue::Int32(90),
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected $1 - 90, got {other}"),
+        }
+        // Other units still need a known DATE or TIMESTAMP operand.
+        let err =
+            plan_interval_arithmetic(parameter(), interval(ast::IntervalUnit::Month), &ctx, None)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("interval"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn interval_arithmetic_lowering() {
+        let exprs = lineitem_projection(
+            "SELECT l_shipdate - INTERVAL '90' DAY, l_shipdate + INTERVAL '90 days', \
+             INTERVAL '1' DAY + l_shipdate, l_shipdate - INTERVAL '1 month', \
+             l_shipdate + INTERVAL '2' HOUR FROM lineitem",
+        )
+        .await
+        .unwrap();
+        // DATE ± days stays integer-day arithmetic (the TPC-H form).
+        for (expr, op) in [
+            (&exprs[0], ast::BinaryOp::Minus),
+            (&exprs[1], ast::BinaryOp::Plus),
+        ] {
+            match expr {
+                PlanExpr::BinaryOp {
+                    left, op: o, right, ..
+                } => {
+                    assert_eq!(*o, op);
+                    assert!(matches!(left.as_ref(), PlanExpr::Column { .. }), "{expr}");
+                    assert!(
+                        matches!(
+                            right.as_ref(),
+                            PlanExpr::Literal {
+                                value: ScalarValue::Int32(90),
+                                ..
+                            }
+                        ),
+                        "{expr}"
+                    );
+                }
+                other => panic!("expected date - days, got {other}"),
+            }
+        }
+        assert!(
+            matches!(
+                &exprs[2],
+                PlanExpr::BinaryOp { left, .. }
+                    if matches!(left.as_ref(), PlanExpr::Literal { value: ScalarValue::Int32(1), .. })
+            ),
+            "{}",
+            exprs[2]
+        );
+        // Other units call date_add, negated for `-`.
+        let PlanExpr::Function { name, args, .. } = &exprs[3] else {
+            panic!("expected date_add, got {}", exprs[3]);
+        };
+        assert_eq!(name, "date_add");
+        assert!(
+            matches!(&args[0], PlanExpr::Literal { value: ScalarValue::Utf8(u), .. } if u == "month")
+        );
+        assert!(matches!(
+            &args[1],
+            PlanExpr::Literal {
+                value: ScalarValue::Int64(-1),
+                ..
+            }
+        ));
+        assert!(matches!(&args[2], PlanExpr::Column { .. }));
+        // A sub-day unit on a DATE goes through TIMESTAMP.
+        let PlanExpr::Function { args, .. } = &exprs[4] else {
+            panic!("expected date_add, got {}", exprs[4]);
+        };
+        assert!(matches!(
+            &args[2],
+            PlanExpr::Cast {
+                data_type: DataType::Timestamp { .. },
+                ..
+            }
+        ));
+
+        // Parentheses around the interval change nothing.
+        let nested = lineitem_projection("SELECT l_shipdate + (INTERVAL '1 month') FROM lineitem")
+            .await
+            .unwrap();
+        assert!(
+            matches!(&nested[0], PlanExpr::Function { name, .. } if name == "date_add"),
+            "{}",
+            nested[0]
+        );
+
+        for sql in [
+            "SELECT INTERVAL '1 day' FROM lineitem",
+            "SELECT INTERVAL '1 day' - l_shipdate FROM lineitem",
+            "SELECT l_suppkey + INTERVAL '1 day' FROM lineitem",
+            "SELECT l_shipdate * INTERVAL '1 day' FROM lineitem",
+        ] {
+            let err = lineitem_projection(sql).await.unwrap_err().to_string();
+            assert!(err.contains("interval"), "{sql}: {err}");
+        }
     }
 
     fn cte_self_agg_window_test_lock() -> &'static tokio::sync::Mutex<()> {
@@ -5920,6 +6953,39 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn limit_offset_accept_constant_integer_expressions() {
+        for (sql, want_limit, want_offset) in [
+            ("SELECT id FROM users LIMIT CAST(2 AS INTEGER)", 2, None),
+            (
+                "SELECT id FROM users LIMIT 2::BIGINT OFFSET 1::INTEGER",
+                2,
+                Some(1),
+            ),
+            ("SELECT id FROM users LIMIT 1 + 2", 3, None),
+        ] {
+            match plan_sql(sql).await.unwrap() {
+                LogicalPlan::Limit { limit, offset, .. } => {
+                    assert_eq!(limit, Some(want_limit), "{sql}");
+                    assert_eq!(offset, want_offset, "{sql}");
+                }
+                other => panic!("expected Limit for {sql}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn limit_rejects_non_constant_and_negative() {
+        for sql in [
+            "SELECT id FROM users LIMIT id",
+            "SELECT id FROM users LIMIT -1",
+            "SELECT id FROM users LIMIT 'x'",
+        ] {
+            let err = plan_sql(sql).await.unwrap_err().to_string();
+            assert!(err.contains("LIMIT/OFFSET must be"), "{sql}: {err}");
+        }
+    }
+
     // ---------------------------------------------------------------
     // EXPLAIN (task 4.9)
     // ---------------------------------------------------------------
@@ -5947,6 +7013,35 @@ mod tests {
                 assert!(matches!(input.as_ref(), LogicalPlan::Projection { .. }));
             }
             _ => panic!("expected Explain"),
+        }
+    }
+
+    /// The dimension of `generate_subscripts` is any constant that folds to 1
+    /// (psycopg 3 sends `1::INTEGER`); anything else is refused.
+    #[tokio::test]
+    async fn generate_subscripts_dim_is_a_constant_folding_to_1() {
+        for dim in [
+            "1",
+            "1::INTEGER",
+            "CAST(1 AS SMALLINT)",
+            "(1)",
+            "2 - 1",
+            "CAST(1.2 AS INTEGER)",
+        ] {
+            let sql = format!("EXPLAIN SELECT generate_subscripts(ARRAY[id], {dim}) FROM users");
+            let plan = plan_sql(&sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert!(
+                plan.to_string()
+                    .contains("ProjectSet: [generate_subscripts(ARRAY[id], 1)]"),
+                "{sql}: {plan}"
+            );
+        }
+        for dim in ["2", "2::INTEGER", "id", "NULL"] {
+            let sql = format!("SELECT generate_subscripts(ARRAY[id], {dim}) FROM users");
+            let err = plan_sql(&sql).await.unwrap_err().to_string();
+            assert!(err.contains("dimension 1"), "{sql}: {err}");
         }
     }
 
@@ -5997,6 +7092,223 @@ mod tests {
         // Queries without SRFs keep their plan shape.
         let plain = plan_sql("SELECT id FROM users").await.unwrap();
         assert!(!plain.to_string().contains("ProjectSet"), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn expandarray_yields_a_struct_read_by_field() {
+        let plan = plan_sql(
+            "EXPLAIN SELECT (information_schema._pg_expandarray(ARRAY[id])).n, \
+             information_schema._pg_expandarray(ARRAY[id]) AS k FROM users",
+        )
+        .await
+        .unwrap();
+        let LogicalPlan::Explain { input, .. } = &plan else {
+            panic!("expected Explain");
+        };
+        let LogicalPlan::Projection {
+            input,
+            exprs,
+            schema,
+        } = input.as_ref()
+        else {
+            panic!("expected Projection, got {input}");
+        };
+        // PostgreSQL names `(srf).n` after the field.
+        assert_eq!(schema[0].name, "n");
+        assert_eq!(schema[0].data_type, DataType::Int32);
+        assert!(matches!(exprs[0], PlanExpr::GetField(_)), "{}", exprs[0]);
+        let element = DataType::Struct(vec![
+            ("x".to_string(), DataType::Int64),
+            ("n".to_string(), DataType::Int32),
+        ]);
+        assert_eq!(schema[1].data_type, element);
+        let LogicalPlan::ProjectSet { srfs, .. } = input.as_ref() else {
+            panic!("expected ProjectSet, got {input}");
+        };
+        assert!(srfs.iter().all(|(k, _)| *k == SrfKind::ExpandArray));
+        // Workers receive plans as JSON.
+        let json = serde_json::to_string(input.as_ref()).unwrap();
+        let back: LogicalPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.to_string(), input.to_string());
+    }
+
+    #[tokio::test]
+    async fn subscripts_and_field_access_are_typed() {
+        let plan = plan_sql("SELECT (ARRAY[id, age])[2], (ARRAY[name])[id] FROM users")
+            .await
+            .unwrap();
+        let LogicalPlan::Projection { exprs, schema, .. } = &plan else {
+            panic!("expected Projection, got {plan}");
+        };
+        assert!(
+            matches!(exprs[0], PlanExpr::ArrayElement(_)),
+            "{}",
+            exprs[0]
+        );
+        assert_eq!(schema[0].data_type, DataType::Int64);
+        assert_eq!(schema[1].data_type, DataType::Utf8);
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: LogicalPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.to_string(), plan.to_string());
+
+        for (sql, want) in [
+            (
+                "SELECT (information_schema._pg_expandarray(ARRAY[1])).zz",
+                "column \"zz\" not found in data type",
+            ),
+            ("SELECT (id).x FROM users", "not a composite type"),
+            ("SELECT (id)[1] FROM users", "not an array"),
+            (
+                "SELECT (ARRAY[1])[name] FROM users",
+                "array subscript must have type integer",
+            ),
+        ] {
+            let err = plan_sql(sql).await.unwrap_err().to_string();
+            assert!(err.contains(want), "{sql}: {err}");
+        }
+    }
+
+    async fn plan_with(catalog: &CatalogManager, sql: &str) -> Result<LogicalPlan, PlanError> {
+        let planner = QueryPlanner::new(catalog);
+        planner
+            .plan_statement(&arneb_sql_parser::parse(sql).expect("parse failed"))
+            .await
+    }
+
+    /// The projected expressions and column names of a plain `SELECT`.
+    fn projection(plan: &LogicalPlan) -> (Vec<String>, Vec<String>) {
+        let LogicalPlan::Projection { exprs, schema, .. } = plan else {
+            panic!("expected Projection, got {plan}");
+        };
+        (
+            exprs.iter().map(ToString::to_string).collect(),
+            schema.iter().map(|c| c.name.clone()).collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn session_functions_fold_and_keep_their_names() {
+        let catalog = test_catalog().with_session_user("alice");
+        let plan = plan_with(
+            &catalog,
+            "SELECT current_database(), current_catalog, current_user, session_user, \
+             current_schema, current_database() AS db",
+        )
+        .await
+        .unwrap();
+        let db = format!("'{}'", catalog.default_catalog());
+        let schema = format!("'{}'", catalog.default_schema());
+        assert_eq!(
+            projection(&plan),
+            (
+                vec![
+                    db.clone(),
+                    db.clone(),
+                    "'alice'".to_string(),
+                    "'alice'".to_string(),
+                    schema,
+                    db
+                ],
+                [
+                    "current_database",
+                    "current_catalog",
+                    "current_user",
+                    "session_user",
+                    "current_schema",
+                    "db"
+                ]
+                .map(String::from)
+                .to_vec()
+            )
+        );
+        // Without a known user `current_user` does not fold; a bare
+        // `current_database` is a column reference, as in PostgreSQL.
+        let (exprs, _) = projection(&plan_sql("SELECT current_user").await.unwrap());
+        assert!(!exprs[0].starts_with('\''), "{exprs:?}");
+        assert!(plan_sql("SELECT current_database").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn privilege_functions_carry_the_session_privileges() {
+        let catalog = test_catalog().with_session_user("alice");
+        let plan = plan_with(
+            &catalog,
+            "SELECT has_table_privilege('t', 'select'), \
+             has_any_column_privilege(current_user, 't', 'update'), \
+             has_schema_privilege('alice', 's', 'usage')",
+        )
+        .await
+        .unwrap();
+        let LogicalPlan::Projection { exprs, schema, .. } = &plan else {
+            panic!("expected Projection, got {plan}");
+        };
+        let privileges = catalog.session_privileges().await;
+        for (expr, (kind, role)) in exprs.iter().zip([
+            ("table", "alice"),
+            ("any_column", "alice"),
+            ("schema", "alice"),
+        ]) {
+            let PlanExpr::Function { name, args, .. } = expr else {
+                panic!("expected a call, got {expr}");
+            };
+            assert_eq!(name, "__has_privilege");
+            assert_eq!(args.len(), 9, "{expr}");
+            assert_eq!(args[0].to_string(), format!("'{kind}'"));
+            assert_eq!(args[1].to_string(), format!("'{role}'"));
+            assert_eq!(args[4].to_string(), "'alice'");
+            assert_eq!(
+                args[5].to_string(),
+                format!("'{}'", catalog.default_catalog())
+            );
+            // Every visible table is listed with all four privileges.
+            let PlanExpr::Literal {
+                value: ScalarValue::Utf8(tables),
+                ..
+            } = &args[8]
+            else {
+                panic!("tables literal: {}", args[8]);
+            };
+            let entries = tables
+                .split(arneb_common::pg_oid::RELATION_ENTRY_SEP)
+                .filter(|e| !e.is_empty())
+                .count();
+            assert_eq!(entries, privileges.tables.len());
+            assert!(tables.ends_with("SIUD"), "{tables:?}");
+        }
+        assert!(schema.iter().all(|c| c.data_type == DataType::Boolean));
+        let err = plan_sql("SELECT has_table_privilege('t')")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("takes 2 or 3 arguments"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn current_schemas_reads_the_session_search_path() {
+        let plan = plan_sql("SELECT current_schemas(true)").await.unwrap();
+        let LogicalPlan::Projection { exprs, schema, .. } = &plan else {
+            panic!("expected Projection, got {plan}");
+        };
+        let PlanExpr::Function { args, .. } = &exprs[0] else {
+            panic!("expected a call, got {}", exprs[0]);
+        };
+        // The catalog's default schema rides along as the search path.
+        assert_eq!(
+            args[1].to_string(),
+            format!("'{}'", test_catalog().default_schema())
+        );
+        assert_eq!(
+            schema[0].data_type,
+            DataType::List(Box::new(DataType::Utf8))
+        );
+        // PostgreSQL has only current_schemas(boolean).
+        for sql in [
+            "SELECT current_schemas(true, 'x')",
+            "SELECT current_schemas()",
+        ] {
+            let err = plan_sql(sql).await.unwrap_err().to_string();
+            assert!(err.contains("exactly one boolean argument"), "{sql}: {err}");
+        }
     }
 
     #[tokio::test]
@@ -6691,6 +8003,92 @@ mod tests {
                 }
             }
             _ => panic!("expected Projection"),
+        }
+    }
+
+    /// An aggregate with `ORDER BY` beside another aggregate: the SELECT item
+    /// must find its own aggregate slot, whose name carries the planned
+    /// `ORDER BY` (SQLAlchemy's pk/unique/index reflection queries).
+    #[tokio::test]
+    async fn test_ordered_aggregate_beside_another_resolves() {
+        for sql in [
+            "SELECT array_agg(u.name ORDER BY u.id) AS a, count(*) AS c FROM users u",
+            "SELECT count(*) AS c, array_agg(name ORDER BY id DESC) AS a, \
+                    array_agg(name ORDER BY id DESC NULLS LAST) AS b FROM users",
+        ] {
+            let plan = plan_sql(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let LogicalPlan::Projection { exprs, input, .. } = &plan else {
+                panic!("expected Projection: {plan:?}");
+            };
+            let LogicalPlan::Aggregate { aggr_exprs, .. } = input.as_ref() else {
+                panic!("expected Aggregate input");
+            };
+            assert_eq!(aggr_exprs.len(), exprs.len(), "{sql}");
+            let mut slots: Vec<usize> = exprs
+                .iter()
+                .map(|e| match e {
+                    PlanExpr::Column { index, .. } => *index,
+                    other => panic!("{sql}: expected Column, got {other:?}"),
+                })
+                .collect();
+            slots.sort_unstable();
+            slots.dedup();
+            assert_eq!(slots.len(), exprs.len(), "{sql}: slots collide");
+        }
+    }
+
+    /// `percentile_*(f) WITHIN GROUP (ORDER BY x)`: the fraction is a
+    /// constant in [0, 1], `percentile_cont` is DOUBLE over a
+    /// numeric key, `percentile_disc` keeps the key's type.
+    #[tokio::test]
+    async fn test_percentile_calls_are_validated_and_typed() {
+        let plan = plan_sql(
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id), \
+                    percentile_disc(1) WITHIN GROUP (ORDER BY name DESC) FROM users",
+        )
+        .await
+        .unwrap();
+        let LogicalPlan::Projection { input, schema, .. } = &plan else {
+            panic!("expected Projection: {plan:?}");
+        };
+        assert_eq!(schema[0].data_type, DataType::Float64);
+        assert_eq!(schema[1].data_type, DataType::Utf8);
+        let LogicalPlan::Aggregate { aggr_exprs, .. } = input.as_ref() else {
+            panic!("expected Aggregate input");
+        };
+        // `percentile_disc(f, name)` ordered by `name DESC`.
+        let PlanExpr::Function { args, order_by, .. } = &aggr_exprs[1] else {
+            panic!("expected Function");
+        };
+        assert_eq!(args.len(), 2);
+        assert!(matches!(&args[1], PlanExpr::Column { name, .. } if name == "name"));
+        let order_by = order_by.as_deref().expect("WITHIN GROUP key");
+        assert_eq!(order_by.len(), 1);
+        assert!(!order_by[0].asc);
+        for (sql, want) in [
+            (
+                "SELECT percentile_cont(1.5) WITHIN GROUP (ORDER BY id) FROM users",
+                "between 0 and 1",
+            ),
+            (
+                "SELECT percentile_disc(-0.1) WITHIN GROUP (ORDER BY id) FROM users",
+                "between 0 and 1",
+            ),
+            (
+                "SELECT percentile_cont(id) WITHIN GROUP (ORDER BY id) FROM users",
+                "constant numeric fraction",
+            ),
+            (
+                "SELECT percentile_cont(ARRAY[0.5]) WITHIN GROUP (ORDER BY id) FROM users",
+                "constant numeric fraction",
+            ),
+            (
+                "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY name) FROM users",
+                "numeric",
+            ),
+        ] {
+            let err = plan_sql(sql).await.expect_err(sql).to_string();
+            assert!(err.contains(want), "{sql}: {err}");
         }
     }
 

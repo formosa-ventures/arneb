@@ -29,6 +29,28 @@ impl GroupKey {
     pub(crate) fn single(value: ScalarValue) -> Self {
         GroupKey(vec![value])
     }
+
+    /// Approximate bytes one entry of this key holds in a hash map or set:
+    /// the key itself, its scalar slots and their heap data, plus a word
+    /// of table overhead. Used for memory accounting, not exact.
+    pub(crate) fn entry_bytes(&self) -> usize {
+        std::mem::size_of::<GroupKey>()
+            + std::mem::size_of::<usize>()
+            + self.0.capacity() * std::mem::size_of::<ScalarValue>()
+            + self.0.iter().map(scalar_heap_bytes).sum::<usize>()
+    }
+}
+
+/// Heap bytes a [`ScalarValue`] owns beyond its inline size.
+pub(crate) fn scalar_heap_bytes(value: &ScalarValue) -> usize {
+    match value {
+        ScalarValue::Utf8(s) => s.capacity(),
+        ScalarValue::Binary(b) => b.capacity(),
+        ScalarValue::Timestamp {
+            timezone: Some(tz), ..
+        } => tz.capacity(),
+        _ => 0,
+    }
 }
 
 // Type tags. Most ScalarValue variants get a distinct one-byte tag

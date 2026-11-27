@@ -531,6 +531,8 @@ where
             negated,
             span,
         } => crate::map_array_contains(expr, array, negated, span, |e| walk_columns(e, f)),
+        E::ArrayElement(pair) => crate::map_array_element(pair, |e| walk_columns(e, f)),
+        E::GetField(pair) => crate::map_get_field(pair, |e| walk_columns(e, f)),
         E::Array {
             elements,
             element_type,

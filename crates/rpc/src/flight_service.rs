@@ -113,6 +113,10 @@ pub struct FlightState {
     release_query_callback: Option<ReleaseQueryCallback>,
     catalog_sync_callback: Option<CatalogSyncCallback>,
     catalog_source: Option<CatalogSourceCallback>,
+    /// Where the work behind a request runs when this server is served on
+    /// its own control runtime: task execution and the encoding of `do_get`
+    /// output. `None` runs it on the serving runtime.
+    execution: Option<tokio::runtime::Handle>,
 }
 
 impl Default for FlightState {
@@ -129,6 +133,7 @@ impl Default for FlightState {
             release_query_callback: None,
             catalog_sync_callback: None,
             catalog_source: None,
+            execution: None,
         }
     }
 }
@@ -198,6 +203,16 @@ impl FlightState {
     /// a worker pulls.
     pub fn set_catalog_source(&mut self, source: Arc<dyn Fn() -> CatalogSet + Send + Sync>) {
         self.catalog_source = Some(source);
+    }
+
+    /// Run the work behind requests on `handle` instead of the runtime that
+    /// serves Flight (#244). The callbacks run inside `handle`'s context,
+    /// so the tasks they spawn (a submitted fragment, a dynamic filter
+    /// report) land there, and `do_get` output is encoded there. The
+    /// serving runtime then only parses requests and moves frames, so a
+    /// saturated execution runtime cannot delay heartbeats or cancels.
+    pub fn set_execution_runtime(&mut self, handle: tokio::runtime::Handle) {
+        self.execution = Some(handle);
     }
 
     /// Register a partitioned output buffer for a task. A2.1.2 renamed
@@ -278,6 +293,76 @@ impl TrinoFlightService {
     pub fn new(state: FlightState) -> Self {
         Self { state }
     }
+
+    /// Enter the execution runtime, if one is set, so a callback's
+    /// `tokio::spawn` lands there. Hold it only across synchronous code.
+    fn enter_execution(&self) -> Option<tokio::runtime::EnterGuard<'_>> {
+        self.state.execution.as_ref().map(|h| h.enter())
+    }
+
+    /// Poll `stream` on the execution runtime and hand its frames over a
+    /// one-slot channel, so the encoding work stays off the serving
+    /// runtime. The pump stops as soon as the response is dropped.
+    ///
+    /// The pump marks a normal end before it drops its sender. If it dies
+    /// any other way (a panic in the producer, an aborted task, a runtime
+    /// shutting down), the response ends with an error rather than a clean
+    /// end of stream, so the consumer never takes a cut-short exchange as
+    /// complete.
+    fn on_execution(&self, stream: BoxedStream<FlightData>) -> BoxedStream<FlightData> {
+        let Some(handle) = &self.state.execution else {
+            return stream;
+        };
+        pump_on(handle, stream)
+    }
+}
+
+fn pump_on(
+    handle: &tokio::runtime::Handle,
+    stream: BoxedStream<FlightData>,
+) -> BoxedStream<FlightData> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // One slot: with the frame the pump is sending and the one the server
+    // is writing, at most two encoded frames sit outside the producer.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let completed = Arc::new(AtomicBool::new(false));
+    let pump_completed = completed.clone();
+    handle.spawn(async move {
+        let mut stream = stream;
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                next = futures::StreamExt::next(&mut stream) => next,
+            };
+            let Some(item) = next else {
+                pump_completed.store(true, Ordering::Release);
+                break;
+            };
+            if tx.send(item).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut finished = false;
+    Box::pin(futures::stream::poll_fn(move |cx| {
+        if finished {
+            return std::task::Poll::Ready(None);
+        }
+        match rx.poll_recv(cx) {
+            std::task::Poll::Ready(None) => {
+                finished = true;
+                if completed.load(Ordering::Acquire) {
+                    std::task::Poll::Ready(None)
+                } else {
+                    std::task::Poll::Ready(Some(Err(Status::internal(
+                        "exchange stream ended before its producer finished",
+                    ))))
+                }
+            }
+            other => other,
+        }
+    }))
 }
 
 type FailureHandle = Arc<std::sync::Mutex<Option<crate::TaskFailure>>>;
@@ -409,7 +494,7 @@ impl FlightService for TrinoFlightService {
                     format!("{task_id}:{partition_id}"),
                 );
                 Ok(Response::new(ServedStream::wrap(
-                    stream,
+                    self.on_execution(stream),
                     ticket_str,
                     "partitioned",
                     peer,
@@ -427,7 +512,7 @@ impl FlightService for TrinoFlightService {
                 let failure = buffer.failure_handle();
                 let flight_stream = async_stream_broadcast(schema, stream, failure);
                 Ok(Response::new(ServedStream::wrap(
-                    flight_stream,
+                    self.on_execution(flight_stream),
                     ticket_str,
                     "broadcast",
                     peer,
@@ -435,7 +520,11 @@ impl FlightService for TrinoFlightService {
             }
             None => {
                 if let Some(ref cb) = self.state.task_status_callback {
-                    match cb(task_id) {
+                    let status = {
+                        let _runtime = self.enter_execution();
+                        cb(task_id)
+                    };
+                    match status {
                         Some(TaskStatusResponse::Running) => {
                             return Err(Status::unavailable(format!(
                                 "task '{task_id}' running, buffer not yet registered"
@@ -477,12 +566,23 @@ impl FlightService for TrinoFlightService {
                 );
 
                 let reply = match self.state.heartbeat_callback {
-                    Some(ref callback) => callback(msg).map_err(Status::failed_precondition)?,
+                    Some(ref callback) => {
+                        let _runtime = self.enter_execution();
+                        callback(msg).map_err(Status::failed_precondition)?
+                    }
                     None => HeartbeatReply::default(),
                 };
 
                 let result = arrow_flight::Result {
                     body: reply.encode().into(),
+                };
+                let stream = futures::stream::once(async { Ok(result) });
+                Ok(Response::new(Box::pin(stream)))
+            }
+            // Coordinator liveness probe: answering at all is the reply.
+            "ping" => {
+                let result = arrow_flight::Result {
+                    body: Default::default(),
                 };
                 let stream = futures::stream::once(async { Ok(result) });
                 Ok(Response::new(Box::pin(stream)))
@@ -498,6 +598,7 @@ impl FlightService for TrinoFlightService {
                 );
 
                 if let Some(ref callback) = self.state.task_callback {
+                    let _runtime = self.enter_execution();
                     callback(descriptor);
                 } else {
                     return Err(Status::unavailable("worker has no task manager registered"));
@@ -543,6 +644,7 @@ impl FlightService for TrinoFlightService {
                 );
 
                 if let Some(ref callback) = self.state.df_report_callback {
+                    let _runtime = self.enter_execution();
                     callback(req);
                 }
                 // No callback registered = inert during A1.3; still ack
@@ -567,7 +669,10 @@ impl FlightService for TrinoFlightService {
                 } else {
                     (&self.state.release_query_callback, "released")
                 };
-                let ended = callback.as_ref().map_or(0, |cb| cb(query_id));
+                let ended = {
+                    let _runtime = self.enter_execution();
+                    callback.as_ref().map_or(0, |cb| cb(query_id))
+                };
                 let result = arrow_flight::Result {
                     body: format!("{verb} {ended}").into(),
                 };
@@ -586,6 +691,7 @@ impl FlightService for TrinoFlightService {
                 );
 
                 if let Some(ref callback) = self.state.df_notify_callback {
+                    let _runtime = self.enter_execution();
                     callback(req);
                 }
 
@@ -609,7 +715,15 @@ impl FlightService for TrinoFlightService {
                     catalogs = set.catalogs.len(),
                     "received catalog sync"
                 );
-                let failed = callback(set).await.map_err(Status::internal)?;
+                let sync = callback(set);
+                let failed = match &self.state.execution {
+                    Some(handle) => handle
+                        .spawn(sync)
+                        .await
+                        .map_err(|e| Status::internal(format!("catalog sync stopped: {e}")))?,
+                    None => sync.await,
+                }
+                .map_err(Status::internal)?;
                 let reply = crate::catalog_sync::CatalogSyncReply { failed };
                 let result = arrow_flight::Result {
                     body: serde_json::to_vec(&reply)
@@ -911,6 +1025,47 @@ mod tests {
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
+    }
+
+    fn frame() -> Result<FlightData, Status> {
+        Ok(FlightData {
+            data_body: vec![0u8; 8].into(),
+            ..Default::default()
+        })
+    }
+
+    /// A pumped stream that ends normally ends cleanly, with every frame.
+    #[tokio::test]
+    async fn a_pumped_stream_that_finishes_ends_cleanly() {
+        use futures::StreamExt;
+        let source = Box::pin(futures::stream::iter(vec![frame(), frame(), frame()]));
+        let out: Vec<_> = pump_on(&tokio::runtime::Handle::current(), source)
+            .collect()
+            .await;
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|f| f.is_ok()));
+    }
+
+    /// If the producer panics part-way, the consumer gets an error, never
+    /// a clean end of a truncated stream.
+    #[tokio::test]
+    async fn a_pumped_stream_whose_producer_panics_ends_with_an_error() {
+        use futures::StreamExt;
+        let mut sent = 0;
+        let source: BoxedStream<FlightData> = Box::pin(futures::stream::poll_fn(move |_| {
+            sent += 1;
+            if sent > 2 {
+                panic!("producer failed mid-stream");
+            }
+            std::task::Poll::Ready(Some(frame()))
+        }));
+        let out: Vec<_> = pump_on(&tokio::runtime::Handle::current(), source)
+            .collect()
+            .await;
+        assert_eq!(out.len(), 3, "two frames, then the error");
+        assert!(out[..2].iter().all(|f| f.is_ok()));
+        let err = out[2].as_ref().unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
     }
 
     /// `flight_incoming` sets `TCP_NODELAY` on every accepted socket.

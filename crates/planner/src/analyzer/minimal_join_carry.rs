@@ -915,6 +915,11 @@ fn collect_columns(expr: &PlanExpr, out: &mut BTreeSet<usize>) {
             collect_columns(expr, out);
             collect_columns(array, out);
         }
+        PlanExpr::ArrayElement(pair) => {
+            collect_columns(&pair.0, out);
+            collect_columns(&pair.1, out);
+        }
+        PlanExpr::GetField(pair) => collect_columns(&pair.0, out),
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -1017,6 +1022,10 @@ fn rewrite_expr(expr: &PlanExpr, mapping: &HashMap<usize, usize>) -> PlanExpr {
         } => crate::map_array_contains_ref(expr, array, *negated, *span, |e| {
             rewrite_expr(e, mapping)
         }),
+        PlanExpr::ArrayElement(pair) => {
+            crate::map_array_element_ref(pair, |e| rewrite_expr(e, mapping))
+        }
+        PlanExpr::GetField(pair) => crate::map_get_field_ref(pair, |e| rewrite_expr(e, mapping)),
         PlanExpr::Array {
             elements,
             element_type,

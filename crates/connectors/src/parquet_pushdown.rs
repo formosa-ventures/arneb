@@ -33,9 +33,12 @@ pub fn prune_row_groups(
         return (0..row_groups.len()).collect();
     }
 
+    // Prepared once per file: an IN list of a dynamic filter can hold
+    // hundreds of thousands of values, too many to convert per row group.
+    let checks: Vec<PruneCheck> = filters.iter().map(PruneCheck::new).collect();
     let mut selected = Vec::new();
     for (rg_idx, rg) in row_groups.iter().enumerate() {
-        if can_prune_row_group(rg, filters) {
+        if checks.iter().any(|check| check.prunes(rg)) {
             debug!("pruning row group {rg_idx} (statistics prove no match)");
         } else {
             selected.push(rg_idx);
@@ -54,54 +57,121 @@ pub fn prune_row_groups(
     selected
 }
 
-/// Returns `true` if statistics prove the row group cannot contain any matching rows.
-fn can_prune_row_group(rg: &RowGroupMetaData, filters: &[PlanExpr]) -> bool {
-    for filter in filters {
-        if filter_prunes_row_group(rg, filter) {
-            return true;
-        }
-    }
-    false
+/// A filter readied for checks against row-group statistics.
+enum PruneCheck {
+    /// A conjunction: prunes if either side proves no match.
+    And(Box<PruneCheck>, Box<PruneCheck>),
+    /// `Column op Literal` (either order).
+    Compare {
+        column: usize,
+        literal: ScalarValue,
+        op: BinaryOp,
+    },
+    /// A non-negated `Column IN (literals)` of integer-shaped values, as
+    /// `inject_inlist_dynamic_filters` produces, sorted for binary search.
+    InList { column: usize, keys: Vec<i64> },
+    /// Anything statistics cannot decide.
+    Never,
 }
 
-/// Check if a single filter expression prunes the given row group.
-fn filter_prunes_row_group(rg: &RowGroupMetaData, filter: &PlanExpr) -> bool {
-    match filter {
-        PlanExpr::BinaryOp {
-            left, op, right, ..
-        } => {
-            // AND conjunction: prune if either side proves no match
-            if *op == BinaryOp::And {
-                return filter_prunes_row_group(rg, left) || filter_prunes_row_group(rg, right);
+impl PruneCheck {
+    fn new(filter: &PlanExpr) -> Self {
+        match filter {
+            PlanExpr::BinaryOp {
+                left, op, right, ..
+            } => {
+                if *op == BinaryOp::And {
+                    return Self::And(Box::new(Self::new(left)), Box::new(Self::new(right)));
+                }
+                match extract_column_literal_comparison(left, op, right) {
+                    Some((column, literal, op)) => Self::Compare {
+                        column,
+                        literal,
+                        op,
+                    },
+                    None => Self::Never,
+                }
             }
-
-            // Try Column op Literal
-            if let Some((col_idx, scalar, comparison_op)) =
-                extract_column_literal_comparison(left, op, right)
-            {
-                return column_stats_prune(rg, col_idx, &scalar, comparison_op);
+            PlanExpr::InList {
+                expr,
+                list,
+                negated: false,
+                ..
+            } => {
+                let PlanExpr::Column { index, .. } = expr.as_ref() else {
+                    return Self::Never;
+                };
+                match inlist_keys(list) {
+                    Some(keys) if !keys.is_empty() => Self::InList {
+                        column: *index,
+                        keys,
+                    },
+                    _ => Self::Never,
+                }
             }
-
-            false
+            _ => Self::Never,
         }
-        // Dynamic-filter InList: prune the row group if every list
-        // value falls outside the column's [min, max] range. Only
-        // applies to non-negated InList over a single column with
-        // all-literal items (the shape produced by
-        // `inject_inlist_dynamic_filters`).
-        PlanExpr::InList {
-            expr,
-            list,
-            negated: false,
-            ..
-        } => match (expr.as_ref(), extract_inlist_literals(list)) {
-            (PlanExpr::Column { index, .. }, Some(values)) => {
-                inlist_stats_prune(rg, *index, &values)
-            }
-            _ => false,
-        },
-        _ => false,
     }
+
+    /// Whether statistics prove `rg` holds no row this filter keeps.
+    fn prunes(&self, rg: &RowGroupMetaData) -> bool {
+        match self {
+            Self::And(left, right) => left.prunes(rg) || right.prunes(rg),
+            Self::Compare {
+                column,
+                literal,
+                op,
+            } => column_stats_prune(rg, *column, literal, *op),
+            Self::InList { column, keys } => inlist_stats_prune(rg, *column, keys),
+            Self::Never => false,
+        }
+    }
+}
+
+/// The IN list's values as sorted integers, or `None` when an item is not
+/// an integer-shaped literal (statistics then cannot prune).
+fn inlist_keys(list: &[PlanExpr]) -> Option<Vec<i64>> {
+    let mut keys = list
+        .iter()
+        .map(|item| match item {
+            PlanExpr::Literal {
+                value: ScalarValue::Int32(x) | ScalarValue::Date32(x),
+                ..
+            } => Some(*x as i64),
+            PlanExpr::Literal {
+                value: ScalarValue::Int64(x),
+                ..
+            } => Some(*x),
+            _ => None,
+        })
+        .collect::<Option<Vec<i64>>>()?;
+    keys.sort_unstable();
+    Some(keys)
+}
+
+/// Returns `true` if every key in sorted `keys` falls outside the row
+/// group's `[min, max]` range for column `col_idx`, proving that
+/// `col IN (keys...)` cannot match any row in it. When stats are missing
+/// or not integer-shaped, returns `false` (conservative: keep the row group).
+fn inlist_stats_prune(rg: &RowGroupMetaData, col_idx: usize, keys: &[i64]) -> bool {
+    if col_idx >= rg.num_columns() || keys.is_empty() {
+        return false;
+    }
+    let (min, max) = match rg.column(col_idx).statistics() {
+        Some(Statistics::Int32(s)) => match (s.min_opt(), s.max_opt()) {
+            (Some(lo), Some(hi)) => (*lo as i64, *hi as i64),
+            _ => return false,
+        },
+        Some(Statistics::Int64(s)) => match (s.min_opt(), s.max_opt()) {
+            (Some(lo), Some(hi)) => (*lo, *hi),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    // The smallest key not below `min`; the row group may match only if
+    // it is within the range.
+    let first = keys.partition_point(|k| *k < min);
+    first == keys.len() || keys[first] > max
 }
 
 /// Pulls all `ScalarValue`s out of an InList's item list when every
@@ -115,53 +185,6 @@ fn extract_inlist_literals(list: &[PlanExpr]) -> Option<Vec<ScalarValue>> {
         }
     }
     Some(out)
-}
-
-/// Returns `true` if every value in `values` falls outside the
-/// row group's `[min, max]` range for column `col_idx`, proving that
-/// `col IN (values...)` cannot match any row in this row group.
-/// When stats are missing or the type is unsupported, returns `false`
-/// (conservative: keep the row group).
-fn inlist_stats_prune(rg: &RowGroupMetaData, col_idx: usize, values: &[ScalarValue]) -> bool {
-    if col_idx >= rg.num_columns() || values.is_empty() {
-        return false;
-    }
-    let col = rg.column(col_idx);
-    let stats = match col.statistics() {
-        Some(s) => s,
-        None => return false,
-    };
-
-    // Reduce all supported integer-shaped stats to `(min_i64, max_i64)`
-    // and check each list value against the range. As soon as ONE
-    // value is inside the range, we can't prune. If ALL values are
-    // outside, we can.
-    let (min, max) = match stats {
-        Statistics::Int32(s) => match (s.min_opt(), s.max_opt()) {
-            (Some(lo), Some(hi)) => (*lo as i64, *hi as i64),
-            _ => return false,
-        },
-        Statistics::Int64(s) => match (s.min_opt(), s.max_opt()) {
-            (Some(lo), Some(hi)) => (*lo, *hi),
-            _ => return false,
-        },
-        _ => return false,
-    };
-
-    for v in values {
-        let candidate: i64 = match v {
-            ScalarValue::Int32(x) => *x as i64,
-            ScalarValue::Int64(x) => *x,
-            ScalarValue::Date32(x) => *x as i64,
-            _ => return false, // unsupported value type in list → don't prune
-        };
-        if candidate >= min && candidate <= max {
-            // At least one value is inside the row group's range —
-            // can't safely prune.
-            return false;
-        }
-    }
-    true
 }
 
 /// Extract (column_index, literal_value, op) from a comparison expression.
@@ -697,6 +720,97 @@ mod tests {
         assert!(prune_with_minmax_i64(Some(10), Some(20), 20, BinaryOp::Gt));
         // Column > 15, range [10, 20] → don't prune (max=20 > 15)
         assert!(!prune_with_minmax_i64(Some(10), Some(20), 15, BinaryOp::Gt));
+    }
+
+    /// Row groups of a real file: `rows` Int32 ids `0..rows`, `per_group`
+    /// rows to a row group.
+    fn id_row_groups(rows: i32, per_group: usize) -> Vec<RowGroupMetaData> {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow::array::Int32Array::from(
+                (0..rows).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let file = tempfile::tempfile().unwrap();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(per_group))
+            .build();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file.try_clone().unwrap(), schema, Some(props))
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let reader = SerializedFileReader::new(file).unwrap();
+        reader.metadata().row_groups().to_vec()
+    }
+
+    fn id_in(values: impl IntoIterator<Item = ScalarValue>) -> PlanExpr {
+        PlanExpr::InList {
+            expr: Box::new(PlanExpr::Column {
+                index: 0,
+                name: "id".to_string(),
+                span: None,
+            }),
+            list: values
+                .into_iter()
+                .map(|value| PlanExpr::Literal { value, span: None })
+                .collect(),
+            negated: false,
+            span: None,
+        }
+    }
+
+    #[test]
+    fn an_in_list_keeps_only_the_row_groups_its_values_fall_in() {
+        // Row groups: [0, 99], [100, 199], ..., [900, 999].
+        let groups = id_row_groups(1_000, 100);
+        assert_eq!(groups.len(), 10);
+        // Unsorted, with many values past the file and one in each of
+        // groups 1 and 7, plus one on a group's upper bound (group 4).
+        let mut values: Vec<ScalarValue> = (5_000..105_000).map(ScalarValue::Int32).collect();
+        values.extend([
+            ScalarValue::Int32(750),
+            ScalarValue::Int32(150),
+            ScalarValue::Int32(499),
+        ]);
+        assert_eq!(
+            prune_row_groups(&groups, &[id_in(values)], &[]),
+            vec![1, 4, 7]
+        );
+        // Int64 and Date32 literals compare the same way.
+        let wide = id_in([ScalarValue::Int64(250), ScalarValue::Date32(0)]);
+        assert_eq!(prune_row_groups(&groups, &[wide], &[]), vec![0, 2]);
+        // None of the values in the file: every group is pruned.
+        let absent = id_in([ScalarValue::Int32(-1), ScalarValue::Int32(1_000)]);
+        assert!(prune_row_groups(&groups, &[absent], &[]).is_empty());
+        // A value statistics cannot compare keeps every group.
+        let mixed = id_in([ScalarValue::Int32(150), ScalarValue::Utf8("x".into())]);
+        assert_eq!(prune_row_groups(&groups, &[mixed], &[]).len(), 10);
+    }
+
+    /// A dynamic filter's IN list can hold hundreds of thousands of values;
+    /// pruning a file prepares it once, not once per row group (#291: 0.8 s
+    /// per split of SF1 lineitem before).
+    #[test]
+    fn a_long_in_list_prunes_many_row_groups_quickly() {
+        let groups = id_row_groups(100_000, 1_000);
+        assert_eq!(groups.len(), 100);
+        let values = (0..1_000_000)
+            .rev()
+            .map(|v| ScalarValue::Int32(v * 7 + 1_000_000));
+        let filter = id_in(values);
+        let started = std::time::Instant::now();
+        assert!(prune_row_groups(&groups, &[filter], &[]).is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

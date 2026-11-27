@@ -382,6 +382,15 @@ impl TableProvider for FileTable {
         self.schema.clone()
     }
 
+    /// Records the planning node's scan-parallelism target so every node
+    /// splits a Parquet file into the same partitions (#157, #283).
+    fn properties(&self) -> HashMap<String, String> {
+        HashMap::from([(
+            crate::parquet_scan::SCAN_PARALLELISM_PROPERTY.to_string(),
+            crate::parquet_scan::local_scan_parallelism().to_string(),
+        )])
+    }
+
     fn statistics(&self) -> Option<TableStatistics> {
         if self.row_count.is_none() && self.size_bytes.is_none() {
             return None;
@@ -524,7 +533,7 @@ impl ConnectorFactory for FileConnectorFactory {
         &self,
         table: &TableReference,
         _schema: &[ColumnInfo],
-        _properties: &std::collections::HashMap<String, String>,
+        properties: &std::collections::HashMap<String, String>,
     ) -> Result<Arc<dyn DataSource>, ConnectorError> {
         let tables = self.tables.read().unwrap();
         let entry = tables.get(&table.table).ok_or_else(|| {
@@ -547,23 +556,49 @@ impl ConnectorFactory for FileConnectorFactory {
                     store: entry.store.clone(),
                     path: entry.path.clone(),
                     column_schema: entry.schema.clone(),
+                    splits: parquet_file_splits(
+                        entry.row_count,
+                        crate::parquet_scan::scan_parallelism(properties),
+                    ),
                 }))
             }
         }
     }
 }
 
+/// Fewest rows a Parquet file split may cover. Smaller files are not split:
+/// opening the footer once per split costs more than it saves.
+const MIN_ROWS_PER_SPLIT: u64 = 100_000;
+
+/// How many row-range partitions a registered Parquet file is read as:
+/// `target` (the planning node's scan parallelism), capped so no split
+/// covers fewer than [`MIN_ROWS_PER_SPLIT`] rows. A file without a known row
+/// count stays a single partition. The result depends only on the file and
+/// the planned target, so every node exposes the same partitions.
+fn parquet_file_splits(row_count: Option<u64>, target: usize) -> usize {
+    let by_rows = (row_count.unwrap_or(0) / MIN_ROWS_PER_SPLIT).max(1);
+    usize::try_from(by_rows)
+        .unwrap_or(usize::MAX)
+        .min(target.max(1))
+}
+
 /// A Parquet data source with pre-resolved schema (avoids async in create_data_source).
+///
+/// A large file is read as `splits` contiguous row ranges, one per
+/// partition, so a scan of a single file (and the join or aggregate fused
+/// above it) runs on several cores, as Hive and Iceberg scans do.
 struct PreResolvedParquetDataSource {
     store: Arc<dyn ObjectStore>,
     path: ObjectPath,
     column_schema: Vec<ColumnInfo>,
+    splits: usize,
 }
 
 impl fmt::Debug for PreResolvedParquetDataSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PreResolvedParquetDataSource")
             .field("path", &self.path.to_string())
+            .field("splits", &self.splits)
             .finish()
     }
 }
@@ -574,17 +609,21 @@ impl DataSource for PreResolvedParquetDataSource {
         self.column_schema.clone()
     }
 
+    fn partition_count(&self) -> usize {
+        self.splits
+    }
+
     async fn scan(
         &self,
         ctx: &ScanContext,
         partition: usize,
     ) -> Result<SendableRecordBatchStream, ExecutionError> {
-        if partition != 0 {
+        if partition >= self.splits {
             return Err(ExecutionError::InvalidOperation(format!(
-                "single-file data source: partition {partition} out of range"
+                "Parquet file '{}': partition {partition} out of range (have {} splits)",
+                self.path, self.splits
             )));
         }
-        let _ = partition;
         let meta = self.store.head(&self.path).await.map_err(|e| {
             ExecutionError::InvalidOperation(format!(
                 "failed to stat Parquet file '{}': {}",
@@ -602,6 +641,20 @@ impl DataSource for PreResolvedParquetDataSource {
                 .map_err(|e| {
                     ExecutionError::InvalidOperation(format!("Parquet reader error: {e}"))
                 })?;
+
+        if self.splits > 1 {
+            let total_rows: usize = builder
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(|rg| rg.num_rows().max(0) as usize)
+                .sum();
+            builder = builder.with_row_selection(crate::parquet_scan::compute_split_selection(
+                total_rows,
+                partition,
+                self.splits,
+            ));
+        }
 
         if let Some(ref projection) = ctx.projection {
             let mask = parquet::arrow::ProjectionMask::roots(
@@ -1281,6 +1334,141 @@ mod tests {
     }
 
     // -- Row group pruning and batch size tests --
+
+    /// Register a single Parquet file of `rows` Int32 ids (`0..rows`), written
+    /// in row groups of 50_000, through an in-memory store.
+    async fn register_ids(rows: i32) -> FileConnectorFactory {
+        use object_store::memory::InMemory;
+        use object_store::PutPayload;
+        use parquet::arrow::arrow_writer::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from((0..rows).collect::<Vec<_>>()))],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(50_000))
+            .build();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, arrow_schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let store = Arc::new(InMemory::new());
+        let obj_path = ObjectPath::from("data/ids.parquet");
+        store
+            .put(&obj_path, PutPayload::from_bytes(buf.into()))
+            .await
+            .unwrap();
+        let registry = Arc::new(StorageRegistry::new());
+        registry.register_store("s3://split-bucket", store);
+        let factory = FileConnectorFactory::new(registry);
+        factory
+            .register_table(
+                "ids",
+                "s3://split-bucket/data/ids.parquet",
+                FileFormat::Parquet,
+                None,
+            )
+            .await
+            .unwrap();
+        factory
+    }
+
+    fn parallelism(n: usize) -> HashMap<String, String> {
+        HashMap::from([(
+            crate::parquet_scan::SCAN_PARALLELISM_PROPERTY.to_string(),
+            n.to_string(),
+        )])
+    }
+
+    async fn read_ids(ds: &Arc<dyn DataSource>, partition: usize) -> Vec<i32> {
+        let stream = ds.scan(&ScanContext::default(), partition).await.unwrap();
+        let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
+        batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_large_parquet_file_is_split_into_the_planned_partitions() {
+        let factory = register_ids(450_000).await;
+        let ds = factory
+            .create_data_source(&TableReference::table("ids"), &[], &parallelism(4))
+            .await
+            .unwrap();
+        assert_eq!(ds.partition_count(), 4);
+
+        // The splits are disjoint, contiguous and together cover every row once.
+        let mut all = Vec::new();
+        for p in 0..4 {
+            let ids = read_ids(&ds, p).await;
+            assert!(!ids.is_empty(), "split {p} is empty");
+            all.extend(ids);
+        }
+        assert_eq!(all, (0..450_000).collect::<Vec<_>>());
+
+        let err = ds.scan(&ScanContext::default(), 4).await.err().unwrap();
+        assert!(err.to_string().contains("out of range"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_split_count_follows_the_planned_parallelism_not_the_local_cores() {
+        let factory = register_ids(450_000).await;
+        for (target, expected) in [(1, 1), (2, 2), (64, 4)] {
+            let ds = factory
+                .create_data_source(&TableReference::table("ids"), &[], &parallelism(target))
+                .await
+                .unwrap();
+            // 450_000 rows allow at most 4 splits of MIN_ROWS_PER_SPLIT rows.
+            assert_eq!(ds.partition_count(), expected, "target {target}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_small_parquet_file_stays_one_partition() {
+        let factory = register_ids(1_000).await;
+        let ds = factory
+            .create_data_source(&TableReference::table("ids"), &[], &parallelism(8))
+            .await
+            .unwrap();
+        assert_eq!(ds.partition_count(), 1);
+        assert_eq!(read_ids(&ds, 0).await, (0..1_000).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn parquet_file_splits_caps_by_rows_and_target() {
+        assert_eq!(parquet_file_splits(None, 8), 1);
+        assert_eq!(parquet_file_splits(Some(0), 8), 1);
+        assert_eq!(parquet_file_splits(Some(99_999), 8), 1);
+        assert_eq!(parquet_file_splits(Some(250_000), 8), 2);
+        assert_eq!(parquet_file_splits(Some(6_001_215), 8), 8);
+        assert_eq!(parquet_file_splits(Some(6_001_215), 0), 1);
+    }
+
+    #[test]
+    fn a_file_table_records_the_planning_nodes_scan_parallelism() {
+        let props = FileTable::new(vec![]).properties();
+        assert_eq!(
+            props.get(crate::parquet_scan::SCAN_PARALLELISM_PROPERTY),
+            Some(&crate::parquet_scan::local_scan_parallelism().to_string())
+        );
+    }
 
     #[tokio::test]
     async fn parquet_batch_size_produces_correct_results() {

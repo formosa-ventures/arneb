@@ -2052,6 +2052,13 @@ pub struct ClusterConfig {
     /// (`ARNEB_QUERY_RETRY_ATTEMPTS`).
     #[serde(default)]
     pub query_retry_attempts: Option<u32>,
+
+    /// Let the coordinator run a query's root-stage work (its final joins,
+    /// aggregations, sorts and windows) instead of handing it to a worker
+    /// (`ARNEB_INCLUDE_COORDINATOR`). Default `false`, like Trino's
+    /// `node-scheduler.include-coordinator` on a multi-node cluster.
+    #[serde(default)]
+    pub include_coordinator: Option<bool>,
 }
 
 /// Default `[cluster] drain_timeout_secs`.
@@ -2252,6 +2259,15 @@ impl ClusterConfig {
         Ok(Some(crate::coordinator::QueryRetry::new(attempts)))
     }
 
+    /// `[cluster] include_coordinator` with the `ARNEB_INCLUDE_COORDINATOR`
+    /// override (env > file > default `false`).
+    pub fn include_coordinator(&self, env: impl Fn(&str) -> Option<String>) -> Result<bool> {
+        match env("ARNEB_INCLUDE_COORDINATOR") {
+            Some(v) => parse_env_bool("ARNEB_INCLUDE_COORDINATOR", &v),
+            None => Ok(self.include_coordinator.unwrap_or(false)),
+        }
+    }
+
     /// Build the cluster RPC security from `[cluster] secret` /
     /// `[cluster.tls]` with `ARNEB_CLUSTER_*` overrides (looked up through
     /// `env`). Reads the PEM files.
@@ -2331,6 +2347,7 @@ impl Default for ClusterConfig {
             drain_timeout_secs: None,
             retry_policy: None,
             query_retry_attempts: None,
+            include_coordinator: None,
         }
     }
 }
@@ -4050,6 +4067,26 @@ password = "hunter2"
         assert!(ClusterConfig::default()
             .heartbeat(env_from(&[("ARNEB_HEARTBEAT_INTERVAL_SECS", "x")]))
             .is_err());
+    }
+
+    #[test]
+    fn include_coordinator_defaults_off_with_file_and_env_overrides() {
+        let read = |toml_src: &str, env: &[(&str, &str)]| {
+            let cluster: ClusterConfig = toml::from_str(toml_src).unwrap();
+            cluster.include_coordinator(env_from(env))
+        };
+        assert!(!read("", &[]).unwrap());
+        assert!(read("include_coordinator = true", &[]).unwrap());
+        assert!(!read(
+            "include_coordinator = true",
+            &[("ARNEB_INCLUDE_COORDINATOR", "false")]
+        )
+        .unwrap());
+        assert!(read("", &[("ARNEB_INCLUDE_COORDINATOR", "on")]).unwrap());
+        let err = read("", &[("ARNEB_INCLUDE_COORDINATOR", "maybe")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ARNEB_INCLUDE_COORDINATOR"), "{err}");
     }
 
     #[test]

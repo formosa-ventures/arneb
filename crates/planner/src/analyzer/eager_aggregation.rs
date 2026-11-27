@@ -923,6 +923,12 @@ where
             remap_expr_columns(e, f).ok_or(())
         })
         .ok()?,
+        PlanExpr::ArrayElement(pair) => {
+            crate::try_map_array_element_ref(pair, |e| remap_expr_columns(e, f).ok_or(())).ok()?
+        }
+        PlanExpr::GetField(pair) => {
+            crate::try_map_get_field_ref(pair, |e| remap_expr_columns(e, f).ok_or(())).ok()?
+        }
         PlanExpr::Between {
             expr,
             negated,
@@ -1225,6 +1231,10 @@ fn shift_column_indices(expr: PlanExpr, offset: usize) -> PlanExpr {
         } => crate::map_array_contains(expr, array, negated, span, |e| {
             shift_column_indices(e, offset)
         }),
+        PlanExpr::ArrayElement(pair) => {
+            crate::map_array_element(pair, |e| shift_column_indices(e, offset))
+        }
+        PlanExpr::GetField(pair) => crate::map_get_field(pair, |e| shift_column_indices(e, offset)),
         PlanExpr::Array {
             elements,
             element_type,
@@ -1537,6 +1547,11 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             collect_column_indices(expr, cb);
             collect_column_indices(array, cb);
         }
+        PlanExpr::ArrayElement(pair) => {
+            collect_column_indices(&pair.0, cb);
+            collect_column_indices(&pair.1, cb);
+        }
+        PlanExpr::GetField(pair) => collect_column_indices(&pair.0, cb),
         PlanExpr::Between {
             expr, low, high, ..
         } => {
@@ -1609,6 +1624,27 @@ fn expr_eq(left: &PlanExpr, right: &PlanExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shift_column_indices_shifts_inside_subscripts_and_field_access() {
+        let col = |index: usize| PlanExpr::Column {
+            index,
+            name: format!("c{index}"),
+            span: None,
+        };
+        let element = PlanExpr::ArrayElement(Box::new((col(2), col(0))));
+        let field = PlanExpr::GetField(Box::new((element, "x".to_string())));
+        let shifted = shift_column_indices(field, 3);
+        let PlanExpr::GetField(pair) = &shifted else {
+            panic!("expected GetField, got {shifted}");
+        };
+        assert_eq!(pair.1, "x");
+        let PlanExpr::ArrayElement(inner) = &pair.0 else {
+            panic!("expected ArrayElement");
+        };
+        assert!(matches!(inner.0, PlanExpr::Column { index: 5, .. }));
+        assert!(matches!(inner.1, PlanExpr::Column { index: 3, .. }));
+    }
     use std::collections::HashMap;
     use std::sync::Arc;
 

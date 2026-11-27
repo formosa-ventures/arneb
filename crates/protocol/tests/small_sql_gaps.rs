@@ -167,6 +167,24 @@ async fn a_cast_guarded_by_and_skips_the_rows_the_guard_rules_out() {
 }
 
 #[tokio::test]
+async fn a_cast_after_two_guards_skips_the_rows_either_rules_out() {
+    for sql in [
+        "SELECT s FROM n WHERE s <> 'abc' AND s IS NOT NULL AND CAST(s AS INTEGER) > 0",
+        "SELECT s FROM n WHERE s IS NOT NULL AND regexp_like(s, '^[0-9]+$') AND CAST(s AS INTEGER) > 5",
+    ] {
+        let (got, _) = rows(sql).await;
+        assert_eq!(got, vec![row(&["12"])], "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn try_cast_to_regclass_of_a_bad_name_is_null() {
+    let (got, _) = rows("SELECT TRY_CAST('a.b.c.d' AS regclass)").await;
+    assert_eq!(got, vec![row(&["NULL"])]);
+    assert!(run("SELECT CAST('a.b.c.d' AS regclass)").await.is_err());
+}
+
+#[tokio::test]
 async fn a_cast_guarded_by_or_skips_the_rows_the_guard_already_keeps() {
     let (got, _) =
         rows("SELECT s FROM n WHERE s = 'abc' OR CAST(s AS INTEGER) = 12 ORDER BY s").await;

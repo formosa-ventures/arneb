@@ -504,24 +504,21 @@ fn try_push_into(
                 )),
             }
         }
-        // A filter already on the scan holds an earlier conjunct (or an
-        // inner query's WHERE). A new conjunct that can fail on some row
-        // goes above it, not between it and the scan, so it runs after the
-        // conjuncts written before it: a guard such as
+        // A stack of filters already on the scan holds earlier conjuncts (or
+        // an inner query's WHERE). A new conjunct that can fail on some row
+        // goes above the whole stack, not between it and the scan, so it
+        // runs after every conjunct already placed there: a guard such as
         // `s <> 'n/a' AND CAST(s AS INTEGER) > 0` filters the rows before
-        // the cast sees them, as in Trino. A conjunct that cannot fail still
-        // goes below, where it was always placed.
+        // the cast sees them. A conjunct that cannot fail still goes below,
+        // where it was always placed. Filters do not change the schema, so
+        // the conjunct resolves against the scan's.
         L::Filter { input, predicate }
-            if matches!(
-                input.as_ref(),
-                L::TableScan { schema, .. }
-                    if rewrite_against(&conjunct, schema)
-                        .is_some_and(|resolved| can_fail_on_a_row(&resolved, schema))
-            ) =>
+            if scan_under_filters(&input).is_some_and(|schema| {
+                rewrite_against(&conjunct, schema)
+                    .is_some_and(|resolved| can_fail_on_a_row(&resolved, schema))
+            }) =>
         {
-            let L::TableScan { schema, .. } = input.as_ref() else {
-                unreachable!("guarded by the match arm")
-            };
+            let schema = scan_under_filters(&input).expect("guarded by the match arm");
             let resolved = rewrite_against(&conjunct, schema).expect("guarded by the match arm");
             Ok(L::Filter {
                 input: Box::new(L::Filter { input, predicate }),
@@ -842,6 +839,10 @@ fn can_fail_on_a_row(expr: &PlanExpr, schema: &[ColumnInfo]) -> bool {
         E::InList { expr, list, .. } => fails(expr) || list.iter().any(fails),
         E::Array { elements, .. } => elements.iter().any(fails),
         E::ArrayContains { expr, array, .. } => fails(expr) || fails(array),
+        // An index out of range is NULL and an unknown field a plan-time
+        // error, so only the operands can fail on a row.
+        E::ArrayElement(pair) => fails(&pair.0) || fails(&pair.1),
+        E::GetField(pair) => fails(&pair.0),
         E::CaseExpr {
             operand,
             when_clauses,
@@ -918,6 +919,8 @@ fn references_a_column(expr: &PlanExpr) -> bool {
         E::ArrayContains { expr, array, .. } => {
             references_a_column(expr) || references_a_column(array)
         }
+        E::ArrayElement(pair) => references_a_column(&pair.0) || references_a_column(&pair.1),
+        E::GetField(pair) => references_a_column(&pair.0),
         E::CaseExpr {
             operand,
             when_clauses,
@@ -930,6 +933,16 @@ fn references_a_column(expr: &PlanExpr) -> bool {
                     .any(|(w, t)| references_a_column(w) || references_a_column(t))
                 || else_result.as_deref().is_some_and(references_a_column)
         }
+    }
+}
+
+/// The schema of the `TableScan` under `plan` when `plan` is that scan or a
+/// stack of `Filter`s over it.
+fn scan_under_filters(plan: &LogicalPlan) -> Option<&[ColumnInfo]> {
+    match plan {
+        LogicalPlan::TableScan { schema, .. } => Some(schema),
+        LogicalPlan::Filter { input, .. } => scan_under_filters(input),
+        _ => None,
     }
 }
 
@@ -1266,6 +1279,11 @@ fn visit_column_pairs<F: FnMut(&str, usize)>(expr: &PlanExpr, callback: &mut F) 
             visit_column_pairs(expr, callback);
             visit_column_pairs(array, callback);
         }
+        E::ArrayElement(pair) => {
+            visit_column_pairs(&pair.0, callback);
+            visit_column_pairs(&pair.1, callback);
+        }
+        E::GetField(pair) => visit_column_pairs(&pair.0, callback),
         E::Function { args, order_by, .. } => {
             for a in args {
                 visit_column_pairs(a, callback);
@@ -1525,6 +1543,11 @@ fn visit_column_names<F: FnMut(&str)>(expr: &PlanExpr, callback: &mut F) {
             visit_column_names(expr, callback);
             visit_column_names(array, callback);
         }
+        E::ArrayElement(pair) => {
+            visit_column_names(&pair.0, callback);
+            visit_column_names(&pair.1, callback);
+        }
+        E::GetField(pair) => visit_column_names(&pair.0, callback),
         E::Function { args, order_by, .. } => {
             for a in args {
                 visit_column_names(a, callback);
@@ -1652,6 +1675,12 @@ fn rewrite_expr(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<PlanExpr> {
             rewrite_expr(e, schema).ok_or(())
         })
         .ok()?,
+        E::ArrayElement(pair) => {
+            crate::try_map_array_element_ref(pair, |e| rewrite_expr(e, schema).ok_or(())).ok()?
+        }
+        E::GetField(pair) => {
+            crate::try_map_get_field_ref(pair, |e| rewrite_expr(e, schema).ok_or(())).ok()?
+        }
         E::Array {
             elements,
             element_type,
@@ -1813,6 +1842,35 @@ mod tests {
         }
         assert!(matches!(node, LogicalPlan::TableScan { .. }));
         assert_eq!(order, vec![narrowing, guard, widening]);
+    }
+
+    /// With two guards already stacked on the scan, the failing conjunct
+    /// still runs after both of them, not between them.
+    #[test]
+    fn a_conjunct_that_can_fail_runs_after_every_guard_before_it() {
+        let narrowing = eq(
+            PlanExpr::Cast {
+                expr: Box::new(col("b", 1)),
+                data_type: DataType::Int8,
+                span: None,
+            },
+            lit_i32(1),
+        );
+        let first = eq(col("a", 0), lit_i32(1));
+        let second = eq(col("a", 0), lit_i32(2));
+        let filter = LogicalPlan::Filter {
+            input: Box::new(scan("t", &["a", "b"])),
+            predicate: and(and(first.clone(), second.clone()), narrowing.clone()),
+        };
+        let mut order = Vec::new();
+        let mut node = push_down(filter);
+        while let LogicalPlan::Filter { input, predicate } = node {
+            order.push(predicate);
+            node = *input;
+        }
+        assert!(matches!(node, LogicalPlan::TableScan { .. }));
+        assert_eq!(order.first(), Some(&narrowing));
+        assert_eq!(order.len(), 3);
     }
 
     #[test]

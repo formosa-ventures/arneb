@@ -97,6 +97,10 @@ pub(crate) fn evaluate(
             array_contains(&value, &list, *negated)
         }
 
+        PlanExpr::ArrayElement(pair) => evaluate_array_element(pair, batch, registry),
+
+        PlanExpr::GetField(pair) => evaluate_get_field(pair, batch, registry),
+
         PlanExpr::BinaryOp {
             left,
             op: op @ (ast::BinaryOp::And | ast::BinaryOp::Or),
@@ -365,6 +369,15 @@ fn evaluate_try(
 /// out. The right side is evaluated over the whole batch first (one
 /// vectorized pass, the common case); only if that fails is it evaluated
 /// again over just the open rows, where an error is the query's.
+///
+/// Cost of the retry: on a batch where the whole-batch pass fails, the
+/// right side is evaluated twice (once over the batch, once over the open
+/// rows) plus a `take` to gather those rows. A chain written left to right
+/// (`a AND b AND c` parses as `(a AND b) AND c`) evaluates each conjunct at
+/// most twice. An `AND` / `OR` nested on the right side doubles that at each
+/// level whose whole-batch pass fails, so `a AND (b AND c)` can evaluate `c`
+/// four times. Clean data, or a left side that decides every row, pays
+/// nothing extra.
 fn evaluate_logical(
     left: &PlanExpr,
     op: &ast::BinaryOp,
@@ -700,6 +713,98 @@ fn build_list_array(
     list_from_values(values, &elem_type, &vec![k; num_rows])
 }
 
+/// `array[index]`: out of line so the recursive `evaluate` frame stays small.
+#[inline(never)]
+fn evaluate_array_element(
+    pair: &(PlanExpr, PlanExpr),
+    batch: &RecordBatch,
+    registry: Option<&FunctionRegistry>,
+) -> Result<ArrayRef, ExecutionError> {
+    let list = evaluate(&pair.0, batch, registry)?;
+    let index = evaluate(&pair.1, batch, registry)?;
+    array_element(&list, &index)
+}
+
+/// The element at the 1-based `index` of each row of `list`; NULL for a NULL
+/// array or index, or an index outside `1..=len`.
+pub(crate) fn array_element(list: &ArrayRef, index: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+    let rows = list.len();
+    let Some(list) = list.as_any().downcast_ref::<arrow::array::ListArray>() else {
+        // An untyped NULL array.
+        if list.data_type() == &ArrowDataType::Null {
+            return Ok(arrow::array::new_null_array(&ArrowDataType::Null, rows));
+        }
+        return Err(ExecutionError::InvalidOperation(format!(
+            "cannot subscript type {} because it is not an array",
+            list.data_type()
+        )));
+    };
+    let index = kernels::cast::cast(index, &ArrowDataType::Int64)?;
+    let index = index
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("cast to Int64 yields Int64Array");
+    let offsets = list.value_offsets();
+    let positions: arrow::array::UInt32Array = (0..rows)
+        .map(|row| {
+            if list.is_null(row) || index.is_null(row) {
+                return None;
+            }
+            let (start, end) = (offsets[row] as i64, offsets[row + 1] as i64);
+            let i = index.value(row);
+            (i >= 1 && i <= end - start).then(|| (start + i - 1) as u32)
+        })
+        .collect();
+    Ok(kernels::take::take(
+        list.values().as_ref(),
+        &positions,
+        None,
+    )?)
+}
+
+/// `(expr).field`: out of line so the recursive `evaluate` frame stays small.
+#[inline(never)]
+fn evaluate_get_field(
+    pair: &(PlanExpr, String),
+    batch: &RecordBatch,
+    registry: Option<&FunctionRegistry>,
+) -> Result<ArrayRef, ExecutionError> {
+    let value = evaluate(&pair.0, batch, registry)?;
+    get_field(&value, &pair.1)
+}
+
+/// The field `name` (case-insensitive) of each row of a struct array; NULL
+/// where the struct is NULL.
+pub(crate) fn get_field(value: &ArrayRef, name: &str) -> Result<ArrayRef, ExecutionError> {
+    let rows = value.len();
+    let Some(st) = value.as_any().downcast_ref::<arrow::array::StructArray>() else {
+        if value.data_type() == &ArrowDataType::Null {
+            return Ok(arrow::array::new_null_array(&ArrowDataType::Null, rows));
+        }
+        return Err(ExecutionError::InvalidOperation(format!(
+            "column notation .{name} applied to type {}, which is not a composite type",
+            value.data_type()
+        )));
+    };
+    let position = st
+        .fields()
+        .iter()
+        .position(|f| f.name().eq_ignore_ascii_case(name))
+        .ok_or_else(|| {
+            ExecutionError::InvalidOperation(format!(
+                "column \"{name}\" not found in data type {}",
+                value.data_type()
+            ))
+        })?;
+    let column = st.column(position).clone();
+    let Some(outer) = st.nulls() else {
+        return Ok(column);
+    };
+    let nulls = arrow::buffer::NullBuffer::union(Some(outer), column.nulls());
+    let data = column.to_data().into_builder().nulls(nulls).build()?;
+    Ok(arrow::array::make_array(data))
+}
+
 /// `value = ANY (list)` per row, or `value <> ALL (list)` when `negated`,
 /// with SQL's three-valued logic: an empty list is false (`<> ALL`: true)
 /// whatever `value` is, a NULL list is NULL, otherwise a match is true, a
@@ -850,6 +955,16 @@ fn compare_op(
     let right = right.clone();
 
     match left.data_type() {
+        ArrowDataType::Int8 => {
+            let l = left.as_primitive::<Int8Type>();
+            let r = right.as_primitive::<Int8Type>();
+            typed_cmp(l, r, op)
+        }
+        ArrowDataType::Int16 => {
+            let l = left.as_primitive::<Int16Type>();
+            let r = right.as_primitive::<Int16Type>();
+            typed_cmp(l, r, op)
+        }
         ArrowDataType::Int32 => {
             let l = left.as_primitive::<Int32Type>();
             let r = right.as_primitive::<Int32Type>();
@@ -1023,6 +1138,15 @@ fn arithmetic_op(
     right: &ArrayRef,
     op: ArithOp,
 ) -> Result<ArrayRef, ExecutionError> {
+    // `date - date` is the number of days between them (PostgreSQL).
+    if matches!(op, ArithOp::Sub)
+        && left.data_type() == &ArrowDataType::Date32
+        && right.data_type() == &ArrowDataType::Date32
+    {
+        let li = arrow::compute::cast(left, &ArrowDataType::Int32)?;
+        let ri = arrow::compute::cast(right, &ArrowDataType::Int32)?;
+        return Ok(kernels::numeric::sub(&li, &ri)?);
+    }
     // Date ± integer is a valid mismatched-type combination —
     // Arrow's `numeric::add/sub` handles `Date32 + Int32 = Date32`
     // (and Int64) directly at the kernel level, matching SQL
@@ -1033,8 +1157,8 @@ fn arithmetic_op(
     // manually. Date32 is `days-since-epoch` stored as i32 — we cast
     // the Date32 column to Int32, do the integer arithmetic, then
     // cast back to Date32. Matches SQL `DATE - INTERVAL 'N' DAY`
-    // semantics after `convert_interval` folds the interval to an
-    // integer day count.
+    // semantics after the planner lowers a day interval on a date to
+    // an integer day count.
     let date_int_mix = matches!(
         (left.data_type(), right.data_type()),
         (ArrowDataType::Date32, ArrowDataType::Int32)
@@ -1420,6 +1544,11 @@ fn case_referenced_columns(expr: &PlanExpr, referenced: &mut [bool]) {
             case_referenced_columns(expr, referenced);
             case_referenced_columns(array, referenced);
         }
+        PlanExpr::ArrayElement(pair) => {
+            case_referenced_columns(&pair.0, referenced);
+            case_referenced_columns(&pair.1, referenced);
+        }
+        PlanExpr::GetField(pair) => case_referenced_columns(&pair.0, referenced),
         PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 case_referenced_columns(arg, referenced);
@@ -1976,6 +2105,58 @@ mod tests {
         assert!(!arr.value(0));
         assert!(arr.value(1));
         assert!(!arr.value(2));
+    }
+
+    #[test]
+    fn array_element_is_one_based_and_null_out_of_range() {
+        use arrow::array::{Int64Builder, ListBuilder};
+        // Rows: [10, 20, 30] (sliced past a leading [0]), NULL, [].
+        let mut b = ListBuilder::new(Int64Builder::new());
+        b.values().append_value(0);
+        b.append(true);
+        b.values().append_slice(&[10, 20, 30]);
+        b.append(true);
+        b.append_null();
+        b.append(true);
+        let list: ArrayRef = Arc::new(b.finish().slice(1, 3));
+        let at = |index: Vec<Option<i64>>| {
+            let out =
+                array_element(&list, &(Arc::new(Int64Array::from(index)) as ArrayRef)).unwrap();
+            out.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(at(vec![Some(1), Some(1), Some(1)]), [Some(10), None, None]);
+        assert_eq!(at(vec![Some(3), Some(2), Some(0)]), [Some(30), None, None]);
+        assert_eq!(at(vec![Some(4), None, Some(-1)]), [None, None, None]);
+        assert_eq!(at(vec![Some(0), Some(1), Some(1)]), [None, None, None]);
+        assert_eq!(at(vec![None, Some(1), Some(1)]), [None, None, None]);
+        // An Int32 index is accepted too.
+        let out = array_element(
+            &list,
+            &(Arc::new(Int32Array::from(vec![2, 1, 1])) as ArrayRef),
+        )
+        .unwrap();
+        assert_eq!(
+            out.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+            20
+        );
+    }
+
+    #[test]
+    fn subscript_and_field_of_an_untyped_null_are_null() {
+        let null: ArrayRef = Arc::new(NullArray::new(2));
+        let index: ArrayRef = Arc::new(Int64Array::from(vec![1, 1]));
+        let out = array_element(&null, &index).unwrap();
+        assert_eq!((out.len(), out.data_type()), (2, &ArrowDataType::Null));
+        let out = get_field(&null, "x").unwrap();
+        assert_eq!((out.len(), out.data_type()), (2, &ArrowDataType::Null));
+        // A non-NULL non-array is still refused.
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+        assert!(array_element(&ints, &index).is_err());
+        assert!(get_field(&ints, "x").is_err());
     }
 
     #[test]

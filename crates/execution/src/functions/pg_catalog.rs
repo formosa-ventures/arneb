@@ -1,17 +1,28 @@
 //! PostgreSQL system catalog functions that pgwire clients call while
 //! reading `pg_catalog` (pg-catalog-tables): `format_type`,
 //! `pg_get_userbyid`, `pg_table_is_visible`, `pg_is_other_temp_schema`,
-//! `obj_description`, `col_description` and `to_regtype`.
+//! `obj_description`, `col_description` and `to_regtype`; the constraint,
+//! index, default and sequence definition functions SQLAlchemy reflection
+//! calls (Arneb has none of those objects, so they return NULL); and the
+//! runtime `regclass` conversions the planner emits (`__regclass_name`,
+//! `__regclass_oid`); the privilege check `has_table_privilege`,
+//! `has_any_column_privilege` and `has_schema_privilege` plan to
+//! (`__has_privilege`); and `current_setting`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arneb_common::error::ExecutionError;
 use arneb_common::pg_oid;
+use arneb_common::pg_settings;
 use arneb_common::types::DataType;
-use arrow::array::{new_null_array, Array, ArrayRef, BooleanArray, Int64Array, StringArray};
+use arrow::array::{
+    new_null_array, Array, ArrayRef, BooleanArray, Int64Array, ListBuilder, StringArray,
+    StringBuilder,
+};
 use arrow::datatypes::DataType as ArrowDataType;
 
-use super::args::{check_arity, int64, utf8};
+use super::args::{check_arity, int64, invalid, utf8};
 use super::registry::ScalarFunction;
 
 pub(crate) fn all_pg_catalog_functions() -> Vec<Arc<dyn ScalarFunction>> {
@@ -35,7 +46,417 @@ pub(crate) fn all_pg_catalog_functions() -> Vec<Arc<dyn ScalarFunction>> {
             name: "COL_DESCRIPTION",
             min_args: 2,
         }),
+        Arc::new(NullTextFunction {
+            name: "PG_GET_CONSTRAINTDEF",
+            min_args: 1,
+            max_args: 2,
+        }),
+        Arc::new(NullTextFunction {
+            name: "PG_GET_EXPR",
+            min_args: 2,
+            max_args: 3,
+        }),
+        Arc::new(NullTextFunction {
+            name: "PG_GET_INDEXDEF",
+            min_args: 1,
+            max_args: 3,
+        }),
+        Arc::new(NullTextFunction {
+            name: "PG_GET_SERIAL_SEQUENCE",
+            min_args: 2,
+            max_args: 2,
+        }),
+        Arc::new(ConstantBoolFunction {
+            name: "PG_COLLATION_IS_VISIBLE",
+            value: true,
+        }),
+        Arc::new(RegclassName),
+        Arc::new(RegclassOid),
+        Arc::new(HasPrivilegeFunction),
+        Arc::new(CurrentSettingFunction),
+        Arc::new(CurrentSchemasFunction),
+        Arc::new(FormatFunction),
     ]
+}
+
+/// PostgreSQL's reserved, column-name and type/function-name keywords: the
+/// words `quote_ident` (and so `format('%I')`) double-quotes. Hardcoded from
+/// PostgreSQL's keyword table (sqlparser's keyword lists follow its own
+/// grammar, not PostgreSQL's quoting rules), sorted for binary search.
+const QUOTED_KEYWORDS: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "between",
+    "bigint",
+    "binary",
+    "bit",
+    "boolean",
+    "both",
+    "case",
+    "cast",
+    "char",
+    "character",
+    "check",
+    "coalesce",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "dec",
+    "decimal",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "extract",
+    "false",
+    "fetch",
+    "float",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "greatest",
+    "group",
+    "grouping",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "inout",
+    "int",
+    "integer",
+    "intersect",
+    "interval",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "json",
+    "json_array",
+    "json_arrayagg",
+    "json_exists",
+    "json_object",
+    "json_objectagg",
+    "json_query",
+    "json_scalar",
+    "json_serialize",
+    "json_table",
+    "json_value",
+    "lateral",
+    "leading",
+    "least",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "merge_action",
+    "national",
+    "natural",
+    "nchar",
+    "none",
+    "normalize",
+    "not",
+    "notnull",
+    "null",
+    "nullif",
+    "numeric",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "out",
+    "outer",
+    "overlaps",
+    "overlay",
+    "placing",
+    "position",
+    "precision",
+    "primary",
+    "real",
+    "references",
+    "returning",
+    "right",
+    "row",
+    "select",
+    "session_user",
+    "setof",
+    "similar",
+    "smallint",
+    "some",
+    "substring",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "time",
+    "timestamp",
+    "to",
+    "trailing",
+    "treat",
+    "trim",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "values",
+    "varchar",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+    "xmlattributes",
+    "xmlconcat",
+    "xmlelement",
+    "xmlexists",
+    "xmlforest",
+    "xmlnamespaces",
+    "xmlparse",
+    "xmlpi",
+    "xmlroot",
+    "xmlserialize",
+    "xmltable",
+];
+
+/// `format(template, args...)`: PostgreSQL's `%s`, `%I`, `%L` and `%%`
+/// specifiers. Positional (`%1$s`) and width forms are refused. A NULL
+/// template gives NULL.
+#[derive(Debug)]
+struct FormatFunction;
+
+impl FormatFunction {
+    fn format_row(template: &str, args: &[Option<&str>]) -> Result<String, ExecutionError> {
+        let mut out = String::with_capacity(template.len());
+        let mut next = 0;
+        let mut chars = template.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            let Some(spec) = chars.next() else {
+                return Err(invalid("unterminated format() type specifier"));
+            };
+            if spec == '%' {
+                out.push('%');
+                continue;
+            }
+            if !matches!(spec, 's' | 'I' | 'L') {
+                return Err(invalid(if spec.is_ascii_alphabetic() {
+                    format!("unrecognized format() type specifier \"{spec}\"")
+                } else {
+                    "unsupported format specifier".to_string()
+                }));
+            }
+            let Some(arg) = args.get(next) else {
+                return Err(invalid("too few arguments for format()"));
+            };
+            next += 1;
+            match (spec, arg) {
+                ('s', arg) => out.push_str(arg.unwrap_or("")),
+                ('I', Some(v)) => out.push_str(&quote_ident(v)),
+                ('I', None) => {
+                    return Err(invalid(
+                        "null values cannot be formatted as an SQL identifier",
+                    ))
+                }
+                (_, Some(v)) => {
+                    out.push('\'');
+                    out.push_str(&v.replace('\'', "''"));
+                    out.push('\'');
+                }
+                (_, None) => out.push_str("NULL"),
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl ScalarFunction for FormatFunction {
+    fn name(&self) -> &str {
+        "FORMAT"
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        Ok(DataType::Utf8)
+    }
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        let rows = args.iter().map(|a| a.len()).max().unwrap_or(0);
+        self.invoke(args, rows)
+    }
+    /// Each argument has `num_rows` values, or one that applies to every
+    /// row (a constant); any other length is refused.
+    fn invoke(&self, args: &[ArrayRef], num_rows: usize) -> Result<ArrayRef, ExecutionError> {
+        let Some(first) = args.first() else {
+            return Err(invalid("FORMAT requires at least 1 argument"));
+        };
+        if let Some(bad) = args.iter().find(|a| a.len() != num_rows && a.len() != 1) {
+            return Err(invalid(format!(
+                "FORMAT: an argument has {} values for {num_rows} rows",
+                bad.len()
+            )));
+        }
+        let at = |a: &StringArray, row: usize| if a.len() == 1 { 0 } else { row };
+        let template = utf8(first, "FORMAT")?;
+        let values: Vec<StringArray> = args[1..]
+            .iter()
+            .map(|a| utf8(a, "FORMAT"))
+            .collect::<Result<_, _>>()?;
+        let mut out = StringBuilder::new();
+        for row in 0..num_rows {
+            let t = at(&template, row);
+            if template.is_null(t) {
+                out.append_null();
+                continue;
+            }
+            let row_args: Vec<Option<&str>> = values
+                .iter()
+                .map(|v| {
+                    let r = at(v, row);
+                    (!v.is_null(r)).then(|| v.value(r))
+                })
+                .collect();
+            out.append_value(Self::format_row(template.value(t), &row_args)?);
+        }
+        Ok(Arc::new(out.finish()))
+    }
+}
+
+/// `current_schemas(include_implicit)`: the session's search path as an
+/// array, with `pg_catalog` first when `include_implicit` is true (PostgreSQL's
+/// order). The planner appends the search path as a second argument (the
+/// session's default schema, as `current_schema` reads it); NULL for a NULL
+/// argument.
+#[derive(Debug)]
+struct CurrentSchemasFunction;
+
+impl ScalarFunction for CurrentSchemasFunction {
+    fn name(&self) -> &str {
+        "CURRENT_SCHEMAS"
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        Ok(DataType::List(Box::new(DataType::Utf8)))
+    }
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        check_arity("CURRENT_SCHEMAS", args, 2, 2)?;
+        let include_implicit =
+            arrow::compute::cast(&args[0], &ArrowDataType::Boolean).map_err(|e| {
+                invalid(format!(
+                    "CURRENT_SCHEMAS: the argument must be a boolean: {e}"
+                ))
+            })?;
+        let include_implicit = include_implicit
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("cast to Boolean yields BooleanArray");
+        let path = utf8(&args[1], "CURRENT_SCHEMAS")?;
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        for i in 0..include_implicit.len() {
+            if include_implicit.is_null(i) || path.is_null(i) {
+                builder.append(false);
+                continue;
+            }
+            if include_implicit.value(i) {
+                builder.values().append_value("pg_catalog");
+            }
+            builder.values().append_value(path.value(i));
+            builder.append(true);
+        }
+        Ok(Arc::new(builder.finish()))
+    }
+}
+
+/// `current_setting(name [, missing_ok])`: the value of a server setting
+/// ([`pg_settings::server_setting`], the table `SHOW` reads). An unknown
+/// name is PostgreSQL's error, or NULL with `missing_ok`. `search_path` is
+/// per session and answered only by `SHOW search_path`.
+#[derive(Debug)]
+struct CurrentSettingFunction;
+
+impl ScalarFunction for CurrentSettingFunction {
+    fn name(&self) -> &str {
+        "CURRENT_SETTING"
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        Ok(DataType::Utf8)
+    }
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        check_arity("CURRENT_SETTING", args, 1, 2)?;
+        let names = utf8(&args[0], "CURRENT_SETTING")?;
+        let missing_ok = match args.get(1) {
+            Some(arg) => Some(boolean(arg)?),
+            None => None,
+        };
+        let mut out = Vec::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            let Some(name) = name else {
+                out.push(None);
+                continue;
+            };
+            let lower = name.to_ascii_lowercase();
+            if let Some(value) = pg_settings::server_setting(&lower) {
+                out.push(Some(value));
+                continue;
+            }
+            if missing_ok
+                .as_ref()
+                .is_some_and(|m| m.is_valid(i) && m.value(i))
+            {
+                out.push(None);
+                continue;
+            }
+            return Err(invalid(if lower == "search_path" {
+                "current_setting('search_path') is not supported; use SHOW search_path".to_string()
+            } else {
+                format!("unrecognized configuration parameter \"{name}\"")
+            }));
+        }
+        Ok(Arc::new(StringArray::from(out)))
+    }
+}
+
+fn boolean(arg: &ArrayRef) -> Result<BooleanArray, ExecutionError> {
+    let cast = arrow::compute::cast(arg, &ArrowDataType::Boolean).map_err(|e| {
+        invalid(format!(
+            "CURRENT_SETTING: missing_ok must be a boolean: {e}"
+        ))
+    })?;
+    Ok(cast
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("cast to Boolean yields BooleanArray")
+        .clone())
 }
 
 /// `format_type(type_oid, typmod)`: the SQL name of a type
@@ -164,12 +585,416 @@ impl ScalarFunction for NoDescriptionFunction {
     }
 }
 
+/// A definition function (`pg_get_constraintdef`, `pg_get_expr`,
+/// `pg_get_indexdef`, `pg_get_serial_sequence`): Arneb has no constraints,
+/// defaults, indexes or sequences, so the answer is always NULL.
+#[derive(Debug)]
+struct NullTextFunction {
+    name: &'static str,
+    min_args: usize,
+    max_args: usize,
+}
+
+impl ScalarFunction for NullTextFunction {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        Ok(DataType::Utf8)
+    }
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        check_arity(self.name, args, self.min_args, self.max_args)?;
+        Ok(new_null_array(&ArrowDataType::Utf8, args[0].len()))
+    }
+}
+
+/// The relations a `regclass` conversion sees: its session catalog and
+/// default schema, and the `(schema, table)` of every relation the
+/// statement's catalog lists. The planner passes them as the last three
+/// arguments (literals), the way session defaults reach a function.
+struct RegclassScope {
+    catalog: String,
+    default_schema: String,
+    /// Oid to `(schema, table)`; PostgreSQL's own system relations are
+    /// always there.
+    relations: HashMap<i64, (String, String)>,
+}
+
+impl RegclassScope {
+    fn from_args(name: &str, args: &[ArrayRef]) -> Result<Option<Self>, ExecutionError> {
+        check_arity(name, args, 4, 4)?;
+        if args[0].is_empty() {
+            return Ok(None);
+        }
+        let text = |i: usize| -> Result<String, ExecutionError> {
+            let a = utf8(&args[i], name)?;
+            Ok(if a.is_null(0) {
+                String::new()
+            } else {
+                a.value(0).to_string()
+            })
+        };
+        let (catalog, default_schema, list) = (text(1)?, text(2)?, text(3)?);
+        let mut relations = HashMap::new();
+        for entry in list
+            .split(pg_oid::RELATION_ENTRY_SEP)
+            .filter(|e| !e.is_empty())
+        {
+            if let Some((schema, table)) = entry.split_once(pg_oid::RELATION_FIELD_SEP) {
+                relations.insert(
+                    pg_oid::relation_oid(&catalog, schema, table),
+                    (schema.to_string(), table.to_string()),
+                );
+            }
+        }
+        for (table, oid) in pg_oid::SYSTEM_RELATIONS {
+            relations
+                .entry(*oid)
+                .or_insert_with(|| (pg_oid::PG_CATALOG.to_string(), table.to_string()));
+        }
+        Ok(Some(Self {
+            catalog,
+            default_schema,
+            relations,
+        }))
+    }
+
+    /// PostgreSQL's `regclassout`: the name, qualified unless the schema is
+    /// the default one or `pg_catalog`.
+    fn name_of(&self, oid: i64) -> String {
+        match self.relations.get(&oid) {
+            Some((schema, table))
+                if *schema == self.default_schema || schema == pg_oid::PG_CATALOG =>
+            {
+                quote_ident(table)
+            }
+            Some((schema, table)) => format!("{}.{}", quote_ident(schema), quote_ident(table)),
+            None => oid.to_string(),
+        }
+    }
+}
+
+/// `ident`, double-quoted when PostgreSQL would quote it (`quote_ident`):
+/// not a plain lowercase name, or a keyword.
+fn quote_ident(ident: &str) -> String {
+    let plain = ident
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && ident
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$')
+        && QUOTED_KEYWORDS.binary_search(&ident).is_err();
+    if plain {
+        ident.to_string()
+    } else {
+        format!("\"{}\"", ident.replace('"', "\"\""))
+    }
+}
+
+/// `__regclass_name(oid, catalog, default_schema, relations)`: what
+/// `CAST(<regclass> AS TEXT)` plans to. The relation's name, or the number
+/// for an oid the catalog does not list.
+#[derive(Debug)]
+struct RegclassName;
+
+impl ScalarFunction for RegclassName {
+    fn name(&self) -> &str {
+        "__REGCLASS_NAME"
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        Ok(DataType::Utf8)
+    }
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        let Some(scope) = RegclassScope::from_args("__REGCLASS_NAME", args)? else {
+            return Ok(new_null_array(&ArrowDataType::Utf8, 0));
+        };
+        let oids = int64(&args[0], "__REGCLASS_NAME")?;
+        let result: StringArray = oids.iter().map(|o| o.map(|o| scope.name_of(o))).collect();
+        Ok(Arc::new(result))
+    }
+}
+
+/// `__regclass_oid(name, catalog, default_schema, relations)`: what
+/// `CAST(<text> AS REGCLASS)` plans to. NULL gives NULL; a name no relation
+/// of the catalog has fails as PostgreSQL does.
+#[derive(Debug)]
+struct RegclassOid;
+
+impl ScalarFunction for RegclassOid {
+    fn name(&self) -> &str {
+        "__REGCLASS_OID"
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        Ok(DataType::Int64)
+    }
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        let Some(scope) = RegclassScope::from_args("__REGCLASS_OID", args)? else {
+            return Ok(new_null_array(&ArrowDataType::Int64, 0));
+        };
+        let names = utf8(&args[0], "__REGCLASS_OID")?;
+        let mut out = Vec::with_capacity(names.len());
+        for name in names.iter() {
+            out.push(match name {
+                None => None,
+                Some(name) => {
+                    let oid = pg_oid::regclass_oid(name, &scope.catalog, &scope.default_schema)
+                        .ok_or_else(|| invalid(format!("invalid name syntax: \"{name}\"")))?;
+                    if !scope.relations.contains_key(&oid) {
+                        return Err(invalid(format!("relation \"{name}\" does not exist")));
+                    }
+                    Some(oid)
+                }
+            });
+        }
+        Ok(Arc::new(Int64Array::from(out)))
+    }
+}
+
+/// What `has_*_privilege` asks about.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrivilegeObject {
+    Table,
+    AnyColumn,
+    Schema,
+}
+
+impl PrivilegeObject {
+    fn parse(kind: &str) -> Result<Self, ExecutionError> {
+        match kind {
+            "table" => Ok(Self::Table),
+            "any_column" => Ok(Self::AnyColumn),
+            "schema" => Ok(Self::Schema),
+            other => Err(invalid(format!(
+                "__HAS_PRIVILEGE: unknown object kind {other}"
+            ))),
+        }
+    }
+
+    fn function(self) -> &'static str {
+        match self {
+            Self::Table => "has_table_privilege",
+            Self::AnyColumn => "has_any_column_privilege",
+            Self::Schema => "has_schema_privilege",
+        }
+    }
+
+    /// Whether a holder of `held` (letters of [`pg_oid::TABLE_PRIVILEGE_LETTERS`]) has
+    /// `privilege`, for a privilege PostgreSQL accepts on this kind of
+    /// object. Privileges Arneb has no operation for (`TRUNCATE`,
+    /// `REFERENCES`, `TRIGGER`, `MAINTAIN`) and grant options are never
+    /// held: Arneb has no `GRANT`.
+    fn holds(self, privilege: &str, held: &str) -> Result<bool, ExecutionError> {
+        let upper = privilege.trim().to_ascii_uppercase();
+        let (name, grant_option) = match upper.strip_suffix("WITH GRANT OPTION") {
+            Some(name) => (name.trim_end(), true),
+            None => (upper.as_str(), false),
+        };
+        let accepted: &[&str] = match self {
+            Self::Table => &[
+                "SELECT",
+                "INSERT",
+                "UPDATE",
+                "DELETE",
+                "TRUNCATE",
+                "REFERENCES",
+                "TRIGGER",
+                "MAINTAIN",
+            ],
+            Self::AnyColumn => &["SELECT", "INSERT", "UPDATE", "REFERENCES"],
+            Self::Schema => &["USAGE", "CREATE"],
+        };
+        if !accepted.contains(&name) {
+            return Err(invalid(format!(
+                "unrecognized privilege type: \"{}\"",
+                privilege.trim()
+            )));
+        }
+        if self == Self::Schema && name == "CREATE" {
+            return Err(invalid(
+                "has_schema_privilege: the CREATE privilege is not supported",
+            ));
+        }
+        if grant_option {
+            return Ok(false);
+        }
+        Ok(match self {
+            Self::Schema => true,
+            _ => pg_oid::TABLE_PRIVILEGE_LETTERS
+                .iter()
+                .any(|(letter, p)| *p == name && held.contains(*letter)),
+        })
+    }
+}
+
+/// `__has_privilege(kind, role, object, privileges, session_user, catalog,
+/// default_schema, schemas, tables)`: what `has_table_privilege`,
+/// `has_any_column_privilege` and `has_schema_privilege` plan to. The
+/// planner passes the session's privileges as the last five arguments
+/// (literals): `schemas` lists the usable schemas, `tables` holds
+/// `schema<US>table<US>letters` entries. Arneb has no column privileges, so
+/// a column privilege is the table's.
+///
+/// Only the session user's privileges are known, so another `role` fails;
+/// with no session user, any named role fails.
+/// The object is a (possibly quoted, qualified) name or, for a table, an
+/// oid; one that does not exist fails as in PostgreSQL. `privileges` is a
+/// comma-separated list, true when any of them is held. NULL gives NULL.
+#[derive(Debug)]
+struct HasPrivilegeFunction;
+
+impl ScalarFunction for HasPrivilegeFunction {
+    fn name(&self) -> &str {
+        "__HAS_PRIVILEGE"
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        Ok(DataType::Boolean)
+    }
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        const NAME: &str = "__HAS_PRIVILEGE";
+        check_arity(NAME, args, 9, 9)?;
+        let rows = args[2].len();
+        if rows == 0 {
+            return Ok(Arc::new(BooleanArray::from(Vec::<bool>::new())));
+        }
+        let text = |i: usize| -> Result<String, ExecutionError> {
+            let a = utf8(&args[i], NAME)?;
+            Ok(if a.is_null(0) {
+                String::new()
+            } else {
+                a.value(0).to_string()
+            })
+        };
+        let kind = PrivilegeObject::parse(&text(0)?)?;
+        let (session_user, catalog, default_schema) = (text(4)?, text(5)?, text(6)?);
+        let (schemas, tables) = (text(7)?, text(8)?);
+        let schemas: Vec<&str> = schemas
+            .split(pg_oid::RELATION_ENTRY_SEP)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut held_by_oid = HashMap::new();
+        for entry in tables
+            .split(pg_oid::RELATION_ENTRY_SEP)
+            .filter(|e| !e.is_empty())
+        {
+            let mut fields = entry.split(pg_oid::RELATION_FIELD_SEP);
+            if let (Some(schema), Some(table), Some(letters)) =
+                (fields.next(), fields.next(), fields.next())
+            {
+                held_by_oid.insert(pg_oid::relation_oid(&catalog, schema, table), letters);
+            }
+        }
+        let roles = utf8(&args[1], NAME)?;
+        let privileges = utf8(&args[3], NAME)?;
+        let object_names = (kind == PrivilegeObject::Schema
+            || !matches!(
+                args[2].data_type(),
+                ArrowDataType::Int64 | ArrowDataType::Int32
+            ))
+        .then(|| utf8(&args[2], NAME))
+        .transpose()?;
+        let object_oids = match object_names {
+            None => Some(int64(&args[2], NAME)?),
+            Some(_) => None,
+        };
+        let mut out = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let object_null = match (&object_names, &object_oids) {
+                (Some(names), _) => names.is_null(row),
+                (_, Some(oids)) => oids.is_null(row),
+                _ => unreachable!(),
+            };
+            if roles.is_null(row) || privileges.is_null(row) || object_null {
+                out.push(None);
+                continue;
+            }
+            let role = roles.value(row);
+            // With no known session user (no login), only the unnamed role
+            // the two-argument form passes is answered: another role's
+            // privileges would otherwise be reported as this session's.
+            if role != session_user {
+                return Err(invalid(format!(
+                    "{}: only the session user's privileges are known, not role \"{role}\"",
+                    kind.function()
+                )));
+            }
+            let held = match kind {
+                PrivilegeObject::Schema => {
+                    let schema = object_names.as_ref().unwrap().value(row);
+                    if !schemas.contains(&schema) {
+                        return Err(invalid(format!("schema \"{schema}\" does not exist")));
+                    }
+                    ""
+                }
+                _ => {
+                    let (oid, shown) = match (&object_names, &object_oids) {
+                        (Some(names), _) => {
+                            let name = names.value(row);
+                            let oid = pg_oid::regclass_oid(name, &catalog, &default_schema)
+                                .ok_or_else(|| {
+                                    invalid(format!("invalid name syntax: \"{name}\""))
+                                })?;
+                            (oid, name.to_string())
+                        }
+                        (_, Some(oids)) => (oids.value(row), oids.value(row).to_string()),
+                        _ => unreachable!(),
+                    };
+                    held_by_oid
+                        .get(&oid)
+                        .copied()
+                        .ok_or_else(|| invalid(format!("relation \"{shown}\" does not exist")))?
+                }
+            };
+            let mut any = false;
+            for privilege in privileges.value(row).split(',') {
+                any |= kind.holds(privilege, held)?;
+            }
+            out.push(Some(any));
+        }
+        Ok(Arc::new(BooleanArray::from(out)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ints(values: &[Option<i64>]) -> ArrayRef {
         Arc::new(Int64Array::from(values.to_vec()))
+    }
+
+    #[test]
+    fn current_setting_reads_server_settings() {
+        let names: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("default_table_access_method"),
+            Some("Server_Version"),
+            None,
+        ]));
+        let out = CurrentSettingFunction.evaluate(&[names]).unwrap();
+        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(out.value(0), "heap");
+        assert_eq!(out.value(1), pg_settings::SERVER_VERSION);
+        assert!(out.is_null(2));
+
+        let unknown: ArrayRef = Arc::new(StringArray::from(vec!["no_such"]));
+        let err = CurrentSettingFunction
+            .evaluate(std::slice::from_ref(&unknown))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unrecognized configuration parameter"),
+            "{err}"
+        );
+        let ok: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
+        let out = CurrentSettingFunction.evaluate(&[unknown, ok]).unwrap();
+        assert!(out.is_null(0));
+
+        let search_path: ArrayRef = Arc::new(StringArray::from(vec!["search_path"]));
+        let err = CurrentSettingFunction
+            .evaluate(&[search_path])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SHOW search_path"), "{err}");
     }
 
     #[test]
@@ -184,6 +1009,65 @@ mod tests {
         assert_eq!(out.value(0), "integer");
         assert_eq!(out.value(1), "numeric(12,2)");
         assert!(out.is_null(2));
+    }
+
+    fn fmt(template: &str, args: &[Option<&str>]) -> Result<Option<String>, ExecutionError> {
+        let mut cols: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![template]))];
+        for a in args {
+            cols.push(Arc::new(StringArray::from(vec![*a])));
+        }
+        let out = FormatFunction.evaluate(&cols)?;
+        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        Ok((!out.is_null(0)).then(|| out.value(0).to_string()))
+    }
+
+    #[test]
+    fn format_specifiers() {
+        let ok = |t: &str, a: &[Option<&str>]| fmt(t, a).unwrap().unwrap();
+        assert_eq!(ok("%s.%s", &[Some("a"), Some("b")]), "a.b");
+        assert_eq!(ok("%I", &[Some("Mixed Case")]), "\"Mixed Case\"");
+        assert_eq!(ok("%I", &[Some("abc")]), "abc");
+        assert_eq!(ok("%I", &[Some("select")]), "\"select\"");
+        assert_eq!(ok("%I", &[Some("a\"b")]), "\"a\"\"b\"");
+        assert_eq!(ok("%L", &[Some("it's")]), "'it''s'");
+        assert_eq!(ok("%L", &[None]), "NULL");
+        assert_eq!(ok("%s", &[None]), "");
+        assert_eq!(ok("100%%", &[]), "100%");
+        let err = |t: &str, a: &[Option<&str>]| fmt(t, a).unwrap_err().to_string();
+        assert!(err("%s", &[]).contains("too few arguments"));
+        assert!(err("%I", &[None]).contains("null values cannot be formatted"));
+        assert!(err("%1$s", &[Some("a")]).contains("unsupported format specifier"));
+        assert!(err("%10s", &[Some("a")]).contains("unsupported format specifier"));
+    }
+
+    #[test]
+    fn format_broadcasts_constant_arguments() {
+        let strs = |v: &[Option<&str>]| -> ArrayRef { Arc::new(StringArray::from(v.to_vec())) };
+        let column = strs(&[Some("int4"), None, Some("varchar")]);
+        // A one-value template (a constant) beside a three-row column.
+        for template in [strs(&[Some("<%s>")]), strs(&[Some("<%s>"); 3])] {
+            let out = FormatFunction
+                .invoke(&[template, Arc::clone(&column)], 3)
+                .unwrap();
+            let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+            let got: Vec<&str> = (0..out.len()).map(|r| out.value(r)).collect();
+            assert_eq!(got, ["<int4>", "<>", "<varchar>"]);
+        }
+        // `evaluate` takes the row count from the longest argument.
+        let out = FormatFunction
+            .evaluate(&[strs(&[Some("%s")]), Arc::clone(&column)])
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        let err = FormatFunction
+            .invoke(&[strs(&[Some("%s"); 2]), column], 3)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 values for 3 rows"), "{err}");
+    }
+
+    #[test]
+    fn quoted_keywords_are_sorted() {
+        assert!(QUOTED_KEYWORDS.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
@@ -226,5 +1110,229 @@ mod tests {
         .evaluate(&[ints(&[Some(1)]), ints(&[Some(1)])])
         .unwrap();
         assert_eq!(none.null_count(), 1);
+    }
+
+    fn scope_args(first: ArrayRef) -> Vec<ArrayRef> {
+        let n = first.len();
+        let col = |v: &str| -> ArrayRef { Arc::new(StringArray::from(vec![v; n])) };
+        let relations = format!(
+            "default{f}nation{e}staging{f}Raw Data{e}pg_catalog{f}pg_class",
+            f = pg_oid::RELATION_FIELD_SEP,
+            e = pg_oid::RELATION_ENTRY_SEP
+        );
+        vec![first, col("file"), col("default"), col(&relations)]
+    }
+
+    /// `__has_privilege` over `default.nation` (all four privileges) and
+    /// `default.ro` (SELECT only), for session user `alice`.
+    fn privilege(kind: &str, role: &str, object: ArrayRef, privileges: &str) -> ArrayRef {
+        privilege_as("alice", kind, role, object, privileges)
+    }
+
+    /// [`privilege`] for session user `session` (empty: no login).
+    fn privilege_as(
+        session: &str,
+        kind: &str,
+        role: &str,
+        object: ArrayRef,
+        privileges: &str,
+    ) -> ArrayRef {
+        let n = object.len();
+        let col = |v: &str| -> ArrayRef { Arc::new(StringArray::from(vec![v; n])) };
+        let tables = format!(
+            "default{f}nation{f}SIUD{e}default{f}ro{f}S",
+            f = pg_oid::RELATION_FIELD_SEP,
+            e = pg_oid::RELATION_ENTRY_SEP
+        );
+        let schemas = format!("default{}pg_catalog", pg_oid::RELATION_ENTRY_SEP);
+        let args = vec![
+            col(kind),
+            col(role),
+            object,
+            col(privileges),
+            col(session),
+            col("file"),
+            col("default"),
+            col(&schemas),
+            col(&tables),
+        ];
+        HasPrivilegeFunction
+            .evaluate(&args)
+            .unwrap_or_else(|e| Arc::new(StringArray::from(vec![e.to_string()])) as ArrayRef)
+    }
+
+    fn bools(a: &ArrayRef) -> Vec<Option<bool>> {
+        match a.as_any().downcast_ref::<BooleanArray>() {
+            Some(b) => b.iter().collect(),
+            None => panic!(
+                "{}",
+                a.as_any().downcast_ref::<StringArray>().unwrap().value(0)
+            ),
+        }
+    }
+
+    fn err(a: &ArrayRef) -> String {
+        a.as_any()
+            .downcast_ref::<StringArray>()
+            .expect("an error")
+            .value(0)
+            .to_string()
+    }
+
+    fn names(values: &[Option<&str>]) -> ArrayRef {
+        Arc::new(StringArray::from(values.to_vec()))
+    }
+
+    #[test]
+    fn has_table_privilege_reads_the_session_grants() {
+        let objects = || names(&[Some("nation"), Some("\"default\".\"ro\""), Some("RO"), None]);
+        assert_eq!(
+            bools(&privilege("table", "alice", objects(), "select")),
+            [Some(true), Some(true), Some(true), None]
+        );
+        assert_eq!(
+            bools(&privilege("table", "alice", objects(), "INSERT")),
+            [Some(true), Some(false), Some(false), None]
+        );
+        // Any of a list; grant options and privileges with no Arneb
+        // operation are never held.
+        assert_eq!(
+            bools(&privilege("table", "alice", objects(), "insert, select")),
+            [Some(true), Some(true), Some(true), None]
+        );
+        for p in ["select with grant option", "TRUNCATE", "references"] {
+            assert_eq!(
+                bools(&privilege("table", "alice", objects(), p)),
+                [Some(false), Some(false), Some(false), None],
+                "{p}"
+            );
+        }
+        // By oid.
+        let oid = pg_oid::relation_oid("file", "default", "ro");
+        assert_eq!(
+            bools(&privilege("table", "alice", ints(&[Some(oid)]), "update")),
+            [Some(false)]
+        );
+        // A column privilege is the table's.
+        assert_eq!(
+            bools(&privilege("any_column", "alice", objects(), "update")),
+            [Some(true), Some(false), Some(false), None]
+        );
+    }
+
+    #[test]
+    fn without_a_session_user_only_the_unnamed_role_is_answered() {
+        let nation = || names(&[Some("nation")]);
+        assert_eq!(
+            bools(&privilege_as("", "table", "", nation(), "select")),
+            [Some(true)]
+        );
+        for role in ["someone_else", "alice"] {
+            let e = err(&privilege_as("", "table", role, nation(), "select"));
+            assert!(e.contains(&format!("not role \"{role}\"")), "{role}: {e}");
+        }
+    }
+
+    #[test]
+    fn has_privilege_refuses_what_it_cannot_answer() {
+        let nation = || names(&[Some("nation")]);
+        for (kind, role, object, p, want) in [
+            (
+                "table",
+                "alice",
+                names(&[Some("nope")]),
+                "select",
+                "relation \"nope\" does not exist",
+            ),
+            ("table", "bob", nation(), "select", "not role \"bob\""),
+            (
+                "table",
+                "alice",
+                nation(),
+                "usage",
+                "unrecognized privilege type: \"usage\"",
+            ),
+            (
+                "any_column",
+                "alice",
+                nation(),
+                "delete",
+                "unrecognized privilege type",
+            ),
+            (
+                "schema",
+                "alice",
+                names(&[Some("nope")]),
+                "usage",
+                "schema \"nope\" does not exist",
+            ),
+            (
+                "schema",
+                "alice",
+                names(&[Some("default")]),
+                "create",
+                "CREATE privilege is not supported",
+            ),
+        ] {
+            let e = err(&privilege(kind, role, object, p));
+            assert!(e.contains(want), "{kind} {p}: {e}");
+        }
+    }
+
+    #[test]
+    fn has_schema_privilege_is_usage_of_a_listed_schema() {
+        let schemas = names(&[Some("default"), Some("pg_catalog"), None]);
+        assert_eq!(
+            bools(&privilege("schema", "alice", schemas, "USAGE")),
+            [Some(true), Some(true), None]
+        );
+    }
+
+    #[test]
+    fn regclass_names_and_oids_round_trip() {
+        let nation = pg_oid::relation_oid("file", "default", "nation");
+        let raw = pg_oid::relation_oid("file", "staging", "Raw Data");
+        let out = RegclassName
+            .evaluate(&scope_args(ints(&[
+                Some(nation),
+                Some(raw),
+                Some(1259),
+                Some(7),
+                None,
+            ])))
+            .unwrap();
+        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(out.value(0), "nation");
+        assert_eq!(out.value(1), "staging.\"Raw Data\"");
+        assert_eq!(out.value(2), "pg_class");
+        assert_eq!(out.value(3), "7");
+        assert!(out.is_null(4));
+
+        let names: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("nation"),
+            None,
+            Some("pg_type"),
+        ]));
+        let out = RegclassOid.evaluate(&scope_args(names)).unwrap();
+        let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(out.value(0), nation);
+        assert!(out.is_null(1));
+        assert_eq!(out.value(2), 1247);
+
+        let missing: ArrayRef = Arc::new(StringArray::from(vec!["nope"]));
+        let err = RegclassOid.evaluate(&scope_args(missing)).unwrap_err();
+        assert!(err.to_string().contains("relation \"nope\" does not exist"));
+    }
+
+    #[test]
+    fn definition_functions_are_null() {
+        let out = NullTextFunction {
+            name: "PG_GET_CONSTRAINTDEF",
+            min_args: 1,
+            max_args: 2,
+        }
+        .evaluate(&[ints(&[Some(1), Some(2)])])
+        .unwrap();
+        assert_eq!(out.null_count(), 2);
     }
 }

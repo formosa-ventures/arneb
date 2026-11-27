@@ -525,6 +525,8 @@ fn coerce_expr(
             negated,
             span,
         } => coerce_array_contains(*expr, *array, negated, span, schema, ctx),
+        PlanExpr::ArrayElement(pair) => coerce_array_element(pair, schema, ctx),
+        PlanExpr::GetField(pair) => coerce_get_field(pair, schema, ctx),
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -659,6 +661,16 @@ fn unify_binary_operands(
         return Ok((left, right));
     }
 
+    // An untyped string literal against a numeric operand takes that
+    // operand's type (`bigint_col = '0'`), as in PostgreSQL. Literals
+    // only: a string column against a numeric one still mismatches.
+    if let Some(left) = resolve_string_literal(&left, &rt, location)? {
+        return unify_binary_operands(left, right, op, schema, location, ctx);
+    }
+    if let Some(right) = resolve_string_literal(&right, &lt, location)? {
+        return unify_binary_operands(left, right, op, schema, location, ctx);
+    }
+
     // Date ± integer-days arithmetic: SQL semantics yields a Date
     // shifted by N days. We keep the operands at their declared
     // types (Date32 and Int32 / Int64) so the executor calls Arrow's
@@ -679,6 +691,53 @@ fn unify_binary_operands(
     );
     if date_and_int && matches!(op, ast::BinaryOp::Plus | ast::BinaryOp::Minus) {
         return Ok((left, right));
+    }
+
+    // DATE compared with TIMESTAMP compares as TIMESTAMP (midnight), as
+    // in PostgreSQL and Trino: `d >= date_trunc('year', now())`.
+    let comparison = matches!(
+        op,
+        ast::BinaryOp::Eq
+            | ast::BinaryOp::NotEq
+            | ast::BinaryOp::Lt
+            | ast::BinaryOp::LtEq
+            | ast::BinaryOp::Gt
+            | ast::BinaryOp::GtEq
+    );
+    if comparison {
+        let to_timestamp = |expr: PlanExpr, ts: &DataType| PlanExpr::Cast {
+            expr: Box::new(expr),
+            data_type: ts.clone(),
+            span: None,
+        };
+        match (&lt, &rt) {
+            (DataType::Date32, DataType::Timestamp { .. }) => {
+                return Ok((to_timestamp(left, &rt), right));
+            }
+            (DataType::Timestamp { .. }, DataType::Date32) => {
+                return Ok((left, to_timestamp(right, &lt)));
+            }
+            _ => {}
+        }
+    }
+    // The matrix's DATE → TIMESTAMP widening serves comparisons, BETWEEN,
+    // IN, CASE and set operations. Arithmetic between the two
+    // (`timestamp - date`, `date + timestamp`) stays unsupported.
+    if !comparison
+        && matches!(
+            (&lt, &rt),
+            (DataType::Date32, DataType::Timestamp { .. })
+                | (DataType::Timestamp { .. }, DataType::Date32)
+        )
+    {
+        let name = |t: &DataType| match t {
+            DataType::Date32 => "date",
+            _ => "timestamp",
+        };
+        return Err(PlanError::UnsupportedExpression {
+            message: format!("operator does not exist: {} {op} {}", name(&lt), name(&rt)),
+            location,
+        });
     }
 
     // Decimal arithmetic: operands keep their own precision/scale (an
@@ -715,6 +774,105 @@ fn unify_binary_operands(
         maybe_cast(left, &lt, &supertype, site.left_is_literal(), location)?,
         maybe_cast(right, &rt, &supertype, site.right_is_literal(), location)?,
     ))
+}
+
+/// `expr` as a numeric literal when it is a string literal and `other`
+/// is a numeric type; `None` when the rule does not apply.
+fn resolve_string_literal(
+    expr: &PlanExpr,
+    other: &DataType,
+    location: Option<arneb_common::error::Location>,
+) -> Result<Option<PlanExpr>, PlanError> {
+    let PlanExpr::Literal {
+        value: ScalarValue::Utf8(text),
+        span,
+    } = expr
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        other,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128 { .. }
+    ) {
+        return Ok(None);
+    }
+    let value = coerce_string_literal_to_numeric(text, other).map_err(|e| match e {
+        PlanError::InvalidLiteral { message, .. } => {
+            PlanError::InvalidLiteral { message, location }
+        }
+        e => e,
+    })?;
+    Ok(Some(PlanExpr::Literal { value, span: *span }))
+}
+
+/// Parses the string literal `lit` as a value of the numeric type
+/// `target`. Integer targets yield an `Int32` (SMALLINT / INTEGER) or
+/// `Int64` literal and decimals a literal with the digits' own
+/// precision and scale, so the usual unification then widens them.
+/// Failures use PostgreSQL's `invalid input syntax for type <name>`.
+fn coerce_string_literal_to_numeric(
+    lit: &str,
+    target: &DataType,
+) -> Result<ScalarValue, PlanError> {
+    let (name, bounds): (&str, Option<(i64, i64)>) = match target {
+        DataType::Int8 | DataType::Int16 => ("smallint", Some((i16::MIN.into(), i16::MAX.into()))),
+        DataType::Int32 => ("integer", Some((i32::MIN.into(), i32::MAX.into()))),
+        DataType::Int64 => ("bigint", None),
+        DataType::Decimal128 { .. } => ("numeric", None),
+        _ => ("double precision", None),
+    };
+    let invalid = || PlanError::InvalidLiteral {
+        message: format!("invalid input syntax for type {name}: \"{lit}\""),
+        location: None,
+    };
+    let trimmed = lit.trim();
+    match target {
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            let n: i64 = trimmed.parse().map_err(|_| invalid())?;
+            if let Some((lo, hi)) = bounds {
+                if n < lo || n > hi {
+                    return Err(PlanError::InvalidLiteral {
+                        message: format!("value \"{lit}\" is out of range for type {name}"),
+                        location: None,
+                    });
+                }
+            }
+            Ok(if *target == DataType::Int64 {
+                ScalarValue::Int64(n)
+            } else {
+                ScalarValue::Int32(n as i32)
+            })
+        }
+        DataType::Decimal128 { .. } => {
+            let unsigned = trimmed.trim_start_matches(['+', '-']);
+            let negative = trimmed.starts_with('-');
+            if trimmed.len() - unsigned.len() > 1 {
+                return Err(invalid());
+            }
+            let (int_part, frac_part) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+            let digits = format!("{int_part}{frac_part}");
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) || digits.len() > 38
+            {
+                return Err(invalid());
+            }
+            let magnitude: i128 = digits.parse().map_err(|_| invalid())?;
+            Ok(ScalarValue::Decimal128 {
+                value: if negative { -magnitude } else { magnitude },
+                precision: digits.len().max(1) as u8,
+                scale: frac_part.len() as i8,
+            })
+        }
+        _ => {
+            let n: f64 = trimmed.parse().map_err(|_| invalid())?;
+            Ok(ScalarValue::Float64(n))
+        }
+    }
 }
 
 /// `expr` blank-padded to its declared length when it is a CHAR(n)
@@ -832,6 +990,55 @@ fn coerce_array_contains(
         negated,
         span,
     })
+}
+
+/// `coerce_expr` for [`PlanExpr::ArrayElement`]: the operand must be an
+/// array (or an untyped NULL) and the index an integer. Out of line so the
+/// recursive `coerce_expr` frame stays small.
+#[inline(never)]
+#[allow(clippy::boxed_local)]
+fn coerce_array_element(
+    pair: Box<(PlanExpr, PlanExpr)>,
+    schema: &[ColumnInfo],
+    ctx: &mut AnalyzerContext,
+) -> Result<PlanExpr, PlanError> {
+    let (array, index) = *pair;
+    let array = coerce_expr(array, schema, ctx)?;
+    let index = coerce_expr(index, schema, ctx)?;
+    match plan_expr_type(&array, schema) {
+        None | Some(DataType::Null) | Some(DataType::List(_)) => {}
+        Some(t) => {
+            return Err(PlanError::invalid_expression(format!(
+                "cannot subscript type {t} because it is not an array"
+            )))
+        }
+    }
+    match plan_expr_type(&index, schema) {
+        None
+        | Some(DataType::Null)
+        | Some(DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64) => {}
+        Some(t) => {
+            return Err(PlanError::invalid_expression(format!(
+                "array subscript must have type integer, not {t}"
+            )))
+        }
+    }
+    Ok(PlanExpr::ArrayElement(Box::new((array, index))))
+}
+
+/// `coerce_expr` for [`PlanExpr::GetField`]: checks the field exists in the
+/// (now typed) operand.
+#[inline(never)]
+#[allow(clippy::boxed_local)]
+fn coerce_get_field(
+    pair: Box<(PlanExpr, String)>,
+    schema: &[ColumnInfo],
+    ctx: &mut AnalyzerContext,
+) -> Result<PlanExpr, PlanError> {
+    let (expr, field) = *pair;
+    let expr = coerce_expr(expr, schema, ctx)?;
+    super::check_get_field(plan_expr_type(&expr, schema).as_ref(), &field)?;
+    Ok(PlanExpr::GetField(Box::new((expr, field))))
 }
 
 /// Aligns the operands of `expr = ANY (array)`: the array must be a
@@ -982,6 +1189,49 @@ fn unify_case(
     ),
     PlanError,
 > {
+    // An untyped string literal arm takes the type of a numeric arm
+    // (`COALESCE(n, '0')`); non-literal arms are left to the supertype
+    // rules below.
+    let numeric_arm = when_clauses
+        .iter()
+        .map(|(_, r)| r)
+        .chain(else_result.as_deref())
+        .filter(|e| {
+            !matches!(
+                e,
+                PlanExpr::Literal {
+                    value: ScalarValue::Utf8(_),
+                    ..
+                }
+            )
+        })
+        .filter_map(|e| plan_expr_type(e, schema))
+        .find(|t| {
+            matches!(
+                t,
+                DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Decimal128 { .. }
+            )
+        });
+    let (when_clauses, else_result) = match numeric_arm {
+        Some(numeric) => {
+            let resolve = |e: PlanExpr| -> Result<PlanExpr, PlanError> {
+                Ok(resolve_string_literal(&e, &numeric, location)?.unwrap_or(e))
+            };
+            let when_clauses = when_clauses
+                .into_iter()
+                .map(|(c, r)| Ok((c, resolve(r)?)))
+                .collect::<Result<Vec<_>, PlanError>>()?;
+            let else_result = else_result.map(|e| resolve(*e).map(Box::new)).transpose()?;
+            (when_clauses, else_result)
+        }
+        None => (when_clauses, else_result),
+    };
     // Unify result arms (THEN + ELSE).
     let mut target: Option<DataType> = None;
     let result_types: Vec<Option<DataType>> = when_clauses
@@ -1420,7 +1670,65 @@ pub(super) fn walk_plan_exprs(
             sql,
             plan: Box::new(walk_plan_exprs(*plan, f)),
         },
+        LogicalPlan::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => walk_project_set(*input, srfs, schema, f),
+        LogicalPlan::Window { input, functions } => walk_window(*input, functions, f),
+        LogicalPlan::AssignUniqueId { input, id_column } => LogicalPlan::AssignUniqueId {
+            input: Box::new(walk_plan_exprs(*input, f)),
+            id_column,
+        },
         other => other,
+    }
+}
+
+#[inline(never)]
+fn walk_project_set(
+    input: LogicalPlan,
+    srfs: Vec<(crate::plan::SrfKind, PlanExpr)>,
+    schema: Vec<ColumnInfo>,
+    f: &mut dyn FnMut(PlanExpr) -> PlanExpr,
+) -> LogicalPlan {
+    LogicalPlan::ProjectSet {
+        input: Box::new(walk_plan_exprs(input, f)),
+        srfs: srfs
+            .into_iter()
+            .map(|(kind, e)| (kind, walk_expr(e, f)))
+            .collect(),
+        schema,
+    }
+}
+
+#[inline(never)]
+fn walk_window(
+    input: LogicalPlan,
+    functions: Vec<crate::plan::WindowFunctionDef>,
+    f: &mut dyn FnMut(PlanExpr) -> PlanExpr,
+) -> LogicalPlan {
+    LogicalPlan::Window {
+        input: Box::new(walk_plan_exprs(input, f)),
+        functions: functions
+            .into_iter()
+            .map(|mut w| {
+                w.args = w.args.into_iter().map(|e| walk_expr(e, f)).collect();
+                w.partition_by = w
+                    .partition_by
+                    .into_iter()
+                    .map(|e| walk_expr(e, f))
+                    .collect();
+                w.order_by = w
+                    .order_by
+                    .into_iter()
+                    .map(|s| SortExpr {
+                        expr: walk_expr(s.expr, f),
+                        ..s
+                    })
+                    .collect();
+                w
+            })
+            .collect(),
     }
 }
 
@@ -1482,6 +1790,8 @@ pub(super) fn walk_expr(expr: PlanExpr, f: &mut dyn FnMut(PlanExpr) -> PlanExpr)
             negated,
             span,
         } => crate::map_array_contains(expr, array, negated, span, |e| walk_expr(e, f)),
+        PlanExpr::ArrayElement(pair) => crate::map_array_element(pair, |e| walk_expr(e, f)),
+        PlanExpr::GetField(pair) => crate::map_get_field(pair, |e| walk_expr(e, f)),
         PlanExpr::Array {
             elements,
             element_type,
@@ -1664,6 +1974,72 @@ mod tests {
     fn run(plan: LogicalPlan) -> Result<LogicalPlan, PlanError> {
         let mut ctx = AnalyzerContext::new();
         Analyzer::new(vec![Box::new(TypeCoercion::new())]).run(plan, &mut ctx)
+    }
+
+    #[test]
+    fn string_literal_coerces_to_numeric_operand() {
+        let schema = vec![ColumnInfo {
+            name: "x".into(),
+            data_type: DataType::Int64,
+            nullable: true,
+        }];
+        let pred = PlanExpr::BinaryOp {
+            left: Box::new(col(0, "x")),
+            op: ast::BinaryOp::Eq,
+            right: Box::new(lit(ScalarValue::Utf8("0".into()))),
+            span: None,
+        };
+        let out = run(filter(scan(schema), pred)).unwrap();
+        let LogicalPlan::Filter { predicate, .. } = out else {
+            panic!("expected Filter");
+        };
+        let PlanExpr::BinaryOp { right, .. } = predicate else {
+            panic!("expected BinaryOp");
+        };
+        assert!(matches!(
+            *right,
+            PlanExpr::Literal {
+                value: ScalarValue::Int64(0),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn string_literal_coercion_is_literal_only() {
+        let schema = vec![
+            ColumnInfo {
+                name: "s".into(),
+                data_type: DataType::Utf8,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "n".into(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+        ];
+        let pred = PlanExpr::BinaryOp {
+            left: Box::new(col(0, "s")),
+            op: ast::BinaryOp::Eq,
+            right: Box::new(col(1, "n")),
+            span: None,
+        };
+        let err = run(filter(scan(schema.clone()), pred)).unwrap_err();
+        assert!(matches!(err, PlanError::TypeMismatch { .. }), "{err}");
+
+        let bad = PlanExpr::BinaryOp {
+            left: Box::new(col(1, "n")),
+            op: ast::BinaryOp::Eq,
+            right: Box::new(lit(ScalarValue::Utf8("abc".into()))),
+            span: None,
+        };
+        let err = run(filter(scan(schema), bad)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid input syntax for type bigint: \"abc\""),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2038,6 +2414,145 @@ mod tests {
         ));
     }
 
+    fn timestamp_tz() -> DataType {
+        DataType::Timestamp {
+            unit: arneb_common::types::TimeUnit::Microsecond,
+            timezone: Some("+00:00".into()),
+        }
+    }
+
+    fn cast_to(data_type: &DataType, expr: PlanExpr) -> PlanExpr {
+        PlanExpr::Cast {
+            expr: Box::new(expr),
+            data_type: data_type.clone(),
+            span: None,
+        }
+    }
+
+    fn date_schema() -> Vec<ColumnInfo> {
+        vec![ColumnInfo {
+            name: "d".into(),
+            data_type: DataType::Date32,
+            nullable: false,
+        }]
+    }
+
+    fn date_lit(day: i32) -> PlanExpr {
+        lit(ScalarValue::Date32(day))
+    }
+
+    /// The DATE → TIMESTAMP widening is for comparisons, BETWEEN, IN, CASE
+    /// and set operations: `timestamp - date` and `date + timestamp` stay
+    /// unsupported, refused at plan time naming the operator.
+    #[test]
+    fn date_timestamp_arithmetic_is_a_plan_time_error() {
+        let ts = timestamp_tz();
+        for (left, op, right, want) in [
+            (
+                cast_to(&ts, date_lit(1)),
+                ast::BinaryOp::Minus,
+                col(0, "d"),
+                "operator does not exist: timestamp - date",
+            ),
+            (
+                col(0, "d"),
+                ast::BinaryOp::Plus,
+                cast_to(&ts, date_lit(1)),
+                "operator does not exist: date + timestamp",
+            ),
+        ] {
+            let pred = PlanExpr::BinaryOp {
+                left: Box::new(PlanExpr::BinaryOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                    span: None,
+                }),
+                op: ast::BinaryOp::Eq,
+                right: Box::new(cast_to(&ts, date_lit(2))),
+                span: None,
+            };
+            let err = run(filter(scan(date_schema()), pred)).unwrap_err();
+            assert!(err.to_string().contains(want), "{err}");
+        }
+    }
+
+    #[test]
+    fn between_date_column_and_timestamp_bounds_compares_as_timestamp() {
+        // Metabase's relative-date filter:
+        // `d BETWEEN CAST(... AS timestamptz) AND CAST(... AS timestamptz)`.
+        let ts = timestamp_tz();
+        let plan = filter(
+            scan(date_schema()),
+            PlanExpr::Between {
+                expr: Box::new(col(0, "d")),
+                negated: false,
+                low: Box::new(cast_to(&ts, date_lit(1))),
+                high: Box::new(cast_to(&ts, date_lit(30))),
+                span: None,
+            },
+        );
+        let LogicalPlan::Filter { predicate, .. } = run(plan).unwrap() else {
+            panic!()
+        };
+        let PlanExpr::Between { expr, .. } = predicate else {
+            panic!()
+        };
+        assert!(
+            matches!(expr.as_ref(), PlanExpr::Cast { data_type, .. } if *data_type == ts),
+            "the date operand compares as the timestamp type: {expr:?}"
+        );
+    }
+
+    #[test]
+    fn in_list_mixing_date_and_timestamp_compares_as_timestamp() {
+        let ts = timestamp_tz();
+        let plan = filter(
+            scan(date_schema()),
+            PlanExpr::InList {
+                expr: Box::new(col(0, "d")),
+                list: vec![date_lit(1), cast_to(&ts, date_lit(2))],
+                negated: false,
+                span: None,
+            },
+        );
+        let LogicalPlan::Filter { predicate, .. } = run(plan).unwrap() else {
+            panic!()
+        };
+        let PlanExpr::InList { expr, list, .. } = predicate else {
+            panic!()
+        };
+        assert!(matches!(expr.as_ref(), PlanExpr::Cast { data_type, .. } if *data_type == ts));
+        assert!(matches!(&list[0], PlanExpr::Cast { data_type, .. } if *data_type == ts));
+    }
+
+    #[test]
+    fn date_between_dates_keeps_date_comparison() {
+        // TPC-H shape (`l_shipdate BETWEEN DATE .. AND DATE ..`): no cast.
+        let plan = filter(
+            scan(date_schema()),
+            PlanExpr::Between {
+                expr: Box::new(col(0, "d")),
+                negated: false,
+                low: Box::new(date_lit(1)),
+                high: Box::new(date_lit(30)),
+                span: None,
+            },
+        );
+        let LogicalPlan::Filter { predicate, .. } = run(plan).unwrap() else {
+            panic!()
+        };
+        let PlanExpr::Between {
+            expr, low, high, ..
+        } = predicate
+        else {
+            panic!()
+        };
+        assert!(matches!(expr.as_ref(), PlanExpr::Column { .. }));
+        assert!(matches!(low.as_ref(), PlanExpr::Literal { .. }));
+        assert!(matches!(high.as_ref(), PlanExpr::Literal { .. }));
+    }
+
     #[test]
     fn in_list_unifies_literal_elements() {
         let schema = vec![ColumnInfo {
@@ -2253,6 +2768,58 @@ mod tests {
             }],
         };
         let (_, ctx) = run_with_ctx(plan).unwrap();
+        assert_eq!(ctx.param_types.get(&1), Some(&DataType::Utf8));
+    }
+
+    #[test]
+    fn unresolved_parameter_below_project_set_and_window_is_defaulted() {
+        let schema = vec![ColumnInfo {
+            name: "a".into(),
+            data_type: DataType::Int32,
+            nullable: false,
+        }];
+        // A parameter among the SRF arguments, and one in a window argument
+        // below it: both must be reached by the default-type walk.
+        let window = LogicalPlan::Window {
+            input: Box::new(scan(schema.clone())),
+            functions: vec![crate::plan::WindowFunctionDef {
+                name: "SUM".into(),
+                args: vec![param(2)],
+                partition_by: vec![],
+                order_by: vec![],
+                rows_frame: false,
+                output_name: "s".into(),
+            }],
+        };
+        let plan = LogicalPlan::ProjectSet {
+            input: Box::new(window),
+            srfs: vec![(crate::plan::SrfKind::Unnest, param(1))],
+            schema: schema.clone(),
+        };
+        let walked = default_unresolved_parameters(plan, &mut AnalyzerContext::new());
+        let mut untyped = 0;
+        walk_plan_exprs(walked, &mut |e| {
+            if matches!(
+                e,
+                PlanExpr::Parameter {
+                    type_hint: None,
+                    ..
+                }
+            ) {
+                untyped += 1;
+            }
+            e
+        });
+        // The default pass records a type for each, so none is left untyped
+        // in the context either.
+        let mut ctx = AnalyzerContext::new();
+        let plan = LogicalPlan::ProjectSet {
+            input: Box::new(scan(schema.clone())),
+            srfs: vec![(crate::plan::SrfKind::Unnest, param(1))],
+            schema,
+        };
+        default_unresolved_parameters(plan, &mut ctx);
+        assert_eq!(untyped, 0);
         assert_eq!(ctx.param_types.get(&1), Some(&DataType::Utf8));
     }
 

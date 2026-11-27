@@ -274,6 +274,18 @@ workers can use up to twice the limit in total, and a skewed query hits it
 first on the node with the most data. Start around 0.5–0.8 × the node's
 spill budget.
 
+**Aggregate state.** DISTINCT aggregates, and other aggregates that cannot
+take the batch-aware path, reserve their state (the groups and every
+distinct value) against the node's memory pool, and this state cannot spill.
+The pool is bounded whenever a spill budget is resolved: from
+`[memory] spill_budget_bytes`, or, with no explicit value, from the
+container's cgroup memory limit × `cgroup_ratio`. That makes it bounded by
+default in Docker and Kubernetes. There a large `COUNT(DISTINCT ..)` whose
+state outgrows the budget fails with SQLSTATE `53200`
+(`EXCEEDED_LOCAL_MEMORY_LIMIT`), instead of growing until the container is
+OOM-killed. Raise the budget (or the container limit) if such queries need
+more, or set `cgroup_ratio = 0.0` to go back to an unbounded pool.
+
 **Timeouts and cancellation.** pgwire sessions use `SET statement_timeout`,
 and Trino sessions use the `query_max_execution_time` (excludes queue time)
 and `query_max_run_time` (includes it) session properties; see
@@ -482,6 +494,7 @@ worker_id = "worker-1"
 | `drain_timeout_secs` | integer | no | Longest a worker waits on SIGTERM for its running queries to finish before it exits (default `120`, `ARNEB_DRAIN_TIMEOUT_SECS`). Read on workers; set the orchestrator's grace period (Kubernetes `terminationGracePeriodSeconds`) above it. See [Stopping a worker](/guide/distributed#stopping-a-worker). |
 | `retry_policy` | string | no | `none` (default) or `query`: re-run a read-only query that failed because one of its workers was lost, on the remaining workers (`ARNEB_RETRY_POLICY`). Read on the coordinator. `task` is refused. See [When a worker fails](/guide/distributed#when-a-worker-fails). |
 | `query_retry_attempts` | integer | no | Most re-runs of one query under `retry_policy = "query"` (default `4`, at least `1`, `ARNEB_QUERY_RETRY_ATTEMPTS`). Read on the coordinator. |
+| `include_coordinator` | bool | no | Let the coordinator run a query's root-stage work — its final joins, aggregations, sorts, windows and set operations — itself (default `false`, `ARNEB_INCLUDE_COORDINATOR`). Off, that work runs as a single-task stage on a worker and the coordinator only gathers the result, like Trino's `node-scheduler.include-coordinator=false`. Read on the coordinator. See [How It Works](/guide/distributed#how-it-works). |
 
 The three `ARNEB_CLUSTER_*` variables above override the file (env > file),
 so one config file can serve every worker; the Helm chart sets them per

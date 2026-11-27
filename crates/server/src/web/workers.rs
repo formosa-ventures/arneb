@@ -68,6 +68,9 @@ pub(super) struct WorkerView {
     /// Whether the registry knows the id (alive or not).
     registered: bool,
     alive: bool,
+    /// Past its heartbeat deadline and being probed by the coordinator:
+    /// takes no new queries, but its running queries go on (#245).
+    suspect: bool,
     version: Option<String>,
     /// Lifecycle, reported by the worker: `active` or `draining` (its
     /// SIGTERM drain-then-exit); `unknown` when not registered.
@@ -139,6 +142,7 @@ fn view(
         address: info.map(|w| w.address.clone()),
         registered: info.is_some(),
         alive: info.is_some_and(|w| w.alive),
+        suspect: info.is_some_and(|w| w.suspect),
         version: info.map(|w| w.version.clone()),
         state: match info {
             Some(w) if w.draining => "draining",

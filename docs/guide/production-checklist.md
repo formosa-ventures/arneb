@@ -186,7 +186,6 @@ The limits below are what keep one query from taking a node with it.
 - [ ] **The known gaps are acceptable.**
   - The gaps are listed in [Known gaps](/guide/clients#known-gaps), for example ISO day of week, one-part intervals only, and Rust regular-expression syntax.
   - dbt models must be ephemeral, because Arneb does not write to catalogs.
-  - Medians and percentiles buffer every value of a group outside the memory pool. A large ungrouped median can exhaust a node's memory instead of failing with `53200`.
 - [ ] **Your tools work with your security settings.** CI runs the client checks on a cluster with no auth and no TLS. Connect each tool the team uses to a staging cluster with your `[auth]` and `[tls]` settings.
 
 ## 9. Agent interface

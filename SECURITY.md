@@ -4,7 +4,8 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | Yes       |
+| 0.2.x   | Yes       |
+| < 0.2   | No        |
 
 ## Reporting a Vulnerability
 
@@ -14,7 +15,7 @@ If you discover a security vulnerability in Arneb, please report it responsibly.
 
 ### How to Report
 
-1. Go to the [Security Advisories](https://github.com/formosa-ventures/trino-alt/security/advisories) page.
+1. Go to the [Security Advisories](https://github.com/formosa-ventures/arneb/security/advisories) page.
 2. Click **"Report a vulnerability"**.
 3. Provide a detailed description of the vulnerability, including:
    - Steps to reproduce

@@ -22,15 +22,6 @@ use tokio::sync::Mutex;
 
 use crate::dynamic_filter::DynamicFilterService;
 
-fn dfrpc_domain_variant(domain: &Domain) -> String {
-    match domain {
-        Domain::DistinctValues(values) => format!("DistinctValues(len={})", values.len()),
-        Domain::Range { .. } => "Range".to_string(),
-        Domain::Bloom(_) => "Bloom".to_string(),
-        Domain::All => "All".to_string(),
-    }
-}
-
 /// Map of `QueryId → DynamicFilterService` shared across the coord's
 /// RPC handlers and `QueryCoordinator`.
 #[derive(Debug, Clone, Default)]
@@ -64,7 +55,8 @@ impl DynamicFilterServiceRegistry {
     pub fn unregister(&self, query_id: &QueryId) {
         let removed = self.inner.write().unwrap().remove(query_id);
         // The rest only logs; skip the lock and the summary when nobody reads it.
-        if !tracing::enabled!(target: "arneb::dynamic_filter", tracing::Level::DEBUG) {
+        if !tracing::enabled!(target: arneb_common::DYNAMIC_FILTER_LOG_TARGET, tracing::Level::DEBUG)
+        {
             return;
         }
         if let Some(svc) = removed {
@@ -73,14 +65,14 @@ impl DynamicFilterServiceRegistry {
                     let waiting = guard.dfrpc_waiting_summary();
                     if waiting.is_empty() {
                         tracing::debug!(
-                            target: "arneb::dynamic_filter",
+                            target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                             "coord registry unregister query_id={} waiting=none",
                             query_id
                         );
                     } else {
                         for entry in waiting {
                             tracing::debug!(
-                                target: "arneb::dynamic_filter",
+                                target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                                 "coord registry unregister query_id={} still_waiting {}",
                                 query_id, entry
                             );
@@ -89,7 +81,7 @@ impl DynamicFilterServiceRegistry {
                 }
                 Err(_) => {
                     tracing::debug!(
-                        target: "arneb::dynamic_filter",
+                        target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                         "coord registry unregister query_id={} waiting=unknown service_locked",
                         query_id
                     );
@@ -118,12 +110,12 @@ impl DynamicFilterServiceRegistry {
             ))
         })?;
         tracing::debug!(
-            target: "arneb::dynamic_filter",
+            target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
             "coord registry route_report query_id={} df_id={} partition_idx={} domain={}",
             query_id,
             df_id,
             partition_idx,
-            dfrpc_domain_variant(&domain)
+            domain.summary()
         );
         let mut guard = svc.lock().await;
         guard.report_partition(df_id, partition_idx, domain)

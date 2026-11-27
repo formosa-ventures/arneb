@@ -26,7 +26,10 @@ pub mod types;
 
 pub use catalog_version::{spec_fingerprint, CatalogVersion};
 pub use config::ServerConfig;
-pub use domain::{bloom_dynamic_filter_enabled, BloomFilter, Domain, DEFAULT_MAX_DISTINCT_VALUES};
+pub use domain::{
+    bloom_dynamic_filter_enabled, BloomFilter, Domain, DomainSummary, DEFAULT_MAX_DISTINCT_VALUES,
+    DYNAMIC_FILTER_LOG_TARGET,
+};
 pub use dynamic_filter::DynamicFilterId;
 pub use error::ArnebError;
 pub use identifiers::{QueryId, SplitId, StageId, TaskId};

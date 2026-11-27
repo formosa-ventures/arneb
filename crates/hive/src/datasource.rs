@@ -344,7 +344,13 @@ impl HiveDataSource {
             .cloned()
             .collect();
         let builder = parquet_scan::open_parquet_builder(&file.store, &file.path).await?;
-        let buffer_bytes = parquet_scan::row_group_buffer_bytes(builder.metadata(), Some(&roots));
+        let buffer_bytes =
+            parquet_scan::split_buffer_bytes(
+                builder.metadata(),
+                Some(&roots),
+                split_idx,
+                self.splits_per_file,
+            ) + arneb_connectors::parquet_pushdown::row_filter_set_bytes(&data_filters);
         let stream = parquet_scan::build_split_stream(
             builder,
             &file.path,
@@ -448,10 +454,13 @@ impl DataSource for HiveDataSource {
             HiveFileFormat::Parquet => {
                 let file_path = &file.path;
                 let builder = parquet_scan::open_parquet_builder(&file.store, file_path).await?;
-                let buffer_bytes = parquet_scan::row_group_buffer_bytes(
-                    builder.metadata(),
-                    ctx.projection.as_deref(),
-                );
+                let buffer_bytes =
+                    parquet_scan::split_buffer_bytes(
+                        builder.metadata(),
+                        ctx.projection.as_deref(),
+                        split_idx,
+                        self.splits_per_file,
+                    ) + arneb_connectors::parquet_pushdown::row_filter_set_bytes(&ctx.filters);
                 let stream = parquet_scan::build_split_stream(
                     builder,
                     file_path,

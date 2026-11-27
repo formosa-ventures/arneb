@@ -115,8 +115,11 @@ pub async fn open_parquet_builder(
 /// Configure an opened file for one `(split_idx, splits_per_file)`
 /// sub-partition and build its stream.
 ///
-/// - `filters` must reference **file leaf column indices** (for Hive the
-///   table schema equals the file schema; Iceberg remaps by field ID).
+/// - `filters` and `dynamic_domains` reference **file root column indices**
+///   (for Hive and registered files the table schema equals the file schema;
+///   Iceberg remaps by field ID). They are mapped to the leaf indices the
+///   Parquet pushdown works on here; one on a nested root is not pushed
+///   (see [`roots_to_leaves`]).
 /// - `projection_roots`: file root columns to read (`None` = all).
 /// - `batch_size`: `None` uses [`crate::file::scan_default_batch_size`].
 ///
@@ -135,6 +138,9 @@ pub fn build_split_stream(
     split_idx: usize,
     splits_per_file: usize,
 ) -> Result<ParquetRecordBatchStream<ParquetObjectReader>, ExecutionError> {
+    let (filters, dynamic_domains) =
+        roots_to_leaves(builder.parquet_schema(), filters, dynamic_domains);
+    let (filters, dynamic_domains) = (&filters[..], &dynamic_domains[..]);
     let total_rows: usize = builder
         .metadata()
         .row_groups()
@@ -142,11 +148,29 @@ pub fn build_split_stream(
         .map(|rg| rg.num_rows() as usize)
         .sum();
 
-    // Apply row-group pruning (min/max) and predicate filters BEFORE
-    // building the slice — the slice should reflect the user-visible
-    // logical row count. Row-group pruning is OK because all splits
-    // see the same min/max-pruned row groups.
-    if !filters.is_empty() {
+    // A file with at least as many row groups as splits is split by whole
+    // row groups: a row range that ends inside a row group would make two
+    // splits fetch and decode that row group's column chunks.
+    if let Some(groups) =
+        split_row_groups(builder.metadata().row_groups(), split_idx, splits_per_file)
+    {
+        let groups = if filters.is_empty() {
+            groups
+        } else {
+            let pruned = crate::parquet_pushdown::prune_row_groups(
+                builder.metadata().row_groups(),
+                filters,
+                &[],
+            );
+            groups.into_iter().filter(|g| pruned.contains(g)).collect()
+        };
+        builder = builder.with_row_groups(groups);
+    }
+    // Otherwise apply row-group pruning (min/max) and predicate filters
+    // BEFORE building the slice — the slice should reflect the
+    // user-visible logical row count. Row-group pruning is OK because all
+    // splits see the same min/max-pruned row groups.
+    else if !filters.is_empty() {
         let file_meta = builder.metadata().clone();
         let selected =
             crate::parquet_pushdown::prune_row_groups(file_meta.row_groups(), filters, &[]);
@@ -189,13 +213,9 @@ pub fn build_split_stream(
         builder = builder.with_projection(mask);
     }
 
-    // Default 2048 (override Parquet's built-in 8192) to keep per-
-    // partition in-flight Arrow batches small. Per Trino architecture
-    // research + arrow-rs issue #623: in-flight working set scales
-    // linearly with batch_size × pipeline_depth × partition_count;
-    // smaller default = lower memory floor for small queries (TPC-H
-    // Q01/Q06/Q10/Q12/Q14 baseline). Override via `ctx.batch_size`, or
-    // tune the default at runtime via `ARNEB_SCAN_BATCH_SIZE`.
+    // `ctx.batch_size`, else `scan_default_batch_size()` (16384 unless
+    // `ARNEB_SCAN_BATCH_SIZE` says otherwise). The in-flight working set
+    // scales with batch_size × pipeline_depth × partition_count.
     let batch_size = batch_size.unwrap_or_else(crate::file::scan_default_batch_size);
     builder = builder.with_batch_size(batch_size);
 
@@ -204,6 +224,44 @@ pub fn build_split_stream(
             "Parquet reader build error for '{file_path}': {e}"
         ))
     })
+}
+
+/// Map filters and dynamic-filter domains from file root column indices to
+/// the leaf column indices the Parquet pushdown (row-group statistics and
+/// `RowFilter`) reads.
+///
+/// Root and leaf indices differ as soon as a nested column (a struct or a
+/// map, which have several leaves) comes before the filtered one. A filter
+/// or domain on a nested root, or on a column the file does not have, is
+/// dropped: it still runs above the scan, which is what keeps this safe.
+pub fn roots_to_leaves(
+    schema: &parquet::schema::types::SchemaDescriptor,
+    filters: &[PlanExpr],
+    dynamic_domains: &[arneb_execution::DynamicFilterDomain],
+) -> (Vec<PlanExpr>, Vec<arneb_execution::DynamicFilterDomain>) {
+    let roots = schema.root_schema().get_fields();
+    let mut leaf_by_root: Vec<Option<usize>> = vec![None; roots.len()];
+    for leaf in 0..schema.num_columns() {
+        let root = schema.get_column_root_idx(leaf);
+        if roots[root].is_primitive() {
+            leaf_by_root[root] = Some(leaf);
+        }
+    }
+    let leaf_of = |root: usize| leaf_by_root.get(root).copied().flatten();
+    let filters = filters
+        .iter()
+        .filter_map(|f| crate::scan_adapter::remap_filter(f, &leaf_of))
+        .collect();
+    let dynamic_domains = dynamic_domains
+        .iter()
+        .filter_map(|d| {
+            Some(arneb_execution::DynamicFilterDomain {
+                column_index: leaf_of(d.column_index)?,
+                ..d.clone()
+            })
+        })
+        .collect();
+    (filters, dynamic_domains)
 }
 
 /// Bytes a scan of this file holds in its decode buffer: the compressed
@@ -217,14 +275,24 @@ pub fn row_group_buffer_bytes(
     metadata: &ParquetMetaData,
     projection_roots: Option<&[usize]>,
 ) -> usize {
+    let all: Vec<usize> = (0..metadata.row_groups().len()).collect();
+    buffer_bytes_of(metadata, projection_roots, &all)
+}
+
+/// The largest projected compressed size among `row_groups`.
+fn buffer_bytes_of(
+    metadata: &ParquetMetaData,
+    projection_roots: Option<&[usize]>,
+    row_groups: &[usize],
+) -> usize {
     let schema = metadata.file_metadata().schema_descr();
     let projected = |leaf: usize| {
         projection_roots.is_none_or(|roots| roots.contains(&schema.get_column_root_idx(leaf)))
     };
-    metadata
-        .row_groups()
+    row_groups
         .iter()
-        .map(|rg| {
+        .map(|&idx| {
+            let rg = metadata.row_group(idx);
             rg.columns()
                 .iter()
                 .enumerate()
@@ -234,6 +302,74 @@ pub fn row_group_buffer_bytes(
         })
         .max()
         .unwrap_or(0)
+}
+
+/// The row groups split `split_idx` of `splits` reads when the file is
+/// split by whole row groups, or `None` when it is split by row ranges
+/// (one split, or fewer row groups than splits).
+///
+/// A row group belongs to the split its first row falls in when the file's
+/// rows are cut into `splits` equal ranges, so splits get about the same
+/// number of rows and every row group exactly one split. The assignment
+/// depends only on the file's metadata, so every node agrees on it.
+pub fn split_row_groups(
+    row_groups: &[parquet::file::metadata::RowGroupMetaData],
+    split_idx: usize,
+    splits: usize,
+) -> Option<Vec<usize>> {
+    if splits <= 1 || row_groups.len() < splits {
+        return None;
+    }
+    let total: usize = row_groups.iter().map(|rg| rg.num_rows() as usize).sum();
+    if total == 0 {
+        return None;
+    }
+    let mut start = 0usize;
+    let mut groups = Vec::new();
+    for (idx, rg) in row_groups.iter().enumerate() {
+        // u128: `start * splits` can overflow usize on a huge file.
+        let owner = (start as u128 * splits as u128 / total as u128) as usize;
+        if owner == split_idx {
+            groups.push(idx);
+        }
+        start += rg.num_rows() as usize;
+    }
+    Some(groups)
+}
+
+/// [`row_group_buffer_bytes`] for split `split_idx` of `splits`: the largest
+/// row group that split reads, instead of the file's largest. A split by
+/// row range counts the row groups its range overlaps.
+pub fn split_buffer_bytes(
+    metadata: &ParquetMetaData,
+    projection_roots: Option<&[usize]>,
+    split_idx: usize,
+    splits: usize,
+) -> usize {
+    let row_groups = metadata.row_groups();
+    let read: Vec<usize> = match split_row_groups(row_groups, split_idx, splits) {
+        Some(groups) => groups,
+        None if splits <= 1 => (0..row_groups.len()).collect(),
+        None => {
+            let total: usize = row_groups.iter().map(|rg| rg.num_rows() as usize).sum();
+            let chunk = total.div_ceil(splits);
+            let (lo, hi) = (
+                (split_idx * chunk).min(total),
+                ((split_idx + 1) * chunk).min(total),
+            );
+            let mut start = 0usize;
+            let mut overlapping = Vec::new();
+            for (idx, rg) in row_groups.iter().enumerate() {
+                let end = start + rg.num_rows() as usize;
+                if start < hi && lo < end {
+                    overlapping.push(idx);
+                }
+                start = end;
+            }
+            overlapping
+        }
+    };
+    buffer_bytes_of(metadata, projection_roots, &read)
 }
 
 /// Build a `RowSelection` that picks rows `[split_idx*chunk, (split_idx+1)*chunk)`
@@ -436,6 +572,139 @@ mod tests {
         let path = ObjectPath::from("t.parquet");
         store.put(&path, PutPayload::from(buf)).await.unwrap();
         (store, path)
+    }
+
+    /// The values of column `a` split `split` of `splits` reads, with
+    /// `filters` pushed down.
+    async fn read_split(
+        store: &Arc<dyn ObjectStore>,
+        path: &ObjectPath,
+        filters: &[PlanExpr],
+        split: usize,
+        splits: usize,
+    ) -> Vec<i64> {
+        let builder = open_parquet_builder(store, path).await.unwrap();
+        let mut stream =
+            build_split_stream(builder, path, filters, &[], None, None, split, splits).unwrap();
+        let mut values = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            let a = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            values.extend(a.values().iter().copied());
+        }
+        values
+    }
+
+    #[tokio::test]
+    async fn split_row_groups_gives_every_row_group_to_one_split() {
+        let (store, path) = store_with_parquet(10_000, 1_000).await;
+        let builder = open_parquet_builder(&store, &path).await.unwrap();
+        let rgs = builder.metadata().row_groups();
+        assert_eq!(rgs.len(), 10);
+        // One split, or fewer row groups than splits: split by row range.
+        assert_eq!(split_row_groups(rgs, 0, 1), None);
+        assert_eq!(split_row_groups(rgs, 0, 11), None);
+        let assigned: Vec<Vec<usize>> = (0..4)
+            .map(|split| split_row_groups(rgs, split, 4).unwrap())
+            .collect();
+        assert_eq!(
+            assigned,
+            vec![vec![0, 1, 2], vec![3, 4], vec![5, 6, 7], vec![8, 9]]
+        );
+    }
+
+    #[tokio::test]
+    async fn splits_by_whole_row_groups_cover_the_file_once() {
+        let (store, path) = store_with_parquet(10_000, 1_000).await;
+        let mut all = Vec::new();
+        for split in 0..4 {
+            let values = read_split(&store, &path, &[], split, 4).await;
+            // Whole row groups only: no row group is shared with another split.
+            assert_eq!(values.len() % 1_000, 0, "split {split}");
+            all.extend(values);
+        }
+        assert_eq!(all, (0..10_000).collect::<Vec<_>>());
+
+        // A filter still prunes inside each split's row groups:
+        // 4_500..5_500 lies in row groups 4 and 5, split 1 and split 2.
+        let col = PlanExpr::Column {
+            index: 0,
+            name: "a".to_string(),
+            span: None,
+        };
+        let cmp = |op, v| PlanExpr::BinaryOp {
+            left: Box::new(col.clone()),
+            op,
+            right: Box::new(PlanExpr::Literal {
+                value: arneb_common::types::ScalarValue::Int64(v),
+                span: None,
+            }),
+            span: None,
+        };
+        use arneb_sql_parser::ast::BinaryOp;
+        let filters = [cmp(BinaryOp::GtEq, 4_500), cmp(BinaryOp::Lt, 5_500)];
+        let mut matched = Vec::new();
+        for split in 0..4 {
+            let values = read_split(&store, &path, &filters, split, 4).await;
+            if split == 0 || split == 3 {
+                assert!(
+                    values.is_empty(),
+                    "split {split} reads no matching row group"
+                );
+            }
+            matched.extend(values);
+        }
+        assert_eq!(matched, (4_500..5_500).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn fewer_row_groups_than_splits_still_split_by_row_range() {
+        let (store, path) = store_with_parquet(10_000, 5_000).await;
+        let mut all = Vec::new();
+        for split in 0..4 {
+            let values = read_split(&store, &path, &[], split, 4).await;
+            assert_eq!(values.len(), 2_500, "split {split}");
+            all.extend(values);
+        }
+        assert_eq!(all, (0..10_000).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn a_split_reserves_only_the_row_groups_it_reads() {
+        // Split by row group: the largest of the split's own row groups.
+        let (store, path) = store_with_parquet(10_000, 1_000).await;
+        let builder = open_parquet_builder(&store, &path).await.unwrap();
+        let meta = builder.metadata();
+        for split in 0..4 {
+            let groups = split_row_groups(meta.row_groups(), split, 4).unwrap();
+            assert_eq!(
+                split_buffer_bytes(meta, None, split, 4),
+                buffer_bytes_of(meta, None, &groups),
+                "split {split}"
+            );
+        }
+        // One split reads the whole file: the file's largest row group.
+        assert_eq!(
+            split_buffer_bytes(meta, None, 0, 1),
+            row_group_buffer_bytes(meta, None)
+        );
+
+        // Split by row range: the row groups the range overlaps. Rows
+        // 0..2_500 lie in row group 0, 2_500..5_000 too, 5_000.. in 1.
+        let (store, path) = store_with_parquet(10_000, 5_000).await;
+        let builder = open_parquet_builder(&store, &path).await.unwrap();
+        let meta = builder.metadata();
+        for (split, group) in [(0, 0), (1, 0), (2, 1), (3, 1)] {
+            assert_eq!(
+                split_buffer_bytes(meta, None, split, 4),
+                buffer_bytes_of(meta, None, &[group]),
+                "split {split}"
+            );
+        }
     }
 
     #[tokio::test]

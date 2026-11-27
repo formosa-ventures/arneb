@@ -25,7 +25,7 @@ Arneb supports the following query features:
 - **Subqueries**: Scalar, IN, and EXISTS subqueries
 - **Arrays**: `ARRAY[...]` literals, `'{...}'::type[]` casts, `= ANY` / `<> ALL`, `UNNEST` and `GENERATE_SUBSCRIPTS` in the SELECT list, and array parameters and results over pgwire — see [Arrays](/sql/advanced#arrays)
 - **CTEs**: Common Table Expressions via `WITH` clauses
-- **Set Operations**: UNION ALL, UNION, INTERSECT, EXCEPT
+- **Set Operations**: UNION ALL, UNION, INTERSECT, EXCEPT, and `VALUES` lists
 - **Window Functions**: ROW_NUMBER, RANK, DENSE_RANK, and aggregate window functions with PARTITION BY and ORDER BY, plus the `ROWS UNBOUNDED PRECEDING` frame
 - **Ordering and Limiting**: ORDER BY (including on aliases and aggregates), LIMIT, OFFSET (any constant integer expression, such as `LIMIT $1::INTEGER` from a driver; not a column)
 

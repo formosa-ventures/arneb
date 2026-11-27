@@ -591,6 +591,27 @@ pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
                 return small_integer_cast(value, data_type, span);
             }
             if let (PlanExpr::Literal { value, .. }, false) = (&expr, is_typed_null) {
+                // A type with no literal form (SMALLINT, TINYINT, Decimal64)
+                // stays a cast, evaluated at run time, but a value that does
+                // not fit still fails here, like a folded cast.
+                if !crate::analyzer::cast_scalar::folds_to_scalar(&data_type) {
+                    crate::analyzer::cast_scalar::check_cast(value, &data_type).map_err(
+                        |e| match e {
+                            PlanError::InvalidLiteral { message, .. } => {
+                                PlanError::InvalidLiteral {
+                                    message,
+                                    location: span.map(|s| s.start),
+                                }
+                            }
+                            other => other,
+                        },
+                    )?;
+                    return Ok(PlanExpr::Cast {
+                        expr: Box::new(expr),
+                        data_type,
+                        span,
+                    });
+                }
                 // Fold the cast: Arrow's strict-mode cast surfaces
                 // parse errors (e.g., malformed DATE literal) as a
                 // `PlanError::InvalidLiteral`. Enrich the error with

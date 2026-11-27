@@ -1315,7 +1315,9 @@ fn unify_case(
 
 /// Align the output column types of every branch of a set operation
 /// by inserting a top-of-branch `Projection` with `Cast` where needed.
-fn align_set_op_branches(branches: Vec<LogicalPlan>) -> Result<Vec<LogicalPlan>, PlanError> {
+pub(crate) fn align_set_op_branches(
+    branches: Vec<LogicalPlan>,
+) -> Result<Vec<LogicalPlan>, PlanError> {
     if branches.is_empty() {
         return Ok(branches);
     }

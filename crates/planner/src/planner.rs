@@ -156,6 +156,27 @@ impl PlanningContext {
     }
 }
 
+/// Gives both inputs of a set operation the same column types now, at
+/// planning time, so whatever is planned on top of it (an outer query over
+/// a `UNION ALL` in a derived table, say) sees the unified type rather than
+/// the left input's. The analyzer aligns them again after coercion; that
+/// pass is then a no-op. Inputs with an untyped (NULL or parameter) column
+/// are left for the analyzer, which infers those types first.
+fn align_set_op_inputs(
+    left: LogicalPlan,
+    right: LogicalPlan,
+) -> Result<(LogicalPlan, LogicalPlan), PlanError> {
+    let untyped = |plan: &LogicalPlan| plan.schema().iter().any(|c| c.data_type == DataType::Null);
+    if untyped(&left) || untyped(&right) || left.schema().len() != right.schema().len() {
+        return Ok((left, right));
+    }
+    let mut aligned =
+        crate::analyzer::type_coercion::align_set_op_branches(vec![left, right])?.into_iter();
+    let left = aligned.next().expect("two inputs");
+    let right = aligned.next().expect("two inputs");
+    Ok((left, right))
+}
+
 fn apply_table_column_aliases(
     plan: LogicalPlan,
     column_aliases: &[String],
@@ -626,6 +647,7 @@ impl<'a> QueryPlanner<'a> {
             ast::QueryBody::SetOperation { op, left, right } => {
                 let left_plan = self.plan_query_body(left, &[]).await?;
                 let right_plan = self.plan_query_body(right, &[]).await?;
+                let (left_plan, right_plan) = align_set_op_inputs(left_plan, right_plan)?;
                 match op {
                     ast::SetOperator::UnionAll => Ok(LogicalPlan::UnionAll {
                         inputs: vec![left_plan, right_plan],
@@ -2725,6 +2747,34 @@ impl<'a> QueryPlanner<'a> {
                             location: node_span.map(|s| s.start),
                         }),
                     };
+                }
+                // `TRY_CAST('x' AS regclass)` is `TRY(regclass('x'))`, which is
+                // resolved here at plan time, so a name it cannot parse is
+                // NULL now rather than an error TRY never sees.
+                if name.eq_ignore_ascii_case("TRY") {
+                    if let [ast::FunctionArg::Unnamed(
+                        inner @ ast::Expr::Function {
+                            name: inner_name, ..
+                        },
+                    )] = args.as_slice()
+                    {
+                        if inner_name.eq_ignore_ascii_case("regclass")
+                            || inner_name.eq_ignore_ascii_case("regtype")
+                        {
+                            return match self.plan_expr(inner, ctx).await {
+                                // Both resolve to an oid (BIGINT).
+                                Err(PlanError::InvalidLiteral { .. }) => Ok(PlanExpr::Cast {
+                                    expr: Box::new(PlanExpr::Literal {
+                                        value: ScalarValue::Null,
+                                        span: node_span,
+                                    }),
+                                    data_type: DataType::Int64,
+                                    span: node_span,
+                                }),
+                                other => other,
+                            };
+                        }
+                    }
                 }
                 let mut plan_args = Vec::with_capacity(args.len());
                 for a in args {

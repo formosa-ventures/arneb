@@ -839,6 +839,10 @@ fn can_fail_on_a_row(expr: &PlanExpr, schema: &[ColumnInfo]) -> bool {
         E::InList { expr, list, .. } => fails(expr) || list.iter().any(fails),
         E::Array { elements, .. } => elements.iter().any(fails),
         E::ArrayContains { expr, array, .. } => fails(expr) || fails(array),
+        // An index out of range is NULL and an unknown field a plan-time
+        // error, so only the operands can fail on a row.
+        E::ArrayElement(pair) => fails(&pair.0) || fails(&pair.1),
+        E::GetField(pair) => fails(&pair.0),
         E::CaseExpr {
             operand,
             when_clauses,
@@ -915,6 +919,8 @@ fn references_a_column(expr: &PlanExpr) -> bool {
         E::ArrayContains { expr, array, .. } => {
             references_a_column(expr) || references_a_column(array)
         }
+        E::ArrayElement(pair) => references_a_column(&pair.0) || references_a_column(&pair.1),
+        E::GetField(pair) => references_a_column(&pair.0),
         E::CaseExpr {
             operand,
             when_clauses,

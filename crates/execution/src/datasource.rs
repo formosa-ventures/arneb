@@ -9,10 +9,25 @@ use std::sync::Arc;
 use arneb_common::error::ExecutionError;
 use arneb_common::stream::{stream_from_batches, SendableRecordBatchStream};
 use arneb_common::types::ColumnInfo;
+use arneb_planner::PlanExpr;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 
 use crate::scan_context::ScanContext;
+
+/// Exact aggregation over a source, expressed in base-table column indices.
+pub struct AggregatePushdown<'a> {
+    /// Grouping expressions in output order.
+    pub group_by: &'a [PlanExpr],
+    /// Aggregate calls in output order, following the grouping columns.
+    pub aggregates: &'a [PlanExpr],
+    /// Predicates that must all be applied before aggregation.
+    pub filters: &'a [PlanExpr],
+    /// Types and names expected by the caller.
+    pub output_schema: &'a [ColumnInfo],
+    /// Preserve the original scan partitions and aggregate within each one.
+    pub partial: bool,
+}
 
 /// A source of tabular data for the execution engine.
 ///
@@ -45,6 +60,13 @@ pub trait DataSource: Send + Sync + Debug {
     /// (and the measured performance) of the file connectors.
     fn pushdown_stacked_filters(&self) -> bool {
         false
+    }
+
+    /// Return a source of aggregate results only if every requested operation
+    /// can be performed exactly. A partial source keeps the original split
+    /// count and ordering. A complete source has a single partition.
+    fn pushdown_aggregate(&self, _request: &AggregatePushdown<'_>) -> Option<Arc<dyn DataSource>> {
+        None
     }
 
     /// Scans rows from one partition as an async stream.

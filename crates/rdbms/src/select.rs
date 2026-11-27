@@ -36,6 +36,39 @@ pub fn build_select(
             .collect::<Vec<_>>()
             .join(", "),
     };
+    let mut sql = build_select_with_filters(table, &select_list, translation, split, dialect);
+    if let (Some(n), true) = (limit, translation.complete) {
+        sql.push_str(&format!(" LIMIT {n}"));
+    }
+    Ok(sql)
+}
+
+/// Build an aggregate query from expressions validated and rendered by the
+/// connector. The select list is ordered to match the output schema.
+pub fn build_aggregate_select(
+    table: &RemoteTable,
+    select_list: &[String],
+    group_by: &[String],
+    translation: &Translation,
+    split: Option<&SplitRange>,
+    dialect: &dyn Dialect,
+) -> String {
+    let mut sql =
+        build_select_with_filters(table, &select_list.join(", "), translation, split, dialect);
+    if !group_by.is_empty() {
+        sql.push_str(" GROUP BY ");
+        sql.push_str(&group_by.join(", "));
+    }
+    sql
+}
+
+fn build_select_with_filters(
+    table: &RemoteTable,
+    select_list: &str,
+    translation: &Translation,
+    split: Option<&SplitRange>,
+    dialect: &dyn Dialect,
+) -> String {
     let mut sql = format!(
         "SELECT {select_list} FROM {}.{}",
         dialect.quote_identifier(&table.schema),
@@ -56,10 +89,7 @@ pub fn build_select(
         sql.push_str(" WHERE ");
         sql.push_str(&conditions.join(" AND "));
     }
-    if let (Some(n), true) = (limit, translation.complete) {
-        sql.push_str(&format!(" LIMIT {n}"));
-    }
-    Ok(sql)
+    sql
 }
 
 #[cfg(test)]

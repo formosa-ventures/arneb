@@ -606,6 +606,37 @@ pub(crate) struct ScanExec {
     pub(crate) scan_task_count: usize,
 }
 
+/// A source that emits aggregate rows. Join filters on output columns do
+/// not get injected into the underlying table scan.
+#[derive(Debug)]
+pub(crate) struct RemoteAggregateExec {
+    pub(crate) scan: ScanExec,
+    pub(crate) partial: bool,
+}
+
+#[async_trait]
+impl ExecutionPlan for RemoteAggregateExec {
+    fn schema(&self) -> Vec<ColumnInfo> {
+        self.scan.schema()
+    }
+
+    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream, ExecutionError> {
+        self.scan.execute(partition).await
+    }
+
+    fn display_name(&self) -> &str {
+        if self.partial {
+            "RemotePartialAggregateExec"
+        } else {
+            "RemoteAggregateExec"
+        }
+    }
+
+    fn output_partitioning(&self) -> crate::partitioning::Partitioning {
+        self.scan.output_partitioning()
+    }
+}
+
 /// Number of DataSource partitions assigned to scan task `task_index` of
 /// `task_count` under the round-robin stride `{index, index+count, …}`.
 /// `(0, 1)` (the default) yields all `n`. Local partition `p` maps to the

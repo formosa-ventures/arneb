@@ -20,7 +20,7 @@ mod split;
 mod table;
 mod translate;
 
-pub use select::build_select;
+pub use select::{build_aggregate_select, build_select};
 pub use split::{plan_splits, SplitPlan, SplitRange};
 pub use table::{RemoteColumn, RemoteTable, TABLE_META_PROPERTY};
 pub use translate::{

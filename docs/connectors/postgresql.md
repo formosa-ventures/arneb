@@ -175,9 +175,29 @@ but the partitions are uneven.
   and nothing is sent to the database.
 - **No TLS to PostgreSQL yet**: connections use plaintext. Use a trusted network
   or an SSH/TLS tunnel until `sslmode` support lands.
-- No aggregate, TopN or join pushdown yet. Joins between two PostgreSQL tables
+- TopN and join pushdown are unavailable. Joins between two PostgreSQL tables
   run in Arneb.
 - Metadata is read on each query that references a table, with no cache.
+
+## Aggregate pushdown
+
+Arneb pushes supported single-table aggregates to PostgreSQL automatically.
+A standalone query can use one remote statement. A distributed source fragment
+presents one aggregate query per primary-key range, then Arneb merges those
+partial results. Distributed `smallint` and `integer` averages use the existing
+`SUM` and `COUNT` rewrite.
+
+The supported forms include column-only grouping, `COUNT(*)`, `COUNT(column)`,
+`SUM` on `smallint`, `integer` and `numeric(p,s)` with `p < 38`, and
+`MIN` / `MAX` on compatible ordered types. Standalone `AVG` supports
+`smallint` and `integer`. Text grouping
+and extrema use PostgreSQL's `C` collation. All pre-aggregate predicates must
+translate exactly. Text predicates, computed aggregate arguments, distinct
+aggregates, `SUM(bigint)`, and unsupported type combinations keep aggregation
+in Arneb.
+
+Set `RUST_LOG=arneb::rdbms=debug` to see the `remote aggregate` event,
+the split number, and the generated `COPY` statement.
 
 ## Local environment
 

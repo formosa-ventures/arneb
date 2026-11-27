@@ -417,6 +417,18 @@ pub fn try_map_get_field_ref<E>(
     Ok(PlanExpr::GetField(Box::new((f(&pair.0)?, pair.1.clone()))))
 }
 
+/// Return the input indices of a projection consisting only of column
+/// references, in projection order.
+pub fn simple_column_projection_indices(exprs: &[PlanExpr]) -> Option<Vec<usize>> {
+    exprs
+        .iter()
+        .map(|expr| match expr {
+            PlanExpr::Column { index, .. } => Some(*index),
+            _ => None,
+        })
+        .collect()
+}
+
 impl PlanExpr {
     /// Returns the source span attached directly to this node, or `None`
     /// if it was synthesized by an analyzer/optimizer pass or is a

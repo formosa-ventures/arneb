@@ -3133,7 +3133,8 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                     .as_deref()
                     .map(|stats| crate::cost::estimated_cardinality(&input, stats).ceil() as u64);
                 let (input_plan, mut input_frags) = self.split(input);
-                if !is_decomposable_for_split(&aggr_exprs) {
+                let group_by_only = !group_by.is_empty() && aggr_exprs.is_empty();
+                if !group_by_only && !is_decomposable_for_split(&aggr_exprs) {
                     return (
                         LogicalPlan::Aggregate {
                             input: Box::new(input_plan),
@@ -3189,6 +3190,7 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                 let parallel_final = (parallel_final_agg_enabled()
                     || self.force_parallel_final_agg)
                     && n_group > 0
+                    && (!group_by_only || self.join_child)
                     && ((self.join_child
                         && input_frags.len() == 1
                         && input_frags[0].source_fragments.is_empty())
@@ -5169,6 +5171,60 @@ mod tests {
             "chain Y keeps its own max — not merged with X"
         );
         assert_eq!(count_of(&y.source_fragments[0]), 3);
+    }
+
+    /// A GROUP BY with no aggregate functions (a DISTINCT over its keys)
+    /// splits like a decomposable aggregate: each worker de-duplicates its
+    /// rows and the final step de-duplicates the partials. Kept single-phase,
+    /// TPC-DS q97 ran both of its `GROUP BY customer, item` CTEs and the FULL
+    /// JOIN above them in one task (SF30: 121-125 s and 12.6-13.3 GB, against
+    /// 28-30 s and 2.0 GB split).
+    #[test]
+    fn group_by_without_aggregates_splits_into_partial_and_final() {
+        let _pfa = set_parallel_final_agg_for_test(false);
+        let schema = vec![ColumnInfo {
+            name: "key".into(),
+            data_type: DataType::Int32,
+            nullable: false,
+        }];
+        let key = PlanExpr::Column {
+            index: 0,
+            name: "key".into(),
+            span: None,
+        };
+        let plan = LogicalPlan::Aggregate {
+            input: Box::new(scan_with_columns("t", &["key", "value"])),
+            group_by: vec![key],
+            aggr_exprs: vec![],
+            schema: schema.clone(),
+        };
+        let result = PlanFragmenter::new().fragment(plan);
+        let LogicalPlan::FinalAggregate {
+            group_by,
+            aggr_exprs,
+            schema: final_schema,
+            ..
+        } = &result.root
+        else {
+            panic!("expected a FinalAggregate root: {:?}", result.root);
+        };
+        assert_eq!(group_by.len(), 1);
+        assert!(aggr_exprs.is_empty());
+        assert_eq!(final_schema, &schema);
+        assert_eq!(result.source_fragments.len(), 1);
+        let LogicalPlan::PartialAggregate {
+            group_by,
+            aggr_exprs,
+            ..
+        } = &result.source_fragments[0].root
+        else {
+            panic!(
+                "expected a PartialAggregate in the scan fragment: {:?}",
+                result.source_fragments[0].root
+            );
+        };
+        assert_eq!(group_by.len(), 1);
+        assert!(aggr_exprs.is_empty());
     }
 
     #[test]

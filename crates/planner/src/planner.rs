@@ -6784,16 +6784,20 @@ mod tests {
         assert!(aggr_exprs.is_empty());
         assert_eq!(schema[0].name, "name");
 
-        // Distributed: the dedup runs in the single-output root fragment,
-        // over rows gathered from every source partition (like a GROUP BY
-        // with no aggregate functions, which the fragmenter keeps single-phase).
+        // Distributed: like any GROUP BY with no aggregate functions, each
+        // source partition de-duplicates its rows and the root de-duplicates
+        // the partials.
         let root = crate::fragment::PlanFragmenter::new().fragment(plan);
         assert_eq!(
             root.output_partitioning,
             crate::fragment::PartitioningScheme::Single
         );
-        assert!(matches!(root.root, LogicalPlan::Aggregate { .. }));
+        assert!(matches!(root.root, LogicalPlan::FinalAggregate { .. }));
         assert_eq!(root.source_fragments.len(), 1);
+        assert!(matches!(
+            root.source_fragments[0].root,
+            LogicalPlan::PartialAggregate { .. }
+        ));
     }
 
     #[tokio::test]

@@ -253,8 +253,6 @@ impl fmt::Debug for IcebergDataSource {
 struct FileColumnMap {
     /// Field ID → root column index in the file.
     root_by_field: HashMap<i32, usize>,
-    /// Root index → leaf index, for primitive roots only.
-    leaf_by_root: HashMap<usize, usize>,
 }
 
 impl FileColumnMap {
@@ -273,17 +271,7 @@ impl FileColumnMap {
                 root_by_field.entry(id).or_insert(idx);
             }
         }
-        let mut leaf_by_root = HashMap::new();
-        for leaf in 0..schema.num_columns() {
-            let root = schema.get_column_root_idx(leaf);
-            if roots[root].is_primitive() {
-                leaf_by_root.insert(root, leaf);
-            }
-        }
-        Self {
-            root_by_field,
-            leaf_by_root,
-        }
+        Self { root_by_field }
     }
 }
 
@@ -357,22 +345,25 @@ impl DataSource for IcebergDataSource {
         // Filter pushdown: only for columns whose physical type equals the
         // table type, so literal comparisons in the Parquet predicates and
         // row-group statistics are exact.
-        let leaf_for = |table_idx: usize| -> Option<usize> {
+        let root_for = |table_idx: usize| -> Option<usize> {
             let root = file_root_of(table_idx)?;
             let target: ArrowDataType = self.columns.get(table_idx)?.data_type.clone().into();
             if file_arrow.field(root).data_type() != &target {
                 return None;
             }
-            fmap.leaf_by_root.get(&root).copied()
+            // `build_split_stream` maps the root to its leaf, and leaves
+            // nested roots out.
+            Some(root)
         };
         let file_filters: Vec<PlanExpr> = ctx
             .filters
             .iter()
             .filter(|f| literal_types_match(f, &self.columns))
-            .filter_map(|f| remap_filter(f, &leaf_for))
+            .filter_map(|f| remap_filter(f, &root_for))
             .collect();
 
-        let buffer_bytes = parquet_scan::row_group_buffer_bytes(builder.metadata(), Some(&roots));
+        let buffer_bytes = parquet_scan::row_group_buffer_bytes(builder.metadata(), Some(&roots))
+            + arneb_connectors::parquet_pushdown::row_filter_set_bytes(&file_filters);
         let stream = parquet_scan::build_split_stream(
             builder,
             uri,

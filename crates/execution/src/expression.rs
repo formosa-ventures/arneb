@@ -354,6 +354,15 @@ fn evaluate_try(
 /// out. The right side is evaluated over the whole batch first (one
 /// vectorized pass, the common case); only if that fails is it evaluated
 /// again over just the open rows, where an error is the query's.
+///
+/// Cost of the retry: on a batch where the whole-batch pass fails, the
+/// right side is evaluated twice (once over the batch, once over the open
+/// rows) plus a `take` to gather those rows. A chain written left to right
+/// (`a AND b AND c` parses as `(a AND b) AND c`) evaluates each conjunct at
+/// most twice. An `AND` / `OR` nested on the right side doubles that at each
+/// level whose whole-batch pass fails, so `a AND (b AND c)` can evaluate `c`
+/// four times. Clean data, or a left side that decides every row, pays
+/// nothing extra.
 fn evaluate_logical(
     left: &PlanExpr,
     op: &ast::BinaryOp,

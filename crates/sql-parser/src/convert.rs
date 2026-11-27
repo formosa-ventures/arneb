@@ -725,26 +725,27 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             let e = convert_expr(*expr)?;
             // `'name'::regclass` / `::regtype` are resolved by the planner
             // (pg-catalog-tables).
-            if let Some(reg) = ["regclass", "regtype"]
+            let cast = if let Some(reg) = ["regclass", "regtype"]
                 .into_iter()
                 .find(|reg| is_custom_type(&data_type, reg))
             {
-                return Ok(ast::Expr::Function {
+                ast::Expr::Function {
                     order_by: vec![],
                     name: reg.to_string(),
                     args: vec![ast::FunctionArg::Unnamed(e)],
                     distinct: false,
                     span,
-                });
-            }
-            let dt = convert_data_type(data_type)?;
-            let cast = ast::Expr::Cast {
-                expr: Box::new(e),
-                data_type: dt,
-                span,
+                }
+            } else {
+                ast::Expr::Cast {
+                    expr: Box::new(e),
+                    data_type: convert_data_type(data_type)?,
+                    span,
+                }
             };
             // `TRY_CAST(x AS t)` (and BigQuery's `SAFE_CAST`) is Trino's
             // `TRY(CAST(x AS t))`: a value the target cannot hold is NULL.
+            // The same holds for `TRY_CAST(x AS regclass)`.
             match kind {
                 sp::CastKind::TryCast | sp::CastKind::SafeCast => Ok(ast::Expr::Function {
                     name: "TRY".to_string(),

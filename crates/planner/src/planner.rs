@@ -2545,6 +2545,34 @@ impl<'a> QueryPlanner<'a> {
                         }),
                     };
                 }
+                // `TRY_CAST('x' AS regclass)` is `TRY(regclass('x'))`, which is
+                // resolved here at plan time, so a name it cannot parse is
+                // NULL now rather than an error TRY never sees.
+                if name.eq_ignore_ascii_case("TRY") {
+                    if let [ast::FunctionArg::Unnamed(
+                        inner @ ast::Expr::Function {
+                            name: inner_name, ..
+                        },
+                    )] = args.as_slice()
+                    {
+                        if inner_name.eq_ignore_ascii_case("regclass")
+                            || inner_name.eq_ignore_ascii_case("regtype")
+                        {
+                            return match self.plan_expr(inner, ctx).await {
+                                // Both resolve to an oid (BIGINT).
+                                Err(PlanError::InvalidLiteral { .. }) => Ok(PlanExpr::Cast {
+                                    expr: Box::new(PlanExpr::Literal {
+                                        value: ScalarValue::Null,
+                                        span: node_span,
+                                    }),
+                                    data_type: DataType::Int64,
+                                    span: node_span,
+                                }),
+                                other => other,
+                            };
+                        }
+                    }
+                }
                 let mut plan_args = Vec::with_capacity(args.len());
                 for a in args {
                     let plan_arg = match a {

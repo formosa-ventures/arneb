@@ -20,17 +20,6 @@ use arneb_execution::ExecutionContext;
 
 use crate::fragment_pruning::prune_fragment_tree;
 
-fn dfrpc_domain_variant(domain: &arneb_common::Domain) -> String {
-    match domain {
-        arneb_common::Domain::DistinctValues(values) => {
-            format!("DistinctValues(len={})", values.len())
-        }
-        arneb_common::Domain::Range { .. } => "Range".to_string(),
-        arneb_common::Domain::Bloom(_) => "Bloom".to_string(),
-        arneb_common::Domain::All => "All".to_string(),
-    }
-}
-
 /// The first task failure of each running distributed query, as its
 /// workers report it (`report_task_failure`). Without it the coordinator
 /// learns of a failure only when a consumer reads the failed task's
@@ -351,7 +340,7 @@ impl QueryCoordinator {
             .collect();
         for (df_id, stage_id, task_count) in &register_entries {
             tracing::debug!(
-                target: "arneb::dynamic_filter",
+                target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                 "coord register_entry query_id={} df_id={} producer_stage_id={} expected_task_count={}",
                 query_id, df_id, stage_id, task_count
             );
@@ -458,7 +447,7 @@ impl QueryCoordinator {
                             // Service dropped before resolution (query ended
                             // early). Consumer-side timeouts handle this.
                             tracing::debug!(
-                                target: "arneb::dynamic_filter",
+                                target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                                 "coord pusher receiver_closed query_id={} df_id={}",
                                 query_id_for_push, df_id
                             );
@@ -466,11 +455,11 @@ impl QueryCoordinator {
                         }
                     };
                     tracing::debug!(
-                        target: "arneb::dynamic_filter",
+                        target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                         "coord pusher resolved query_id={} df_id={} domain={} targets={}",
                         query_id_for_push,
                         df_id,
-                        dfrpc_domain_variant(&domain),
+                        domain.summary(),
                         targets.len()
                     );
                     for (addr, task_id) in targets {
@@ -481,13 +470,13 @@ impl QueryCoordinator {
                             domain: domain.clone(),
                         };
                         tracing::debug!(
-                            target: "arneb::dynamic_filter",
+                            target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                             "coord notify_send query_id={} task_id={} df_id={} addr={} domain={}",
                             query_id_for_push,
                             task_id,
                             df_id,
                             addr,
-                            dfrpc_domain_variant(&domain)
+                            domain.summary()
                         );
                         if let Err(e) = arneb_rpc::notify_dynamic_filter(&addr, &req).await {
                             tracing::warn!(
@@ -499,7 +488,7 @@ impl QueryCoordinator {
                             );
                         } else {
                             tracing::debug!(
-                                target: "arneb::dynamic_filter",
+                                target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                                 "coord notify_ok query_id={} task_id={} df_id={}",
                                 query_id_for_push, task_id, df_id
                             );

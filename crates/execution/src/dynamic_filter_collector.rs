@@ -37,15 +37,6 @@ use arneb_planner::PlanExpr;
 use arneb_sql_parser::ast::BinaryOp;
 use tokio::sync::{oneshot, Mutex};
 
-fn dfrpc_domain_variant(domain: &Domain) -> String {
-    match domain {
-        Domain::DistinctValues(values) => format!("DistinctValues(len={})", values.len()),
-        Domain::Range { .. } => "Range".to_string(),
-        Domain::Bloom(_) => "Bloom".to_string(),
-        Domain::All => "All".to_string(),
-    }
-}
-
 /// Converts a resolved [`Domain`] into a [`PlanExpr`] filter that
 /// `ScanExec` can hand to its underlying `DataSource` along with any
 /// static filters.
@@ -179,20 +170,20 @@ impl DynamicFilterCollector {
             None => "none",
         };
         tracing::debug!(
-            target: "arneb::dynamic_filter",
+            target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
             "worker collector insert df_id={} domain={} prior_slot={}",
             df_id,
-            dfrpc_domain_variant(&domain),
+            domain.summary(),
             prior_slot
         );
         match inner.remove(&df_id) {
             Some(Slot::Pending(txs)) => {
                 for tx in txs {
                     tracing::debug!(
-                        target: "arneb::dynamic_filter",
+                        target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
                         "worker collector fire_receiver df_id={} domain={}",
                         df_id,
-                        dfrpc_domain_variant(&domain)
+                        domain.summary()
                     );
                     let _ = tx.send(domain.clone());
                 }
@@ -223,7 +214,7 @@ impl DynamicFilterCollector {
             None => "none",
         };
         tracing::debug!(
-            target: "arneb::dynamic_filter",
+            target: arneb_common::DYNAMIC_FILTER_LOG_TARGET,
             "worker collector take_receiver subscribed_df_id={} prior_slot={}",
             df_id, prior_slot
         );

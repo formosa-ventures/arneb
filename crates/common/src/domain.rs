@@ -144,6 +144,26 @@ impl BloomFilter {
     }
 }
 
+/// `tracing` target of every dynamic-filter event, so
+/// `RUST_LOG=arneb::dynamic_filter=debug` follows a filter end to end.
+pub const DYNAMIC_FILTER_LOG_TARGET: &str = "arneb::dynamic_filter";
+
+/// A [`Domain`]'s kind (and size, for distinct values) for log lines,
+/// without its values: `DistinctValues(len=3)`, `Range`, `Bloom`, `All`.
+#[derive(Debug, Clone, Copy)]
+pub struct DomainSummary<'a>(&'a Domain);
+
+impl std::fmt::Display for DomainSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Domain::DistinctValues(values) => write!(f, "DistinctValues(len={})", values.len()),
+            Domain::Range { .. } => f.write_str("Range"),
+            Domain::Bloom(_) => f.write_str("Bloom"),
+            Domain::All => f.write_str("All"),
+        }
+    }
+}
+
 /// Per-column dynamic-filter value set.
 ///
 /// `Eq` and `Hash` are intentionally NOT implemented because `ScalarValue`
@@ -174,6 +194,11 @@ pub enum Domain {
 }
 
 impl Domain {
+    /// The domain's kind for log lines; see [`DomainSummary`].
+    pub fn summary(&self) -> DomainSummary<'_> {
+        DomainSummary(self)
+    }
+
     /// Returns a Domain that filters out all rows (empty distinct values).
     pub fn none() -> Self {
         Domain::DistinctValues(Vec::new())

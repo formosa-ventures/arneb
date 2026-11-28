@@ -24,6 +24,7 @@ use futures::StreamExt;
 
 use crate::operator::ExecutionPlan;
 use crate::partitioning::Partitioning;
+use crate::task_guard::TaskGroup;
 
 const DEFAULT_CHANNEL_CAPACITY: usize = 4;
 
@@ -86,10 +87,13 @@ impl ExecutionPlan for CoalescePartitionsExec {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, ArnebError>>(capacity);
         let schema = crate::datasource::column_info_to_arrow_schema(&self.schema());
 
+        // Dropping the output stream aborts the tasks, so an input still
+        // waiting for its first batch is dropped too (#335).
+        let mut tasks = TaskGroup::default();
         for p in 0..n {
             let tx = tx.clone();
             let input = Arc::clone(&self.input);
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 match input.execute(p).await {
                     Ok(mut stream) => {
                         while let Some(item) = stream.next().await {
@@ -107,13 +111,18 @@ impl ExecutionPlan for CoalescePartitionsExec {
         }
         drop(tx); // channel closes when all spawned senders drop
 
-        Ok(Box::pin(CoalesceStream { rx, schema }))
+        Ok(Box::pin(CoalesceStream {
+            rx,
+            schema,
+            _tasks: tasks,
+        }))
     }
 }
 
 struct CoalesceStream {
     rx: tokio::sync::mpsc::Receiver<Result<RecordBatch, ArnebError>>,
     schema: arrow::datatypes::SchemaRef,
+    _tasks: TaskGroup,
 }
 
 impl Stream for CoalesceStream {
@@ -126,5 +135,21 @@ impl Stream for CoalesceStream {
 impl RecordBatchStream for CoalesceStream {
     fn schema(&self) -> arrow::datatypes::SchemaRef {
         self.schema.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task_guard::tests::{dropped_soon, StalledExec};
+
+    #[tokio::test]
+    async fn dropping_the_stream_drops_an_input_that_never_produced() {
+        let (input, dropped) = StalledExec::new(2);
+        let stream = CoalescePartitionsExec::new(input).execute(0).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        drop(stream);
+        assert!(dropped_soon(&dropped).await);
     }
 }

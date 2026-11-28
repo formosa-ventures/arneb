@@ -39,6 +39,7 @@ mod scalar_subquery;
 mod scan_context;
 mod semi_join;
 mod set_ops;
+mod task_guard;
 mod window;
 
 pub use aggregate::{

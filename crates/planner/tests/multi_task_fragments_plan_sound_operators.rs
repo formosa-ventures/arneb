@@ -192,6 +192,42 @@ fn benchmark_queries_plan_sound_fragments() {
     );
 }
 
+/// TPC-DS q97 FULL JOINs two `GROUP BY customer, item` CTEs on those keys.
+/// The join and both de-duplications run hash-partitioned on the keys, in
+/// several tasks, not in one task over every row.
+#[test]
+fn tpcds_q97_joins_its_group_by_ctes_hash_partitioned() {
+    let (_, q97) = benchmark_plans()
+        .into_iter()
+        .find(|(key, _)| key == "tpcds q97")
+        .expect("tpcds q97 is a benchmark query");
+    let mut full_join_fragments = Vec::new();
+    for_each_fragment(&q97, &mut |fragment| {
+        if fragment.root.to_string().contains("Join: Full") {
+            full_join_fragments.push(fragment);
+        }
+    });
+    assert_eq!(full_join_fragments.len(), 1, "{}", describe(&q97, 0));
+    assert_eq!(
+        full_join_fragments[0].fragment_type,
+        FragmentType::HashPartitioned,
+        "{}",
+        describe(&q97, 0)
+    );
+    let mut single_phase = Vec::new();
+    for_each_fragment(&q97, &mut |fragment| {
+        for line in fragment.root.to_string().lines() {
+            if line.trim_start().starts_with("Aggregate:") {
+                single_phase.push(line.trim().to_string());
+            }
+        }
+    });
+    assert!(
+        single_phase.is_empty(),
+        "single-phase aggregates: {single_phase:?}"
+    );
+}
+
 async fn assert_shapes_plan_sound_fragments(names: &[&str]) {
     let catalog = tpcds_catalog();
     let mut offenders = Vec::new();

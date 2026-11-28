@@ -1542,6 +1542,7 @@ async fn run(control: tokio::runtime::Handle) -> Result<()> {
             heartbeat_target.as_ref().zip(worker_tasks.as_ref()),
             &worker_state,
             heartbeat.interval_secs,
+            heartbeat.timeout_secs,
             drain_timeout_secs,
         ) => None,
     };
@@ -1635,6 +1636,9 @@ where
 struct HeartbeatTarget {
     coordinator_address: String,
     message: arneb_rpc::HeartbeatMessage,
+    /// When the coordinator last answered a heartbeat (start-up until the
+    /// first answer). Shared by clones.
+    last_answer: std::sync::Arc<std::sync::Mutex<std::time::Instant>>,
 }
 
 impl HeartbeatTarget {
@@ -1660,14 +1664,26 @@ impl HeartbeatTarget {
             .advertised_address
             .clone()
             .unwrap_or_else(|| my_rpc_addr.to_string());
-        Some(Self {
-            coordinator_address: format!("http://{addr}"),
-            message: arneb_rpc::HeartbeatMessage::new(
-                worker_id,
-                format!("http://{advertised}"),
-                256,
-            ),
-        })
+        Some(Self::new(
+            format!("http://{addr}"),
+            arneb_rpc::HeartbeatMessage::new(worker_id, format!("http://{advertised}"), 256),
+        ))
+    }
+
+    fn new(coordinator_address: String, message: arneb_rpc::HeartbeatMessage) -> Self {
+        Self {
+            coordinator_address,
+            message,
+            last_answer: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        }
+    }
+
+    /// How long ago the coordinator last answered a heartbeat.
+    fn coordinator_silent_for(&self) -> std::time::Duration {
+        self.last_answer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .elapsed()
     }
 
     /// Send one heartbeat reporting `state`, logging a failure. Returns
@@ -1685,6 +1701,10 @@ impl HeartbeatTarget {
         {
             Ok(reply) => {
                 tracing::debug!(worker_id = %worker_id, ?state, "heartbeat sent");
+                *self
+                    .last_answer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
                 return Some(reply);
             }
             Err(
@@ -1816,11 +1836,14 @@ async fn worker_heartbeat_loop_on_runtime(
 
 /// Wait for SIGTERM or Ctrl-C. On a worker, then drain: report `draining`,
 /// wait until the coordinator has released every query here (or the drain
-/// timeout passes), and report `stopped`. A second signal ends the drain.
+/// timeout passes, or the coordinator has not answered a heartbeat for
+/// `heartbeat_timeout_secs`), and report `stopped`. A second signal ends
+/// the drain.
 async fn run_until_shutdown(
     worker: Option<(&HeartbeatTarget, &task_manager::TaskManager)>,
     state: &tokio::sync::watch::Sender<arneb_rpc::WorkerState>,
     interval_secs: u64,
+    heartbeat_timeout_secs: u64,
     drain_timeout_secs: u64,
 ) {
     drain::shutdown_signal().await;
@@ -1838,8 +1861,12 @@ async fn run_until_shutdown(
     );
     state.send_replace(arneb_rpc::WorkerState::Draining);
     let started = std::time::Instant::now();
+    // A coordinator silent that long has dropped this worker too, so it
+    // will not release the queries still here.
+    let heartbeat_timeout = std::time::Duration::from_secs(heartbeat_timeout_secs);
     let wait = drain::wait_until_idle(
         || tasks.active_queries(),
+        || target.coordinator_silent_for() >= heartbeat_timeout,
         std::time::Duration::from_secs(interval_secs),
         std::time::Duration::from_secs(drain_timeout_secs),
         std::time::Duration::from_millis(500),
@@ -1858,6 +1885,14 @@ async fn run_until_shutdown(
                 active_queries = left,
                 drain_timeout_secs,
                 "drain timed out"
+            ),
+            drain::DrainOutcome::CoordinatorGone(left) => tracing::warn!(
+                target: "arneb::cluster",
+                worker_id = %worker_id,
+                active_queries = left,
+                silent_secs = target.coordinator_silent_for().as_secs(),
+                heartbeat_timeout_secs,
+                "coordinator not answering; ending the drain"
             ),
         },
         _ = drain::shutdown_signal() => {
@@ -2990,10 +3025,10 @@ mod tests {
         let addr = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(arneb_rpc::__serve_flight_for_test(listener, state));
 
-        let target = HeartbeatTarget {
-            coordinator_address: addr.clone(),
-            message: arneb_rpc::HeartbeatMessage::new("w1".into(), "http://localhost:1".into(), 8),
-        };
+        let target = HeartbeatTarget::new(
+            addr.clone(),
+            arneb_rpc::HeartbeatMessage::new("w1".into(), "http://localhost:1".into(), 8),
+        );
         let live = empty_live();
         let puller = catalogs::CatalogPuller::from_coordinator(addr, live.clone());
         for _ in 0..2 {
@@ -3003,8 +3038,39 @@ mod tests {
                 .expect("heartbeat reply");
             puller.after_heartbeat(&reply).await;
         }
+        assert!(target.coordinator_silent_for() < std::time::Duration::from_secs(5));
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
         assert_eq!(live.generation(), 3);
+    }
+
+    /// Only an answered heartbeat resets how long the coordinator has been
+    /// silent, which ends a drain once it reaches the heartbeat timeout.
+    #[tokio::test]
+    async fn only_an_answered_heartbeat_resets_the_coordinator_silence() {
+        // Nothing listens on this port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let target = HeartbeatTarget::new(
+            addr,
+            arneb_rpc::HeartbeatMessage::new("w1".into(), "http://localhost:1".into(), 8),
+        );
+        let before = target.coordinator_silent_for();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(target
+            .send(arneb_rpc::WorkerState::Draining)
+            .await
+            .is_none());
+        assert!(target.coordinator_silent_for() > before);
+        assert!(target.coordinator_silent_for() >= std::time::Duration::from_millis(50));
+
+        let other = target.clone();
+        *other.last_answer.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(60);
+        assert!(
+            target.coordinator_silent_for() >= std::time::Duration::from_secs(60),
+            "clones share it"
+        );
     }
 
     /// A coordinator Flight server serving `set` (its heartbeat reply
@@ -3058,10 +3124,10 @@ mod tests {
         }));
         let fetches = Arc::new(AtomicUsize::new(0));
         let addr = fake_coordinator(set.clone(), fetches.clone()).await;
-        let target = HeartbeatTarget {
-            coordinator_address: addr.clone(),
-            message: arneb_rpc::HeartbeatMessage::new("w1".into(), "http://localhost:1".into(), 8),
-        };
+        let target = HeartbeatTarget::new(
+            addr.clone(),
+            arneb_rpc::HeartbeatMessage::new("w1".into(), "http://localhost:1".into(), 8),
+        );
         let live = empty_live();
         // The worker already holds (100, 5) with `lake` installed.
         live.install(lake.clone(), memory_built());
@@ -3531,14 +3597,10 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let target = HeartbeatTarget {
-                coordinator_address: addr,
-                message: arneb_rpc::HeartbeatMessage::new(
-                    "w1".into(),
-                    "http://localhost:1".into(),
-                    8,
-                ),
-            };
+            let target = HeartbeatTarget::new(
+                addr,
+                arneb_rpc::HeartbeatMessage::new("w1".into(), "http://localhost:1".into(), 8),
+            );
             if let Some(busy) = busy {
                 target
                     .send(arneb_rpc::WorkerState::Active)

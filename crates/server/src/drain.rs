@@ -37,26 +37,40 @@ pub enum DrainOutcome {
     Idle,
     /// The timeout passed with this many queries still on the node.
     TimedOut(usize),
+    /// The coordinator stopped answering with this many queries still on
+    /// the node. Nothing can release them, so waiting longer only delays
+    /// the exit.
+    CoordinatorGone(usize),
 }
 
 /// Wait `settle` (so tasks of a query planned just before the coordinator
 /// saw the drain are tracked), then poll `active_queries` every `poll`
-/// until it is 0 or `timeout` (counted from the start) passes.
+/// until it is 0, `coordinator_gone` turns true, or `timeout` (counted
+/// from the start) passes.
 pub async fn wait_until_idle(
     active_queries: impl Fn() -> usize,
+    coordinator_gone: impl Fn() -> bool,
     settle: Duration,
     timeout: Duration,
     poll: Duration,
 ) -> DrainOutcome {
     let drained = tokio::time::timeout(timeout, async {
         tokio::time::sleep(settle).await;
-        while active_queries() > 0 {
+        loop {
+            let left = active_queries();
+            if left == 0 {
+                return DrainOutcome::Idle;
+            }
+            if coordinator_gone() {
+                return DrainOutcome::CoordinatorGone(left);
+            }
             tokio::time::sleep(poll).await;
         }
     })
     .await;
     match (drained, active_queries()) {
-        (Ok(()), _) | (Err(_), 0) => DrainOutcome::Idle,
+        (Ok(outcome), _) => outcome,
+        (Err(_), 0) => DrainOutcome::Idle,
         (Err(_), left) => DrainOutcome::TimedOut(left),
     }
 }
@@ -80,6 +94,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let outcome = wait_until_idle(
             || active.load(Ordering::SeqCst),
+            || false,
             Duration::from_secs(2),
             Duration::from_secs(60),
             Duration::from_millis(500),
@@ -98,6 +113,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let outcome = wait_until_idle(
             || 0,
+            || false,
             Duration::from_secs(2),
             Duration::from_secs(60),
             Duration::from_millis(500),
@@ -112,6 +128,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let outcome = wait_until_idle(
             || 3,
+            || false,
             Duration::from_secs(2),
             Duration::from_secs(10),
             Duration::from_millis(500),
@@ -119,5 +136,33 @@ mod tests {
         .await;
         assert_eq!(outcome, DrainOutcome::TimedOut(3));
         assert_eq!(start.elapsed(), Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stops_waiting_once_the_coordinator_is_gone() {
+        let start = tokio::time::Instant::now();
+        let outcome = wait_until_idle(
+            || 3,
+            || tokio::time::Instant::now() - start >= Duration::from_secs(5),
+            Duration::from_secs(2),
+            Duration::from_secs(600),
+            Duration::from_millis(500),
+        )
+        .await;
+        assert_eq!(outcome, DrainOutcome::CoordinatorGone(3));
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_node_is_idle_even_without_a_coordinator() {
+        let outcome = wait_until_idle(
+            || 0,
+            || true,
+            Duration::from_secs(2),
+            Duration::from_secs(600),
+            Duration::from_millis(500),
+        )
+        .await;
+        assert_eq!(outcome, DrainOutcome::Idle);
     }
 }

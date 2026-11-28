@@ -177,31 +177,15 @@ fn binary_comparison(
     }
 
     // Identify the (column, literal) operand ordering for asymmetric ops.
-    let (col_side, lit_side, op_view) = match (column_name(left), literal_value(right)) {
-        (Some(_), Some(_)) => (Side::Left, Side::Right, op),
-        _ => match (column_name(right), literal_value(left)) {
-            // Swap operands for asymmetric ops to keep column on the left.
-            (Some(_), Some(_)) => (Side::Right, Side::Left, flip(op)),
+    let ((col_name, index), lit_value, op_view) = match (column_ref(left), literal_value(right)) {
+        (Some(col), Some(lit)) => (col, lit, op),
+        _ => match (column_ref(right), literal_value(left)) {
+            (Some(col), Some(lit)) => (col, lit, flip(op)),
             _ => return DEFAULT_UNKNOWN_SELECTIVITY,
         },
     };
 
-    let col = match col_side {
-        Side::Left => column_name(left),
-        Side::Right => column_name(right),
-    };
-    let col_name = match col {
-        Some(n) => n,
-        None => return DEFAULT_UNKNOWN_SELECTIVITY,
-    };
-
-    let lit = match lit_side {
-        Side::Left => literal_value(left),
-        Side::Right => literal_value(right),
-    };
-    let lit_value = lit.expect("literal_value guaranteed by ordering above");
-
-    let stats = lookup.lookup(col_name);
+    let stats = lookup.lookup_at(col_name, index);
     match op_view {
         BinaryOp::Eq => eq_selectivity(stats.as_ref()),
         BinaryOp::NotEq => 1.0 - eq_selectivity(stats.as_ref()),
@@ -237,7 +221,7 @@ fn between_selectivity(
     high: &PlanExpr,
     lookup: &dyn ColumnStatsLookup,
 ) -> f64 {
-    let col_name = match column_name(expr) {
+    let (col_name, index) = match column_ref(expr) {
         Some(n) => n,
         None => return DEFAULT_BETWEEN_SELECTIVITY,
     };
@@ -250,17 +234,17 @@ fn between_selectivity(
         None => return DEFAULT_BETWEEN_SELECTIVITY,
     };
 
-    let stats = lookup.lookup(col_name);
+    let stats = lookup.lookup_at(col_name, index);
     range_fraction(stats.as_ref(), &lo, &hi).unwrap_or(DEFAULT_BETWEEN_SELECTIVITY)
 }
 
 fn in_list_selectivity(expr: &PlanExpr, list: &[PlanExpr], lookup: &dyn ColumnStatsLookup) -> f64 {
-    let col_name = match column_name(expr) {
+    let (col_name, index) = match column_ref(expr) {
         Some(n) => n,
         None => return clamp01(DEFAULT_EQ_SELECTIVITY * list.len() as f64),
     };
     let k = list.len() as f64;
-    let stats = lookup.lookup(col_name);
+    let stats = lookup.lookup_at(col_name, index);
     match stats.and_then(|s| s.ndv) {
         Some(ndv) if ndv > 0 => (k / ndv as f64).min(1.0),
         _ => (DEFAULT_EQ_SELECTIVITY * k).min(1.0),
@@ -334,11 +318,6 @@ fn numeric(v: &ScalarValue) -> Option<f64> {
 // Small helpers
 // ---------------------------------------------------------------------------
 
-enum Side {
-    Left,
-    Right,
-}
-
 fn flip(op: BinaryOp) -> BinaryOp {
     match op {
         BinaryOp::Lt => BinaryOp::Gt,
@@ -382,10 +361,6 @@ fn is_aggregate_function_call(expr: &PlanExpr) -> bool {
         }
         _ => false,
     }
-}
-
-fn column_name(expr: &PlanExpr) -> Option<&str> {
-    column_ref(expr).map(|(name, _)| name)
 }
 
 fn null_fraction(expr: &PlanExpr, lookup: &dyn ColumnStatsLookup) -> f64 {

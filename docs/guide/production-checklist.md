@@ -224,8 +224,10 @@ before relying on the cluster.
   - The growth in #258 most likely came from the same place, on the Hive + S3 scan path.
   - Size container limits with headroom well above the pool.
 - **Aggregate spill is partial (#316, #317).** Aggregate spill is off unless `ARNEB_AGG_SPILL=1` is set. When it is on:
+  - Only an aggregate whose input arrives as a single partition can spill. An aggregate over several input partitions, the usual case on a cluster, fails with `53200` when the pool is full, as it does with spill off.
   - Groups admitted before memory ran short stay in memory while the rest spill. If their state keeps growing (`MIN`/`MAX` over long strings, `ARRAY_AGG`, percentiles), the query can still run out of memory (#316).
   - A spilling aggregate's 64 spill writers hold about 37 MB of buffers outside the pool (#317). That is small next to a multi-GiB pool, but it adds up when many queries spill at once.
+- **A small memory pool can fail a query with an exchange error (#325).** With a 64 MiB pool on a local SF1 cluster, TPC-H q21 fails with `partition 0 already consumed` instead of spilling or failing with `53200`. Pools sized for production are far larger, but treat this error as a sign that the pool is too small.
 - **No task-level retry (#248).** A query that loses a task fails, or reruns from the start under `retry_policy = "query"`.
 - **PostgreSQL aggregate pushdown has no switch.** A supported aggregate over one PostgreSQL table runs in PostgreSQL, with its `work_mem` and CPU (see [Aggregate pushdown](/connectors/postgresql#aggregate-pushdown)). A `GROUP BY` on a high-cardinality column moves the whole aggregation into that database, and no catalog option turns this off. Before attaching a production database, check that it can take those queries, or point the catalog at a replica.
 - **Broadcast joins on one core (#283).** A broadcast hash join uses about one core of a multi-core worker, where a hash-partitioned plan uses several.

@@ -234,7 +234,10 @@ All gated per dialect capability, falling back to Arneb-side evaluation.
 
 - Aggregate pushdown: `GROUP BY` with `COUNT` / `SUM` / `MIN` / `MAX`;
   `AVG` decomposed into `SUM` + `COUNT`; partial aggregate remote and final
-  aggregate in Arneb when a table is read as multiple splits.
+  aggregate in Arneb when a table is read as multiple splits. **Done for
+  PostgreSQL single-table aggregates in v0.2.3 (#319)**; see
+  `docs/connectors/postgresql.md#aggregate-pushdown` for the supported forms.
+  It has no per-catalog switch yet.
 - TopN pushdown: `ORDER BY ... LIMIT n`.
 - Join pushdown when both sides are in the same PostgreSQL/MySQL catalog.
 
@@ -308,7 +311,8 @@ its own OpenSpec change.
 | v0.2.0 (shipped 2026-11-07) | Headless agent interface | H1–H6 (#215–#220): state store, API tokens and authentication on every route; agent query API; remote MCP; manage API, write privileges and audit log; runtime config; MCP OAuth. Access rules also checked on the connector-resolved name (#221). See `2026-10-30-headless-agent-interface-design.md` | Tier 1 + Tier 2 per change + CI cluster smoke + kind; the headless acceptance scenario has not been run yet |
 | v0.2.1 | Correctness and coverage | TPC-DS 103/103 cell-identical to Trino at SF1 (#224); join, planner and cast fixes (#225/#235, #234, #240, #241, #243, #253, #257, #259); worker heartbeat on its own thread with a 5 s timeout (#242, #252, #254); the headless acceptance scenario on kind in CI (#255); RustSec and dependency bumps (#260, #267, #268, #269) | Tier 1 + CI cluster smoke + kind + headless acceptance on kind |
 | v0.2.2 | Arrays and cluster failure handling | Arrays, `= ANY` / `<> ALL`, `ARRAY_AGG` and `UNNEST` (G6 2b-1 part 1, #275); `GROUPING` with several arguments (#288); `IN` subqueries in a not-false position (#287); TINYINT/SMALLINT coercion (#292); a failed task fails its query at once (#281); a worker that misses heartbeats is probed before its queries fail (#293); pgwire `CancelRequest` (#278); spilling stops before the disk fills (#280); partial aggregate fused into the join fragment (#282); row-group pruning checks prepared once per file (#295); RustSec bumps (#298, #303) | Tier 1 + CI cluster smoke + kind + headless acceptance on kind |
-| after headless | Client gaps | G6 stage 2b: arrays (shipped in v0.2.2), `json_build_object`, SQLAlchemy column reflection over pgwire, a Metabase run; `pg_catalog` follow-ups (#189) | Tier 1 + 2 |
+| v0.2.3 | BI clients, aggregate pushdown, single-file Parquet parallelism | SQLAlchemy reflection over pgwire (G6 2b-1 part 2, #276) and Metabase over pgwire (G6 2b-2, #277); PostgreSQL single-table aggregate pushdown (M4, #319); a registered Parquet file read as parallel splits with row-group pruning and row-level filters (#291, #296, #311); the root stage's heavy work runs on a worker (#306); Flight served on its own control runtime (#294); strict run-time casts, `TRY_CAST`, SMALLINT/TINYINT literals and `FROM (VALUES)` (#286); DISTINCT and percentile state reserved against the memory pool (#285, #310); Extended Query parameters bound in one pass (#284); the production checklist (#315) | Tier 1 + CI cluster smoke + kind + headless acceptance on kind; Metabase checked by hand |
+| after headless | Client gaps | G6 stage 2b, done: arrays (v0.2.2), `json_build_object`, SQLAlchemy column reflection over pgwire and a Metabase run (v0.2.3); `pg_catalog` follow-ups (#189) remain | Tier 1 + 2 |
 | in parallel | Large-scale memory | P1 SF30 validation, `dist-adaptive-partition` SF30 sweep (q18 SF30 still OOMs) | Tier 3 |
 | v0.2.x (later) | Production-ready | Headless acceptance scenario green (done in v0.2.1, #255), scenario 1 checklist green, BI client smoke (G6), `docs/guide/production-checklist.md` | — |
 
@@ -369,3 +373,12 @@ and a check that the setting took effect. It also lists the open issues that
 limit a deployment: #139, #247 (which #258's growth most likely belongs to),
 #248 and #283. Left for the production-ready v0.2.x: the P1 SF30 validation
 (Tier 3), and walking the checklist on a real deployment.
+
+**Status (2026-11-27, v0.2.3):** v0.2.3 finishes G6 stage 2b: SQLAlchemy
+reflection (#276) and Metabase (#277) work over pgwire. It also ships the
+first M4 item, PostgreSQL single-table aggregate pushdown (#319). A
+registered Parquet file is now read as parallel splits with row-group
+pruning and row-level filters (#291, #296, #311); the SF30 run for #311's
+row-group splits is with the teammates. The production checklist is in
+(#315). Left for the production-ready v0.2.x: the P1 SF30 validation
+(Tier 3) and walking the checklist on a real deployment.

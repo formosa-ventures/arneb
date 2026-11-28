@@ -128,7 +128,19 @@ jobs:
           cache: pip
           cache-dependency-path: scripts/client-smoke/requirements.txt
       - run: pip install -r scripts/client-smoke/requirements.txt
+      # The data and the DuckDB reference database depend only on
+      # gen_tpch.py and the DuckDB version, so reuse them across runs.
+      - name: DuckDB version
+        id: duckdb
+        run: echo "version=$(python -c 'import duckdb; print(duckdb.__version__)')" >> "$GITHUB_OUTPUT"
+      - name: Cache TPC-H SF1
+        id: tpch-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/tpch
+          key: tpch-sf1-${{ hashFiles('scripts/k8s-smoke/gen_tpch.py') }}-duckdb-${{ steps.duckdb.outputs.version }}
       - name: Generate TPC-H SF1
+        if: steps.tpch-cache.outputs.cache-hit != 'true'
         run: python scripts/k8s-smoke/gen_tpch.py "$RUNNER_TEMP/tpch" 1
       - name: Smoke test
         run: ROUNDS=5 scripts/client-smoke/run.sh "$RUNNER_TEMP/tpch"

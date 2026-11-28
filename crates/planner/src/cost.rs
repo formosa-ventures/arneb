@@ -87,16 +87,26 @@ impl ColumnStatsLookup for PlanLookup<'_> {
 
 impl PlanLookup<'_> {
     fn column_stats(&self, column: &str, index: Option<usize>) -> Option<ColumnStatistics> {
-        walk_scans(self.input, index, false, &mut |table_ref, null_extended| {
-            let mut column_stats = self.stats.get(table_ref)?.columns.get(column)?.clone();
-            if null_extended {
-                // Unmatched rows introduce NULLs absent from the base statistics.
-                column_stats.null_fraction = column_stats
-                    .null_fraction
-                    .map(|fraction| fraction.max(selectivity::DEFAULT_NULL_SELECTIVITY));
-            }
-            Some(column_stats)
-        })
+        walk_scans(
+            self.input,
+            index,
+            false,
+            &mut |table_ref, source, null_extended| {
+                let mut column_stats = self
+                    .stats
+                    .get(table_ref)?
+                    .columns
+                    .get(source.unwrap_or(column))?
+                    .clone();
+                if null_extended {
+                    // Unmatched rows introduce NULLs absent from the base statistics.
+                    column_stats.null_fraction = column_stats
+                        .null_fraction
+                        .map(|fraction| fraction.max(selectivity::DEFAULT_NULL_SELECTIVITY));
+                }
+                Some(column_stats)
+            },
+        )
     }
 }
 
@@ -120,6 +130,20 @@ impl ColumnStatsLookup for JoinLookup<'_> {
             }
             .lookup(column)
         })
+    }
+
+    fn lookup_at(&self, column: &str, index: usize) -> Option<ColumnStatistics> {
+        let width = self.left.schema().len();
+        let (input, index) = if index < width {
+            (self.left, index)
+        } else {
+            (self.right, index - width)
+        };
+        PlanLookup {
+            input,
+            stats: self.stats,
+        }
+        .lookup_at(column, index)
     }
 }
 
@@ -497,7 +521,7 @@ fn estimate_join(
                 .unwrap_or(false)
             {
                 let mut cols = Vec::new();
-                visit_columns(expr, &mut |name| cols.push(name.to_string()));
+                visit_columns(expr, &mut |name, _| cols.push(name.to_string()));
                 let owners: Vec<String> = cols
                     .iter()
                     .map(|c| {
@@ -570,7 +594,7 @@ fn best_effort_join_ndv(
     stats: &CatalogStats,
 ) -> f64 {
     let mut best: f64 = 1.0;
-    visit_columns(expr, &mut |name| {
+    visit_columns(expr, &mut |name, _| {
         if let Some(ndv) =
             lookup_column_ndv(name, left, stats).or_else(|| lookup_column_ndv(name, right, stats))
         {
@@ -602,7 +626,7 @@ fn best_effort_join_ndv(
     // chain case. Falls back to the old subtree-min when no key column
     // resolves to a scan (e.g. a key over a computed column).
     let mut owner_cards: Vec<f64> = Vec::new();
-    visit_columns(expr, &mut |name| {
+    visit_columns(expr, &mut |name, _| {
         if let Some(c) = key_owner_unfiltered_card(name, left, stats)
             .or_else(|| key_owner_unfiltered_card(name, right, stats))
         {
@@ -737,7 +761,7 @@ pub fn total_scanned_rows(plan: &LogicalPlan, stats: &CatalogStats) -> f64 {
 }
 
 fn lookup_column_ndv(name: &str, plan: &LogicalPlan, stats: &CatalogStats) -> Option<u64> {
-    walk_scans(plan, None, false, &mut |scan_table, _| {
+    walk_scans(plan, None, false, &mut |scan_table, _, _| {
         stats
             .get(scan_table)
             .and_then(|t| t.columns.get(name))
@@ -752,28 +776,51 @@ fn walk_scans<T, F>(
     callback: &mut F,
 ) -> Option<T>
 where
-    F: FnMut(&TableReference, bool) -> Option<T>,
+    F: FnMut(&TableReference, Option<&str>, bool) -> Option<T>,
 {
     match plan {
-        LogicalPlan::TableScan { table, .. } => callback(table, null_extended),
+        LogicalPlan::TableScan { table, schema, .. } => {
+            let source = match index {
+                Some(i) => Some(schema.get(i)?.name.as_str()),
+                None => None,
+            };
+            callback(table, source, null_extended)
+        }
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Window { input, .. }
         | LogicalPlan::Distinct { input } => walk_scans(input, index, null_extended, callback),
-        LogicalPlan::Projection { input, exprs, .. } => {
-            let source = index.and_then(|i| match exprs.get(i)? {
-                PlanExpr::Column { index, .. } => Some(*index),
-                _ => None,
-            });
-            walk_scans(input, source, null_extended, callback)
+        LogicalPlan::Projection { input, exprs, .. }
+        | LogicalPlan::Aggregate {
+            input,
+            group_by: exprs,
+            ..
         }
-        LogicalPlan::Aggregate { input, .. }
-        | LogicalPlan::RollupAggregate { input, .. }
-        | LogicalPlan::PartialAggregate { input, .. }
-        | LogicalPlan::FinalAggregate { input, .. } => {
-            walk_scans(input, None, null_extended, callback)
+        | LogicalPlan::RollupAggregate {
+            input,
+            group_by: exprs,
+            ..
+        }
+        | LogicalPlan::PartialAggregate {
+            input,
+            group_by: exprs,
+            ..
+        }
+        | LogicalPlan::FinalAggregate {
+            input,
+            group_by: exprs,
+            ..
+        } => {
+            let source = match index {
+                Some(i) => match exprs.get(i)? {
+                    PlanExpr::Column { index, .. } => Some(*index),
+                    _ => return None,
+                },
+                None => None,
+            };
+            walk_scans(input, source, null_extended, callback)
         }
         LogicalPlan::Join {
             left,
@@ -821,10 +868,10 @@ where
 
 fn visit_columns<F>(expr: &PlanExpr, callback: &mut F)
 where
-    F: FnMut(&str),
+    F: FnMut(&str, usize),
 {
     match expr {
-        PlanExpr::Column { name, .. } => callback(name),
+        PlanExpr::Column { name, index, .. } => callback(name, *index),
         PlanExpr::BinaryOp { left, right, .. } => {
             visit_columns(left, callback);
             visit_columns(right, callback);
@@ -900,11 +947,13 @@ fn group_by_ndv_product(
     let mut product = 1.0_f64;
     for expr in group_by {
         let mut col_ndv: Option<u64> = None;
-        visit_columns(expr, &mut |name| {
+        visit_columns(expr, &mut |name, index| {
             if col_ndv.is_some() {
                 return;
             }
-            col_ndv = lookup_column_ndv(name, input, stats);
+            col_ndv = PlanLookup { input, stats }
+                .lookup_at(name, index)
+                .and_then(|s| s.ndv);
         });
         let ndv = col_ndv.map(|v| v as f64).unwrap_or_else(|| {
             // No column NDV stat (e.g. HMS never supplies column
@@ -921,7 +970,7 @@ fn group_by_ndv_product(
             // still caps the final result, so an owner larger than the
             // child (e.g. a filtered/joined-down input) can't inflate it.
             let mut owner: Option<f64> = None;
-            visit_columns(expr, &mut |name| {
+            visit_columns(expr, &mut |name, _| {
                 if owner.is_some() {
                     return;
                 }
@@ -1945,6 +1994,221 @@ mod tests {
             let (join, s) = orders_refunds();
             let (estimate, _) = estimate_over(join, is_null(0, "id"), &s);
             assert_eq!(estimate, 1.0);
+        }
+    }
+
+    mod column_statistics_by_position {
+        //! Two joined tables may both have a column named `id`. A predicate
+        //! names the one it means by its position in the input, and the
+        //! estimate must use that table's statistics (#318).
+
+        use super::*;
+
+        /// orders.id: never NULL, 1 000 distinct values in 0..=1 000 000.
+        /// refunds.id: 40 % NULL, 50 distinct values in 0..=100.
+        fn catalog_stats() -> CatalogStats {
+            let id = |ndv, null_fraction, max| ColumnStatistics {
+                ndv: Some(ndv),
+                null_fraction: Some(null_fraction),
+                min_value: Some(ScalarValue::Int64(0)),
+                max_value: Some(ScalarValue::Int64(max)),
+            };
+            let table = |rows, id: ColumnStatistics| TableStatistics {
+                row_count: Some(rows),
+                size_bytes: None,
+                columns: HashMap::from([("id".to_string(), id)]),
+            };
+            let mut s = CatalogStats::new();
+            s.insert(
+                TableReference::table("orders"),
+                table(1_000_000, id(1_000, 0.0, 1_000_000)),
+            );
+            s.insert(
+                TableReference::table("refunds"),
+                table(50_000, id(50, 0.4, 100)),
+            );
+            s
+        }
+
+        /// `orders JOIN refunds ON orders.id = refunds.order_id [AND extra]`.
+        /// Output columns: 0 = orders.id, 1 = refunds.id, 2 = refunds.order_id.
+        fn orders_refunds(join_type: JoinType, extra: Option<PlanExpr>) -> LogicalPlan {
+            let keys = eq(col_expr(0, "id"), col_expr(2, "order_id"));
+            let condition = match extra {
+                Some(extra) => PlanExpr::BinaryOp {
+                    left: Box::new(keys),
+                    op: AstBinaryOp::And,
+                    right: Box::new(extra),
+                    span: None,
+                },
+                None => keys,
+            };
+            LogicalPlan::Join {
+                left: Box::new(make_scan("orders", vec!["id"])),
+                right: Box::new(make_scan("refunds", vec!["id", "order_id"])),
+                join_type,
+                condition: JoinCondition::On(condition),
+                dynamic_filter_ids: Vec::new(),
+            }
+        }
+
+        fn is_null(index: usize, column: &str) -> PlanExpr {
+            PlanExpr::IsNull {
+                expr: Box::new(col_expr(index, column)),
+                span: None,
+            }
+        }
+
+        fn compare(index: usize, column: &str, op: AstBinaryOp, value: i64) -> PlanExpr {
+            PlanExpr::BinaryOp {
+                left: Box::new(col_expr(index, column)),
+                op,
+                right: Box::new(lit(ScalarValue::Int64(value))),
+                span: None,
+            }
+        }
+
+        /// The share of `input`'s rows that `predicate` is estimated to keep.
+        fn kept(input: LogicalPlan, predicate: PlanExpr) -> f64 {
+            let s = catalog_stats();
+            let rows = estimated_cardinality(&input, &s);
+            let filtered = LogicalPlan::Filter {
+                input: Box::new(input),
+                predicate,
+            };
+            estimated_cardinality(&filtered, &s) / rows
+        }
+
+        fn assert_share(got: f64, expected: f64, what: &str) {
+            assert!(
+                (got - expected).abs() <= expected * 0.02,
+                "{what}: kept {got}, expected about {expected}"
+            );
+        }
+
+        /// `SELECT ... GROUP BY o.id, r.id`: output 0 = orders.id, 1 = refunds.id.
+        fn grouped(join_type: JoinType) -> LogicalPlan {
+            LogicalPlan::Aggregate {
+                input: Box::new(orders_refunds(join_type, None)),
+                group_by: vec![col_expr(0, "id"), col_expr(1, "id")],
+                aggr_exprs: Vec::new(),
+                schema: vec![col("id"), col("id")],
+            }
+        }
+
+        #[test]
+        fn having_on_a_grouped_column_uses_that_columns_table() {
+            // HAVING r.id IS NULL over an inner join: refunds.id is 40 % NULL.
+            assert_share(
+                kept(grouped(JoinType::Inner), is_null(1, "id")),
+                0.4,
+                "refunds.id IS NULL",
+            );
+            // HAVING o.id IS NOT NULL: orders.id is never NULL.
+            assert_share(
+                kept(
+                    grouped(JoinType::Inner),
+                    PlanExpr::IsNotNull {
+                        expr: Box::new(col_expr(0, "id")),
+                        span: None,
+                    },
+                ),
+                1.0,
+                "orders.id IS NOT NULL",
+            );
+        }
+
+        #[test]
+        fn an_aggregate_result_does_not_borrow_a_same_named_columns_statistics() {
+            // SELECT o.id, max(r.order_id) AS id ... GROUP BY o.id HAVING id IS NULL
+            // (output 1): the result of max() is no table's `id`, so its NULL
+            // share is the default, not orders.id's 0 %.
+            let plan = LogicalPlan::Aggregate {
+                input: Box::new(orders_refunds(JoinType::Inner, None)),
+                group_by: vec![col_expr(0, "id")],
+                aggr_exprs: vec![PlanExpr::Function {
+                    name: "max".to_string(),
+                    args: vec![col_expr(2, "order_id")],
+                    distinct: false,
+                    order_by: None,
+                    span: None,
+                }],
+                schema: vec![col("id"), col("id")],
+            };
+            assert_share(
+                kept(plan, is_null(1, "id")),
+                selectivity::DEFAULT_NULL_SELECTIVITY,
+                "max(refunds.order_id) IS NULL",
+            );
+        }
+
+        #[test]
+        fn an_on_condition_uses_the_side_its_column_comes_from() {
+            // ON o.id = r.order_id AND r.id IS NULL keeps 40 % of the matches.
+            let s = catalog_stats();
+            let plain = estimated_cardinality(&orders_refunds(JoinType::Inner, None), &s);
+            let with_null_test =
+                estimated_cardinality(&orders_refunds(JoinType::Inner, Some(is_null(1, "id"))), &s);
+            assert_share(with_null_test / plain, 0.4, "ON ... AND refunds.id IS NULL");
+        }
+
+        #[test]
+        fn a_renamed_column_keeps_its_tables_statistics() {
+            // SELECT r.id AS rid ... WHERE rid IS NULL
+            let renamed = LogicalPlan::Projection {
+                input: Box::new(orders_refunds(JoinType::Inner, None)),
+                exprs: vec![col_expr(1, "id")],
+                schema: vec![col("rid")],
+            };
+            assert_share(kept(renamed, is_null(0, "rid")), 0.4, "rid IS NULL");
+        }
+
+        #[test]
+        fn equality_uses_the_distinct_count_of_the_column_at_that_position() {
+            let join = || orders_refunds(JoinType::Inner, None);
+            assert_share(
+                kept(join(), compare(1, "id", AstBinaryOp::Eq, 7)),
+                1.0 / 50.0,
+                "refunds.id = 7",
+            );
+            assert_share(
+                kept(join(), compare(0, "id", AstBinaryOp::Eq, 7)),
+                1.0 / 1_000.0,
+                "orders.id = 7",
+            );
+        }
+
+        #[test]
+        fn ranges_use_the_bounds_of_the_column_at_that_position() {
+            let join = || orders_refunds(JoinType::Inner, None);
+            assert_share(
+                kept(join(), compare(1, "id", AstBinaryOp::LtEq, 50)),
+                0.5,
+                "refunds.id <= 50",
+            );
+            let between = PlanExpr::Between {
+                expr: Box::new(col_expr(1, "id")),
+                low: Box::new(lit(ScalarValue::Int64(0))),
+                high: Box::new(lit(ScalarValue::Int64(25))),
+                negated: false,
+                span: None,
+            };
+            assert_share(kept(join(), between), 0.25, "refunds.id BETWEEN 0 AND 25");
+        }
+
+        #[test]
+        fn in_lists_use_the_distinct_count_of_the_column_at_that_position() {
+            let in_list = PlanExpr::InList {
+                expr: Box::new(col_expr(1, "id")),
+                list: (1..=5).map(|v| lit(ScalarValue::Int64(v))).collect(),
+                negated: false,
+                span: None,
+            };
+            assert_share(
+                kept(orders_refunds(JoinType::Inner, None), in_list),
+                5.0 / 50.0,
+                "refunds.id IN (1..5)",
+            );
         }
     }
 }

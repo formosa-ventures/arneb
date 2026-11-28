@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arneb_common::error::ExecutionError;
 use arneb_common::stream::{collect_stream, stream_from_batches, SendableRecordBatchStream};
@@ -2007,6 +2007,7 @@ impl ExecutionPlan for HashJoinExec {
                 };
                 if stream_hash_probe_enabled() {
                     return self.stream_single_probe(
+                        partition,
                         left_stream,
                         Arc::new(right_batch.clone()),
                         Arc::clone(hash_map),
@@ -2103,6 +2104,7 @@ impl HashJoinExec {
 
     fn stream_single_probe(
         &self,
+        partition: usize,
         mut left_stream: SendableRecordBatchStream,
         right_batch: Arc<RecordBatch>,
         hash_map: Arc<JoinHashMap>,
@@ -2110,7 +2112,21 @@ impl HashJoinExec {
         let output_schema = column_info_to_arrow_schema(&self.schema());
         let probe_exec = Arc::new(self.probe_driver());
 
+        let profile = StreamProbeProfile {
+            partition,
+            join_type: self.join_type_label(),
+            started: None,
+            probe_time: Duration::ZERO,
+            probe_input_batches: 0,
+            probe_input_rows: 0,
+            output_batches: 0,
+            output_rows: 0,
+            finished: false,
+        };
+
         let inner = async_stream::try_stream! {
+            let mut profile = profile;
+            profile.started = Some(Instant::now());
             let mut right_matched = build_row_bitmap(right_batch.num_rows());
             let mut pending = Vec::new();
             let mut pending_rows = 0;
@@ -2119,29 +2135,38 @@ impl HashJoinExec {
                 let left_batch = batch_res.map_err(|e| {
                     ExecutionError::upstream("hash join streaming probe left stream", e)
                 })?;
+                profile.probe_input_batches += 1;
+                profile.probe_input_rows += left_batch.num_rows();
                 if left_batch.num_rows() == 0 {
                     continue;
                 }
+                let started = Instant::now();
                 if dict_probe_build_enabled() && matches!(probe_exec.join_type, ast::JoinType::Inner) {
-                    for out in probe_exec.probe_with_bitmap(
+                    let result = probe_exec.probe_with_bitmap(
                         &left_batch, &right_batch, &hash_map, true, &mut right_matched,
-                    )? {
+                    );
+                    profile.probe_time += started.elapsed();
+                    for out in result? {
+                        profile.record_output(&out);
                         yield out;
                     }
                     continue;
                 }
                 let schema = probe_exec.build_output_schema(&left_batch, &right_batch);
-                for out in probe_one_left_batch(
+                let result = probe_one_left_batch(
                     &left_batch, &right_batch, &hash_map, &probe_exec.left_keys,
                     &probe_exec.right_keys, probe_exec.residual.as_ref(), probe_exec.join_type,
                     &schema, &mut right_matched,
-                )? {
+                );
+                profile.probe_time += started.elapsed();
+                for out in result? {
                     pending_rows += out.num_rows();
                     pending.push(out);
                 }
                 // Deliver the first match before waiting for another probe batch.
                 if (!emitted && pending_rows > 0) || pending_rows >= STREAMING_OUTPUT_TARGET_ROWS {
                     for merged in flush_join_pending(&mut pending, &schema)? {
+                        profile.record_output(&merged);
                         yield merged;
                     }
                     emitted = true;
@@ -2150,9 +2175,14 @@ impl HashJoinExec {
             }
             if let Some(last) = pending.last() {
                 let schema = last.schema();
-                for merged in flush_join_pending(&mut pending, &schema)? {
+                let merged_batches = flush_join_pending(&mut pending, &schema)?;
+                profile.finished = true;
+                for merged in merged_batches {
+                    profile.record_output(&merged);
                     yield merged;
                 }
+            } else {
+                profile.finished = true;
             }
         };
 
@@ -6234,6 +6264,46 @@ fn build_unmatched_right_tail(
     Ok(out)
 }
 
+struct StreamProbeProfile {
+    partition: usize,
+    join_type: &'static str,
+    started: Option<Instant>,
+    probe_time: Duration,
+    probe_input_batches: usize,
+    probe_input_rows: usize,
+    output_batches: usize,
+    output_rows: usize,
+    finished: bool,
+}
+
+impl StreamProbeProfile {
+    fn record_output(&mut self, batch: &RecordBatch) {
+        self.output_batches += 1;
+        self.output_rows += batch.num_rows();
+    }
+}
+
+impl Drop for StreamProbeProfile {
+    fn drop(&mut self) {
+        // elapsed_ms includes time the reader was not polling after the first poll.
+        // probe_input_batches counts zero-row batches too.
+        tracing::info!(
+            target: "arneb::profile",
+            op = "HashJoinExec.stream_single_probe",
+            partition = self.partition,
+            join_type = self.join_type,
+            probe_input_batches = self.probe_input_batches,
+            probe_input_rows = self.probe_input_rows,
+            output_batches = self.output_batches,
+            output_rows = self.output_rows,
+            probe_ms = self.probe_time.as_millis() as u64,
+            elapsed_ms = self.started.map_or(0, |start| start.elapsed().as_millis() as u64),
+            finished = self.finished,
+            "hash join streaming probe ended"
+        );
+    }
+}
+
 /// `RecordBatchStream` adapter over a `Pin<Box<dyn Stream + Send>>`.
 /// Used to wrap `async_stream::try_stream!` output so it satisfies the
 /// `SendableRecordBatchStream` shape that the rest of arneb's
@@ -7242,6 +7312,288 @@ mod tests {
             // Like the other default-on knobs (`ARNEB_PROBE_PREFETCH`), a set
             // but empty value disables it.
             assert!(!first_output_before_probe_end(Some("")));
+        }
+    }
+
+    mod stream_probe_profile {
+        //! The streaming Single-build probe (the default;
+        //! `ARNEB_STREAM_HASH_PROBE=0` turns it off) reports one
+        //! `arneb::profile` event per probe partition when its output stream
+        //! ends, like the other hash-join probe paths. A stream that is
+        //! dropped early or fails still reports what it counted, with
+        //! `finished=false`.
+
+        use super::*;
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl Capture {
+            /// Routes this thread's `arneb::profile` events into the capture
+            /// until the returned guard is dropped.
+            fn install(&self) -> tracing::subscriber::DefaultGuard {
+                let writer = self.clone();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_env_filter(tracing_subscriber::EnvFilter::new("arneb::profile=info"))
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone())
+                    .finish();
+                tracing::subscriber::set_default(subscriber)
+            }
+
+            /// The captured log lines of the streaming-probe profile event.
+            fn lines(&self) -> Vec<String> {
+                let buf = self.0.lock().unwrap();
+                String::from_utf8_lossy(&buf)
+                    .lines()
+                    .filter(|line| line.contains(OP))
+                    .map(str::to_string)
+                    .collect()
+            }
+        }
+
+        const OP: &str = "op=\"HashJoinExec.stream_single_probe\"";
+
+        /// Runs every partition in `partitions` to the end with the
+        /// streaming probe on, and returns the captured log lines of the
+        /// streaming-probe profile event.
+        async fn profile_lines(
+            join_type: ast::JoinType,
+            left: Arc<dyn ExecutionPlan>,
+            right: Arc<dyn ExecutionPlan>,
+            partitions: &[usize],
+        ) -> Vec<String> {
+            let capture = Capture::default();
+            let _subscriber = capture.install();
+
+            std::env::set_var("ARNEB_STREAM_HASH_PROBE", "1");
+            let mut join = hash_join_for_stream_probe_equivalence(left, right);
+            join.join_type = join_type;
+            for &partition in partitions {
+                let stream = join.execute(partition).await.expect("execute");
+                collect_stream(stream).await.expect("collect");
+            }
+            std::env::remove_var("ARNEB_STREAM_HASH_PROBE");
+
+            capture.lines()
+        }
+
+        fn field(line: &str, name: &str) -> u64 {
+            let key = format!(" {name}=");
+            let start = line
+                .find(&key)
+                .unwrap_or_else(|| panic!("no {name} in {line:?}"))
+                + key.len();
+            line[start..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|digits| digits.parse().ok())
+                .unwrap_or_else(|| panic!("{name} is not a number in {line:?}"))
+        }
+
+        #[tokio::test]
+        async fn reports_one_event_with_the_probe_counts() {
+            let _g = env_test_guard().await;
+            // Build keys are {2, 3, 5}: 1 + 0 + 1 matches over 3 batches in
+            // partition 0. A second partition keeps the join on the parallel
+            // probe path (one probe partition runs `execute_single`).
+            let left = partitioned_left_source(vec![
+                vec![vec![1, 2], vec![10, 11], vec![3, 4]],
+                vec![vec![5]],
+            ]);
+            let lines = profile_lines(ast::JoinType::Inner, left, right_source(), &[0]).await;
+            assert_eq!(lines.len(), 1, "expected one event: {lines:?}");
+            let line = &lines[0];
+            assert!(line.contains("arneb::profile"), "{line}");
+            assert!(line.contains(" finished=true"), "{line}");
+            assert_eq!(field(line, "partition"), 0, "{line}");
+            assert_eq!(field(line, "probe_input_batches"), 3, "{line}");
+            assert_eq!(field(line, "probe_input_rows"), 6, "{line}");
+            assert_eq!(field(line, "output_rows"), 2, "{line}");
+            field(line, "output_batches");
+            // Time spent inside the synchronous probe, and from the first
+            // poll to the end of the stream; the first cannot exceed the second.
+            assert!(
+                field(line, "probe_ms") <= field(line, "elapsed_ms"),
+                "{line}"
+            );
+        }
+
+        #[tokio::test]
+        async fn each_partition_reports_its_own_counts() {
+            let _g = env_test_guard().await;
+            let left =
+                partitioned_left_source(vec![vec![vec![1, 2], vec![3, 4]], vec![vec![5, 6]]]);
+            let lines = profile_lines(ast::JoinType::Inner, left, right_source(), &[0, 1]).await;
+            assert_eq!(
+                lines.len(),
+                2,
+                "expected one event per partition: {lines:?}"
+            );
+            let by_partition = |p: u64| {
+                lines
+                    .iter()
+                    .find(|line| field(line, "partition") == p)
+                    .unwrap_or_else(|| panic!("no event for partition {p}: {lines:?}"))
+            };
+            let p0 = by_partition(0);
+            assert_eq!(field(p0, "probe_input_rows"), 4, "{p0}");
+            assert_eq!(field(p0, "output_rows"), 2, "{p0}");
+            let p1 = by_partition(1);
+            assert_eq!(field(p1, "probe_input_rows"), 2, "{p1}");
+            assert_eq!(field(p1, "output_rows"), 1, "{p1}");
+        }
+
+        #[tokio::test]
+        async fn an_empty_probe_side_still_reports_zero_counts() {
+            let _g = env_test_guard().await;
+            let left = partitioned_left_source(vec![vec![], vec![vec![2]]]);
+            let lines = profile_lines(ast::JoinType::Inner, left, right_source(), &[0]).await;
+            assert_eq!(lines.len(), 1, "expected one event: {lines:?}");
+            assert_eq!(field(&lines[0], "probe_input_batches"), 0, "{}", lines[0]);
+            assert_eq!(field(&lines[0], "probe_input_rows"), 0, "{}", lines[0]);
+            assert_eq!(field(&lines[0], "output_rows"), 0, "{}", lines[0]);
+            assert!(lines[0].contains(" finished=true"), "{}", lines[0]);
+        }
+
+        #[tokio::test]
+        async fn the_event_names_the_join_type() {
+            let _g = env_test_guard().await;
+            // Same label as the `HashJoinExec.build` event.
+            for (join_type, label) in [
+                (ast::JoinType::Inner, " join_type=\"Inner\""),
+                (ast::JoinType::Left, " join_type=\"Left\""),
+            ] {
+                let left = partitioned_left_source(vec![vec![vec![1, 2]], vec![vec![5]]]);
+                let lines = profile_lines(join_type, left, right_source(), &[0]).await;
+                assert_eq!(lines.len(), 1, "expected one event: {lines:?}");
+                assert!(lines[0].contains(label), "no {label} in {}", lines[0]);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_stream_dropped_early_reports_what_it_counted() {
+            let _g = env_test_guard().await;
+            let capture = Capture::default();
+            let _subscriber = capture.install();
+            // Every probe batch matches one build row, so the first output
+            // arrives after one probe batch; the reader (a LIMIT, a cancelled
+            // query) then drops the stream with two probe batches unread.
+            let left =
+                partitioned_left_source(vec![vec![vec![2], vec![3], vec![5]], vec![vec![5]]]);
+
+            std::env::set_var("ARNEB_STREAM_HASH_PROBE", "1");
+            let join = hash_join_for_stream_probe_equivalence(left, right_source());
+            let mut stream = join.execute(0).await.expect("execute");
+            let first = stream.next().await.expect("one batch").expect("ok");
+            std::env::remove_var("ARNEB_STREAM_HASH_PROBE");
+            assert_eq!(first.num_rows(), 1);
+            assert_eq!(
+                capture.lines(),
+                Vec::<String>::new(),
+                "event before the end"
+            );
+            drop(stream);
+
+            let lines = capture.lines();
+            assert_eq!(lines.len(), 1, "expected one event: {lines:?}");
+            let line = &lines[0];
+            assert!(line.contains(" finished=false"), "{line}");
+            assert_eq!(field(line, "partition"), 0, "{line}");
+            assert_eq!(field(line, "probe_input_batches"), 1, "{line}");
+            assert_eq!(field(line, "probe_input_rows"), 1, "{line}");
+            assert_eq!(field(line, "output_batches"), 1, "{line}");
+            assert_eq!(field(line, "output_rows"), 1, "{line}");
+        }
+
+        /// Probe partition 0 yields one batch (key 2, which matches the build
+        /// side) and then fails; partition 1 ends normally.
+        #[derive(Debug)]
+        struct FailingProbeSource {
+            schema: Vec<ColumnInfo>,
+        }
+
+        #[async_trait]
+        impl DataSource for FailingProbeSource {
+            fn schema(&self) -> Vec<ColumnInfo> {
+                self.schema.clone()
+            }
+
+            fn partition_count(&self) -> usize {
+                2
+            }
+
+            async fn scan(
+                &self,
+                _ctx: &ScanContext,
+                partition: usize,
+            ) -> Result<SendableRecordBatchStream, ExecutionError> {
+                let schema = column_info_to_arrow_schema(&self.schema);
+                let batch =
+                    RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![2]))])
+                        .unwrap();
+                let mut items = vec![Ok(batch)];
+                if partition == 0 {
+                    items.push(Err(ExecutionError::InvalidOperation(
+                        "probe side failed".into(),
+                    )));
+                }
+                Ok(Box::pin(AsyncBatchStream {
+                    schema,
+                    inner: Box::pin(futures::stream::iter(items)),
+                }))
+            }
+        }
+
+        #[tokio::test]
+        async fn a_failed_probe_side_reports_what_it_counted() {
+            let _g = env_test_guard().await;
+            let capture = Capture::default();
+            let _subscriber = capture.install();
+            let left: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
+                source: Arc::new(FailingProbeSource {
+                    schema: vec![ColumnInfo {
+                        name: "id".into(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    }],
+                }),
+                _table_name: "left_failing".into(),
+                scan_context: ScanContext::default(),
+                dynamic_filters: Default::default(),
+                dynamic_filters_consumed: Vec::new(),
+                dynamic_filter_collector: None,
+                dynamic_filtering_enabled: false,
+                dynamic_filtering_wait_timeout: std::time::Duration::from_secs(10),
+                scan_task_index: 0,
+                scan_task_count: 1,
+            });
+
+            std::env::set_var("ARNEB_STREAM_HASH_PROBE", "1");
+            let join = hash_join_for_stream_probe_equivalence(left, right_source());
+            let stream = join.execute(0).await.expect("execute");
+            let result = collect_stream(stream).await;
+            std::env::remove_var("ARNEB_STREAM_HASH_PROBE");
+            let err = result.expect_err("the probe side's error reaches the reader");
+            assert!(err.to_string().contains("probe side failed"), "{err}");
+
+            let lines = capture.lines();
+            assert_eq!(lines.len(), 1, "expected one event: {lines:?}");
+            let line = &lines[0];
+            assert!(line.contains(" finished=false"), "{line}");
+            assert_eq!(field(line, "probe_input_batches"), 1, "{line}");
+            assert_eq!(field(line, "probe_input_rows"), 1, "{line}");
+            assert_eq!(field(line, "output_rows"), 1, "{line}");
         }
     }
 

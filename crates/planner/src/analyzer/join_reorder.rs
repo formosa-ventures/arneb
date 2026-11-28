@@ -171,6 +171,87 @@ fn transform_remap(
     recurse_remap(plan, stats, config)
 }
 
+/// A membership test on one input of an inner equijoin filters that input
+/// without changing the multiplicity or column layout of surviving rows.
+fn place_semi_join(
+    mut probe: LogicalPlan,
+    build: LogicalPlan,
+    mut left_key: PlanExpr,
+    right_key: PlanExpr,
+    residual: Option<PlanExpr>,
+    stats: &CatalogStats,
+) -> LogicalPlan {
+    let destination = match (&mut left_key, &right_key, &residual) {
+        (PlanExpr::Column { index, name, .. }, PlanExpr::Column { .. }, None) => {
+            semi_join_destination(&mut probe, *index, name, stats).map(|(child, local)| {
+                *index = local;
+                child
+            })
+        }
+        _ => None,
+    };
+    let child = match destination {
+        Some(child) => child,
+        None => &mut probe,
+    };
+    let kept = std::mem::replace(child, LogicalPlan::OneRow);
+    *child = LogicalPlan::SemiJoin {
+        left: Box::new(kept),
+        right: Box::new(build),
+        left_key,
+        right_key,
+        residual,
+        dynamic_filter_ids: Vec::new(),
+        probe_side_filter_ids: Vec::new(),
+    };
+    probe
+}
+
+/// Follow the key through joined subtrees before comparing the final input
+/// with its sibling. A failed descent leaves every ancestor untouched.
+fn semi_join_destination<'a>(
+    probe: &'a mut LogicalPlan,
+    index: usize,
+    name: &str,
+    stats: &CatalogStats,
+) -> Option<(&'a mut LogicalPlan, usize)> {
+    let LogicalPlan::Join {
+        join_type: JoinType::Inner,
+        condition:
+            JoinCondition::On(PlanExpr::BinaryOp {
+                left: lhs,
+                op: BinaryOp::Eq,
+                right: rhs,
+                ..
+            }),
+        left,
+        right,
+        ..
+    } = probe
+    else {
+        return None;
+    };
+    if !matches!(lhs.as_ref(), PlanExpr::Column { .. })
+        || !matches!(rhs.as_ref(), PlanExpr::Column { .. })
+    {
+        return None;
+    }
+    let width = left.schema().len();
+    let (child, sibling, local) = if index < width {
+        (left, right, index)
+    } else {
+        (right, left, index - width)
+    };
+    if child.schema().get(local)?.name != name {
+        return None;
+    }
+    if matches!(child.as_ref(), LogicalPlan::Join { .. }) {
+        return semi_join_destination(child, local, name, stats);
+    }
+    (estimated_cardinality(child, stats) < estimated_cardinality(sibling, stats))
+        .then_some((child, local))
+}
+
 /// Apply a child's remap table to one expression. Column indices present in
 /// the table are remapped to their new position; indices beyond the table
 /// (e.g. a Window/AssignUniqueId column appended past the permuted input,
@@ -505,15 +586,7 @@ fn recurse_remap(
             let residual = residual.map(|r| remap_one(r, &compose_join_table(&lt, lw, &rt, rw)));
             // Semi join emits LEFT rows → output is the left schema.
             (
-                L::SemiJoin {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                    left_key,
-                    right_key,
-                    residual,
-                    dynamic_filter_ids: Vec::new(),
-                    probe_side_filter_ids: Vec::new(),
-                },
+                place_semi_join(left, right, left_key, right_key, residual, stats),
                 lt,
             )
         }

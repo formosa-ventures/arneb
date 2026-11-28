@@ -40,6 +40,7 @@ use crate::group_by_hash::{
 use crate::group_key::GroupKey;
 use crate::scan_context::{DynamicFilterDomain, ScanContext};
 use crate::spill::PartitionedSpillWriter;
+use crate::task_guard::AbortOnDrop;
 
 /// A physical execution operator that produces a stream of record batches.
 #[async_trait]
@@ -2483,7 +2484,7 @@ impl HashAggregateExec {
             let group_by = self.group_by.clone();
             let aggr_info = Arc::clone(&aggr_info);
             let pool = self.memory_pool.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(AbortOnDrop::spawn(async move {
                 build_partial_groups(input, p, group_by, aggr_info, pool).await
             }));
         }
@@ -3002,7 +3003,7 @@ impl HashAggregateExec {
             let aggr_info = Arc::clone(&aggr_info);
             let estimated_groups = partition_estimated_groups(self.estimated_groups, n);
             let pool = self.memory_pool.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(AbortOnDrop::spawn(async move {
                 build_partial_groups_batch_aware(
                     input,
                     p,
@@ -3155,7 +3156,7 @@ impl HashAggregateExec {
             let aggr_info = Arc::clone(&aggr_info);
             let estimated_groups = partition_estimated_groups(self.estimated_groups, n);
             let pool = self.memory_pool.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(AbortOnDrop::spawn(async move {
                 build_partial_groups_batch_aware(
                     input,
                     p,
@@ -8245,6 +8246,49 @@ mod tests {
                 "grouped={grouped}: parallel peak {parallel} vs single {single}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_parallel_aggregate_drops_its_partial_tasks() {
+        use crate::task_guard::tests::{dropped_soon, StalledExec};
+        use std::sync::atomic::Ordering;
+
+        let (input, dropped) = StalledExec::new(2);
+        let agg = HashAggregateExec {
+            input,
+            group_by: vec![PlanExpr::Column {
+                index: 0,
+                name: "id".to_string(),
+                span: None,
+            }],
+            aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
+                name: "COUNT".to_string(),
+                args: vec![],
+                distinct: false,
+                span: None,
+            }],
+            output_schema: vec![
+                ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                },
+                ColumnInfo {
+                    name: "cnt".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+            ],
+            output_order: None,
+            estimated_groups: None,
+            memory_pool: Arc::new(crate::memory_pool::UnboundedMemoryPool::new()),
+        };
+        let running = tokio::spawn(async move { agg.execute(0).await.map(|_| ()) });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!dropped.load(Ordering::SeqCst));
+        running.abort();
+        assert!(dropped_soon(&dropped).await);
     }
 }
 

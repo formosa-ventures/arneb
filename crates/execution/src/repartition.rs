@@ -39,6 +39,7 @@ use crate::expression;
 use crate::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool};
 use crate::operator::{materialize_dictionary_array, ExecutionPlan};
 use crate::partitioning::Partitioning;
+use crate::task_guard::TaskGroup;
 
 const DEFAULT_CHANNEL_CAPACITY: usize = 4;
 
@@ -123,6 +124,11 @@ pub struct RepartitionExec {
 struct RouterState {
     receivers: Vec<Option<Receiver<ChannelItem>>>,
     started: bool,
+    /// The routing tasks, held here until the last receiver is taken and
+    /// then by the output streams: once every stream is dropped (or the
+    /// operator, with receivers still untaken), the tasks are aborted and
+    /// drop their input (#335).
+    tasks: Option<Arc<TaskGroup>>,
 }
 
 impl std::fmt::Debug for RepartitionExec {
@@ -150,6 +156,7 @@ impl RepartitionExec {
             state: tokio::sync::Mutex::new(RouterState {
                 receivers: (0..n).map(|_| None).collect(),
                 started: false,
+                tasks: None,
             }),
             schema,
             memory_pool: Arc::new(UnboundedMemoryPool::new()),
@@ -235,6 +242,7 @@ impl ExecutionPlan for RepartitionExec {
             let inflight_budget = Arc::clone(&self.inflight_budget);
             let decode_sem = Arc::new(Semaphore::new(scan_decode_concurrency()));
             let m = input.output_partitioning().partition_count();
+            let mut tasks = TaskGroup::default();
             for input_partition in 0..m {
                 let input = Arc::clone(&input);
                 let senders = Arc::clone(&senders);
@@ -243,7 +251,7 @@ impl ExecutionPlan for RepartitionExec {
                 let memory_pool = Arc::clone(&memory_pool);
                 let inflight_budget = Arc::clone(&inflight_budget);
                 let decode_sem = Arc::clone(&decode_sem);
-                tokio::spawn(async move {
+                tasks.spawn(async move {
                     let _permit = decode_sem.acquire_owned().await.unwrap();
                     route_one_input_partition(
                         input,
@@ -257,6 +265,7 @@ impl ExecutionPlan for RepartitionExec {
                     .await;
                 });
             }
+            state.tasks = Some(Arc::new(tasks));
         }
 
         let rx = state.receivers[partition].take().ok_or_else(|| {
@@ -264,12 +273,18 @@ impl ExecutionPlan for RepartitionExec {
                 "RepartitionExec: partition {partition} already taken by a previous execute() call"
             ))
         })?;
+        let tasks = if state.receivers.iter().all(Option::is_none) {
+            state.tasks.take()
+        } else {
+            state.tasks.clone()
+        };
         drop(state);
 
         let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.schema);
         let inner: SendableRecordBatchStream = Box::pin(MpscStream {
             rx,
             schema: arrow_schema,
+            _tasks: tasks,
         });
         Ok(crate::operator::profile_stream(
             "RepartitionExec",
@@ -624,6 +639,7 @@ fn hash_one_cell_ahash<H: std::hash::Hasher>(
 struct MpscStream {
     rx: Receiver<ChannelItem>,
     schema: arrow::datatypes::SchemaRef,
+    _tasks: Option<Arc<TaskGroup>>,
 }
 
 impl Stream for MpscStream {
@@ -874,5 +890,44 @@ mod tests {
             }
         }
         assert_eq!(total_rows, 6, "all input rows must be present");
+    }
+
+    #[tokio::test]
+    async fn dropping_every_output_stream_drops_an_input_that_never_produced() {
+        use crate::task_guard::tests::{dropped_soon, StalledExec};
+        use std::sync::atomic::Ordering;
+
+        let (input, dropped) = StalledExec::new(2);
+        let exec = Arc::new(RepartitionExec::new(
+            input,
+            Partitioning::RoundRobinBatch(2),
+        ));
+        let first = exec.execute(0).await.unwrap();
+        let second = exec.execute(1).await.unwrap();
+        // The operator itself going away must not stop routing for
+        // streams that are still being read.
+        drop(exec);
+        drop(first);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(second);
+        assert!(dropped_soon(&dropped).await);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_operator_before_every_stream_is_taken_drops_the_input() {
+        use crate::task_guard::tests::{dropped_soon, StalledExec};
+
+        let (input, dropped) = StalledExec::new(1);
+        let exec = Arc::new(RepartitionExec::new(
+            input,
+            Partitioning::RoundRobinBatch(2),
+        ));
+        let first = exec.execute(0).await.unwrap();
+        drop(first);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        drop(exec);
+        assert!(dropped_soon(&dropped).await);
     }
 }

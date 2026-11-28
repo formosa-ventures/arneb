@@ -1511,9 +1511,25 @@ impl SemiJoinExec {
             }
             let estimated = compact.estimated_bytes();
             if reservation.try_resize(estimated).is_err() {
+                let operator = if self.anti {
+                    "AntiJoinExec"
+                } else {
+                    "SemiJoinExec"
+                };
+                // The fallback reads the right input again from the start.
+                // An exchange partition is served once, so without a
+                // re-readable input the query fails here, cleanly, rather
+                // than on the second read (#325).
+                if !self.right.can_reexecute() {
+                    return Err(ExecutionError::ResourceExhausted(format!(
+                        "compact <> build for {operator} needs {estimated} bytes, more than \
+                         the memory budget allows, and its input can't be read again to \
+                         fall back to the spilling build"
+                    )));
+                }
                 tracing::info!(
                     target: "arneb::mem",
-                    operator = if self.anti { "AntiJoinExec" } else { "SemiJoinExec" },
+                    operator,
                     estimated_bytes = estimated,
                     "compact <> build exceeded its memory budget; falling back",
                 );
@@ -4310,6 +4326,20 @@ mod tests {
         std::env::remove_var("ARNEB_PARTITIONED_SEMI_SPILL");
         std::env::remove_var("ARNEB_SEMI_MARK_JOIN");
 
+        let (left, right) = compact_ne_scans(left_batches, right_batches);
+        let pool: Arc<dyn MemoryPool> = Arc::new(crate::memory_pool::UnboundedMemoryPool::new());
+        let out = run_compact_ne_join(left, right, anti, pool)
+            .await
+            .expect("compact equivalence run");
+        int64_rowids_from_batches(&out)
+    }
+
+    /// The `(orderkey, l_suppkey, row_id)` probe scan and the
+    /// `(orderkey, r_suppkey)` build scan the compact `<>` tests join.
+    fn compact_ne_scans(
+        left_batches: Vec<RecordBatch>,
+        right_batches: Vec<RecordBatch>,
+    ) -> (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>) {
         let left = scan_of_batches_with_schema(
             "L",
             vec![
@@ -4347,8 +4377,27 @@ mod tests {
             ],
             right_batches,
         );
-        let pool: Arc<dyn MemoryPool> = Arc::new(crate::memory_pool::UnboundedMemoryPool::new());
-        let join = SemiJoinExec::new(
+        (left, right)
+    }
+
+    /// Semi/anti join on `orderkey` with the `r_suppkey <> l_suppkey` residual.
+    async fn run_compact_ne_join(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        anti: bool,
+        pool: Arc<dyn MemoryPool>,
+    ) -> Result<Vec<RecordBatch>, arneb_common::error::ArnebError> {
+        run_compact_ne_join_with(left, right, anti, pool, None).await
+    }
+
+    async fn run_compact_ne_join_with(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        anti: bool,
+        pool: Arc<dyn MemoryPool>,
+        spill_chunk_bytes: Option<usize>,
+    ) -> Result<Vec<RecordBatch>, arneb_common::error::ArnebError> {
+        let mut join = SemiJoinExec::new(
             left,
             right,
             orderkey_expr(),
@@ -4357,11 +4406,10 @@ mod tests {
             anti,
             pool,
         );
-        let stream = join.execute(0).await.expect("compact equivalence execute");
-        let out = collect_stream(stream)
-            .await
-            .expect("compact equivalence collect");
-        int64_rowids_from_batches(&out)
+        if let Some(bytes) = spill_chunk_bytes {
+            join = join.with_spill_chunk_bytes(bytes);
+        }
+        collect_stream(join.execute(0).await?).await
     }
 
     fn scan_of_batches_with_schema(
@@ -4516,6 +4564,126 @@ mod tests {
     async fn compact_ne_anti_matches_full_residual_path() {
         let _guard = ENV_TEST_LOCK.lock().await;
         assert_compact_ne_matches_full(true).await;
+        std::env::remove_var("ARNEB_COMPACT_SEMI_NE");
+    }
+
+    /// A plan whose partition can be read once, like an exchange: the
+    /// second `execute(0)` fails the way a remote partition does.
+    #[derive(Debug)]
+    struct ReadOnceExec {
+        input: Arc<dyn ExecutionPlan>,
+        read: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl ExecutionPlan for ReadOnceExec {
+        fn schema(&self) -> Vec<ColumnInfo> {
+            self.input.schema()
+        }
+
+        async fn execute(
+            &self,
+            partition: usize,
+        ) -> Result<SendableRecordBatchStream, ExecutionError> {
+            if self.read.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(ExecutionError::InvalidOperation(format!(
+                    "partition {partition} already consumed"
+                )));
+            }
+            self.input.execute(partition).await
+        }
+
+        fn display_name(&self) -> &str {
+            "ReadOnceExec"
+        }
+    }
+
+    /// 24 distinct build keys in 4 batches of 6, so the compact map outgrows
+    /// a budget that the spilling build fits in; probe rows hit some keys
+    /// with an equal and some with a different suppkey.
+    fn compact_ne_overflow_inputs() -> (Vec<RecordBatch>, Vec<RecordBatch>, usize) {
+        let right: Vec<RecordBatch> = (0..4)
+            .map(|b| {
+                let keys: Vec<Option<i64>> = (0..6).map(|i| Some(b * 6 + i)).collect();
+                let supps: Vec<Option<i64>> = (0..6).map(|i| Some((b * 6 + i) * 10)).collect();
+                nullable_int64_batch(&["orderkey", "r_suppkey"], vec![keys, supps])
+            })
+            .collect();
+        let left = vec![nullable_int64_batch(
+            &["orderkey", "l_suppkey", "row_id"],
+            vec![
+                vec![Some(0), Some(5), Some(7), Some(23), Some(30)],
+                vec![Some(0), Some(51), Some(70), Some(1), Some(300)],
+                (0..5).map(Some).collect(),
+            ],
+        )];
+        // Room for the spilling build's per-chunk reload, but far below the
+        // compact map for 24 keys (about 1 KB).
+        let budget = 4 * right
+            .iter()
+            .map(crate::operator::record_batch_bytes)
+            .max()
+            .expect("right batches");
+        (left, right, budget)
+    }
+
+    /// #325: when the compact build outgrows its budget over an input that
+    /// can't be read again, the join fails with `ResourceExhausted` instead
+    /// of reading the partition a second time.
+    #[tokio::test]
+    async fn compact_ne_over_budget_on_a_read_once_input_is_resource_exhausted() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        std::env::set_var("ARNEB_COMPACT_SEMI_NE", "1");
+        for anti in [false, true] {
+            let (left, right_batches, budget) = compact_ne_overflow_inputs();
+            let (left, right) = compact_ne_scans(left, right_batches);
+            let right: Arc<dyn ExecutionPlan> = Arc::new(ReadOnceExec {
+                input: right,
+                read: Default::default(),
+            });
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(budget));
+            let err = run_compact_ne_join(left, right, anti, pool)
+                .await
+                .expect_err("over budget");
+            assert!(
+                matches!(
+                    &err,
+                    arneb_common::error::ArnebError::Execution(ExecutionError::ResourceExhausted(m))
+                        if m.contains("can't be read again")
+                ),
+                "{err}"
+            );
+        }
+        std::env::remove_var("ARNEB_COMPACT_SEMI_NE");
+    }
+
+    /// Over a scan, which can be read again, the same overflow still falls
+    /// back to the spilling build and returns what the unbounded run does.
+    #[tokio::test]
+    async fn compact_ne_over_budget_on_a_scan_falls_back_and_matches() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        std::env::set_var("ARNEB_COMPACT_SEMI_NE", "1");
+        for anti in [false, true] {
+            let (left, right_batches, budget) = compact_ne_overflow_inputs();
+            let (l, r) = compact_ne_scans(left.clone(), right_batches.clone());
+            let unbounded: Arc<dyn MemoryPool> =
+                Arc::new(crate::memory_pool::UnboundedMemoryPool::new());
+            let expected = run_compact_ne_join(l, r, anti, unbounded)
+                .await
+                .expect("unbounded run");
+            let (l, r) = compact_ne_scans(left, right_batches);
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(budget));
+            // Each build batch is its own spilled chunk, so the multi-pass
+            // probe has room for a chunk and a probe batch at once.
+            let got = run_compact_ne_join_with(l, r, anti, pool, Some(16))
+                .await
+                .expect("fallback run");
+            assert_eq!(
+                int64_rowids_from_batches(&got),
+                int64_rowids_from_batches(&expected),
+                "anti={anti}"
+            );
+        }
         std::env::remove_var("ARNEB_COMPACT_SEMI_NE");
     }
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.4](https://github.com/formosa-ventures/arneb/compare/v0.2.3...v0.2.4) (2026-11-28)
+
+
+### Bug Fixes
+
+* **execution:** account aggregate state at its real size ([#308](https://github.com/formosa-ventures/arneb/issues/308)) ([3e821e5](https://github.com/formosa-ventures/arneb/commit/3e821e587fa3d634c7b23e3c66ff9425c0dbdf01))
+* **execution:** count(NULL) counts no rows ([#323](https://github.com/formosa-ventures/arneb/issues/323)) ([d61829e](https://github.com/formosa-ventures/arneb/commit/d61829ec3ba2c260976ef32dcfb8e63fbaa8179e))
+* **execution:** stop an operator's spawned tasks when its output is dropped ([#337](https://github.com/formosa-ventures/arneb/issues/337)) ([6f41b22](https://github.com/formosa-ventures/arneb/commit/6f41b224c547584f68604cdb915542651c2b6e89)), closes [#335](https://github.com/formosa-ventures/arneb/issues/335)
+* **execution:** stream the hash-join probe side by default ([#299](https://github.com/formosa-ventures/arneb/issues/299)) ([c9af5ed](https://github.com/formosa-ventures/arneb/commit/c9af5ed57fef59078efc6733f02ea13750ea633c))
+* **planner:** estimate IS NULL on the outer join's null side ([#307](https://github.com/formosa-ventures/arneb/issues/307)) ([dfb6477](https://github.com/formosa-ventures/arneb/commit/dfb6477f059ed40e8ae6e86a92e74ff4805de9b7))
+* **server:** end a worker's drain once the coordinator stops answering ([#334](https://github.com/formosa-ventures/arneb/issues/334)) ([db70126](https://github.com/formosa-ventures/arneb/commit/db701269b6f23004b7d49579f96dd445fcacb771))
+
+
+### Performance Improvements
+
+* **planner:** split a GROUP BY that has no aggregates ([#320](https://github.com/formosa-ventures/arneb/issues/320)) ([127a7f2](https://github.com/formosa-ventures/arneb/commit/127a7f28dc9db70c5de438d90b91d44a5a35a404))
+
 ## [0.2.3](https://github.com/formosa-ventures/arneb/compare/v0.2.2...v0.2.3) (2026-11-27)
 
 

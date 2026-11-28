@@ -2212,6 +2212,54 @@ pub fn prune_for_columns_with_exchange_fallback(
     let n_out = plan.schema().len();
 
     match plan {
+        L::Distinct { input } => {
+            // DISTINCT compares every input column, including those its parent drops.
+            let all_columns = (0..n_out).collect();
+            let (input, mapping) =
+                prune_for_columns_with_exchange_fallback(input, &all_columns, exchange_fallback);
+            (
+                L::Distinct {
+                    input: Box::new(input),
+                },
+                mapping,
+            )
+        }
+        L::UnionAll { inputs } => {
+            // Even a row-count-only union needs the same typed column in every branch.
+            let mut kept = needed.clone();
+            if kept.is_empty() && n_out > 0 {
+                kept.insert(0);
+            }
+            let inputs = inputs
+                .iter()
+                .map(|input| {
+                    let (pruned, mapping) =
+                        prune_for_columns_with_exchange_fallback(input, &kept, exchange_fallback);
+                    let schema = pruned.schema();
+                    let positions = kept.iter().map(|old| mapping[old]);
+                    if schema.len() == kept.len() && positions.clone().eq(0..kept.len()) {
+                        return pruned;
+                    }
+                    // Filters can retain predicate columns and DISTINCT retains the whole row.
+                    // Select the union's columns only after those operators have used them.
+                    let exprs = positions
+                        .clone()
+                        .map(|index| PlanExpr::Column {
+                            index,
+                            name: schema[index].name.clone(),
+                            span: None,
+                        })
+                        .collect();
+                    L::Projection {
+                        input: Box::new(pruned),
+                        exprs,
+                        schema: positions.map(|index| schema[index].clone()).collect(),
+                    }
+                })
+                .collect();
+            let mapping = kept.into_iter().zip(0..).collect();
+            (L::UnionAll { inputs }, mapping)
+        }
         L::TableScan {
             table,
             schema,
@@ -2443,6 +2491,44 @@ pub fn prune_for_columns_with_exchange_fallback(
                 },
             };
             (rebuilt, identity_map(schema.len()))
+        }
+        L::Window { input, functions } => {
+            let input_width = n_out - functions.len();
+            let mut child_needed = needed.range(..input_width).copied().collect();
+            for function in functions {
+                for expr in function
+                    .args
+                    .iter()
+                    .chain(&function.partition_by)
+                    .chain(function.order_by.iter().map(|sort| &sort.expr))
+                {
+                    collect_column_indices_into(expr, &mut child_needed);
+                }
+            }
+            let (new_input, mut mapping) =
+                prune_for_columns_with_exchange_fallback(input, &child_needed, exchange_fallback);
+            let mut functions = functions.clone();
+            for function in &mut functions {
+                for expr in function
+                    .args
+                    .iter_mut()
+                    .chain(&mut function.partition_by)
+                    .chain(function.order_by.iter_mut().map(|sort| &mut sort.expr))
+                {
+                    *expr = rewrite_column_indices(expr, &mapping);
+                }
+            }
+            let new_input_width = new_input.schema().len();
+            for index in 0..functions.len() {
+                mapping.insert(input_width + index, new_input_width + index);
+            }
+            (
+                L::Window {
+                    input: Box::new(new_input),
+                    functions,
+                },
+                mapping,
+            )
         }
         L::Sort { input, order_by } => {
             let mut child_needed = needed.clone();
@@ -3145,6 +3231,183 @@ mod tests {
         let mut ctx = ExecutionContext::new();
         ctx.register_data_source("users", source);
         (ctx, schema)
+    }
+
+    #[tokio::test]
+    async fn a_union_all_reads_only_the_columns_its_parent_uses() {
+        let (ctx, schema) = test_context();
+        let scan = || LogicalPlan::TableScan {
+            table: TableReference::table("users"),
+            schema: schema.clone(),
+            alias: None,
+            properties: Default::default(),
+            dynamic_filters_consumed: Vec::new(),
+        };
+        // One branch is a bare scan; the other filters on a column the
+        // parent does not read, which must not shift the columns it does.
+        let filtered = LogicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate: PlanExpr::BinaryOp {
+                left: Box::new(PlanExpr::Column {
+                    index: 0,
+                    name: "id".to_string(),
+                    span: None,
+                }),
+                op: ast::BinaryOp::Gt,
+                right: Box::new(PlanExpr::Literal {
+                    value: ScalarValue::Int32(3),
+                    span: None,
+                }),
+                span: None,
+            },
+        };
+        let plan = LogicalPlan::Projection {
+            input: Box::new(LogicalPlan::UnionAll {
+                inputs: vec![scan(), filtered],
+            }),
+            exprs: vec![PlanExpr::Column {
+                index: 2,
+                name: "value".to_string(),
+                span: None,
+            }],
+            schema: vec![schema[2].clone()],
+        };
+
+        let needed: std::collections::BTreeSet<usize> = [0].into_iter().collect();
+        let (pruned, _) = prune_for_columns(&plan, &needed);
+        fn union_of(plan: &LogicalPlan) -> &[LogicalPlan] {
+            match plan {
+                LogicalPlan::UnionAll { inputs } => inputs,
+                LogicalPlan::Projection { input, .. } => union_of(input),
+                other => panic!("unexpected plan: {other:?}"),
+            }
+        }
+        for input in union_of(&pruned) {
+            let names: Vec<String> = input.schema().iter().map(|c| c.name.clone()).collect();
+            assert_eq!(names, ["value"], "{input:?}");
+        }
+
+        let exec = ctx.create_physical_plan(&plan).unwrap();
+        let mut values = Vec::new();
+        for partition in 0..exec.output_partitioning().partition_count() {
+            let stream = exec.execute(partition).await.unwrap();
+            for batch in collect_stream(stream).await.unwrap() {
+                assert_eq!(batch.num_columns(), 1);
+                let column = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                values.extend(column.iter().map(|v| v.unwrap()));
+            }
+        }
+        values.sort_unstable();
+        assert_eq!(values, [100, 200, 300, 400, 400, 500, 500]);
+    }
+
+    #[tokio::test]
+    async fn a_distinct_prunes_below_its_input_and_keeps_whole_rows() {
+        let (ctx, schema) = test_context();
+        let scan = LogicalPlan::TableScan {
+            table: TableReference::table("users"),
+            schema: schema.clone(),
+            alias: None,
+            properties: Default::default(),
+            dynamic_filters_consumed: Vec::new(),
+        };
+        // (id > 3, value): five different rows, two different `big` values.
+        let rows = LogicalPlan::Projection {
+            input: Box::new(scan),
+            exprs: vec![
+                PlanExpr::BinaryOp {
+                    left: Box::new(PlanExpr::Column {
+                        index: 0,
+                        name: "id".to_string(),
+                        span: None,
+                    }),
+                    op: ast::BinaryOp::Gt,
+                    right: Box::new(PlanExpr::Literal {
+                        value: ScalarValue::Int32(3),
+                        span: None,
+                    }),
+                    span: None,
+                },
+                PlanExpr::Column {
+                    index: 2,
+                    name: "value".to_string(),
+                    span: None,
+                },
+            ],
+            schema: vec![
+                ColumnInfo {
+                    name: "big".to_string(),
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                },
+                schema[2].clone(),
+            ],
+        };
+        let plan = LogicalPlan::Projection {
+            input: Box::new(LogicalPlan::Distinct {
+                input: Box::new(rows),
+            }),
+            exprs: vec![PlanExpr::Column {
+                index: 0,
+                name: "big".to_string(),
+                span: None,
+            }],
+            schema: vec![ColumnInfo {
+                name: "big".to_string(),
+                data_type: DataType::Boolean,
+                nullable: false,
+            }],
+        };
+
+        let needed: std::collections::BTreeSet<usize> = [0].into_iter().collect();
+        let (pruned, _) = prune_for_columns(&plan, &needed);
+        fn names(plan: &LogicalPlan) -> Vec<String> {
+            plan.schema().iter().map(|c| c.name.clone()).collect()
+        }
+        // What the scan hands on, and what DISTINCT compares.
+        fn scan_output(plan: &LogicalPlan) -> Vec<String> {
+            match plan {
+                LogicalPlan::Projection { input, .. }
+                    if matches!(input.as_ref(), LogicalPlan::TableScan { .. }) =>
+                {
+                    names(plan)
+                }
+                LogicalPlan::Projection { input, .. } | LogicalPlan::Distinct { input } => {
+                    scan_output(input)
+                }
+                other => panic!("unexpected plan: {other:?}"),
+            }
+        }
+        fn distinct_input(plan: &LogicalPlan) -> Vec<String> {
+            match plan {
+                LogicalPlan::Distinct { input } => names(input),
+                LogicalPlan::Projection { input, .. } => distinct_input(input),
+                other => panic!("unexpected plan: {other:?}"),
+            }
+        }
+        assert_eq!(scan_output(&pruned), ["id", "value"], "{pruned:?}");
+        assert_eq!(distinct_input(&pruned), ["big", "value"], "{pruned:?}");
+
+        let exec = ctx.create_physical_plan(&plan).unwrap();
+        let mut big = Vec::new();
+        for partition in 0..exec.output_partitioning().partition_count() {
+            let stream = exec.execute(partition).await.unwrap();
+            for batch in collect_stream(stream).await.unwrap() {
+                assert_eq!(batch.num_columns(), 1);
+                let column = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .unwrap();
+                big.extend(column.iter().map(|v| v.unwrap()));
+            }
+        }
+        big.sort_unstable();
+        assert_eq!(big, [false, false, false, true, true]);
     }
 
     #[tokio::test]

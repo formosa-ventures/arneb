@@ -592,6 +592,226 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Exchanges under a UNION ALL.
+    //
+    // The parent reads a UNION ALL by position, so every branch must
+    // keep the same columns. A branch that is an exchange should have
+    // its child fragment send only those columns, as an exchange under
+    // a join does.
+    // -----------------------------------------------------------------
+
+    /// A leaf fragment producing `c0..c3`.
+    fn leaf(id: u32) -> PlanFragment {
+        PlanFragment {
+            id: StageId(id),
+            fragment_type: FragmentType::Source,
+            root: LogicalPlan::ExchangeNode {
+                stage_id: StageId(id + 100),
+                schema: cols(&["c0", "c1", "c2", "c3"]),
+            },
+            output_partitioning: PartitioningScheme::Single,
+            source_fragments: vec![],
+        }
+    }
+
+    fn exchange(id: u32) -> LogicalPlan {
+        LogicalPlan::ExchangeNode {
+            stage_id: StageId(id),
+            schema: cols(&["c0", "c1", "c2", "c3"]),
+        }
+    }
+
+    /// A parent whose root is `root`, reading the leaf fragments `ids`.
+    fn pruned_parent(root: LogicalPlan, ids: &[u32]) -> PlanFragment {
+        let mut parent = PlanFragment {
+            id: StageId(50),
+            fragment_type: FragmentType::Fixed,
+            root,
+            output_partitioning: PartitioningScheme::Single,
+            source_fragments: ids.iter().map(|&id| leaf(id)).collect(),
+        };
+        prune_fragment_tree(&mut parent);
+        parent
+    }
+
+    fn child_columns(parent: &PlanFragment, id: u32) -> Vec<String> {
+        let child = parent
+            .source_fragments
+            .iter()
+            .find(|f| f.id == StageId(id))
+            .expect("child fragment");
+        child.root.schema().iter().map(|c| c.name.clone()).collect()
+    }
+
+    /// Checks that every exchange in `plan` claims exactly what its child
+    /// fragment now produces, and that the inputs of every UNION ALL have
+    /// the same column names in the same order.
+    fn check_exchanges_and_unions(plan: &LogicalPlan, parent: &PlanFragment) {
+        match plan {
+            LogicalPlan::ExchangeNode { stage_id, schema } => {
+                let names: Vec<String> = schema.iter().map(|c| c.name.clone()).collect();
+                assert_eq!(names, child_columns(parent, stage_id.0), "exchange schema");
+            }
+            LogicalPlan::UnionAll { inputs } => {
+                let names = |p: &LogicalPlan| {
+                    p.schema()
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect::<Vec<_>>()
+                };
+                for input in inputs {
+                    assert_eq!(names(input), names(&inputs[0]), "union inputs differ");
+                    check_exchanges_and_unions(input, parent);
+                }
+            }
+            LogicalPlan::Projection { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Distinct { input } => check_exchanges_and_unions(input, parent),
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    fn names_of(plan: &LogicalPlan) -> Vec<String> {
+        plan.schema().iter().map(|c| c.name.clone()).collect()
+    }
+
+    #[test]
+    fn exchanges_under_a_union_all_send_only_the_columns_read() {
+        // Nested, as `a UNION ALL b UNION ALL c` plans.
+        let union = LogicalPlan::UnionAll {
+            inputs: vec![
+                LogicalPlan::UnionAll {
+                    inputs: vec![exchange(1), exchange(2)],
+                },
+                exchange(3),
+            ],
+        };
+        let root = LogicalPlan::Projection {
+            input: Box::new(union),
+            exprs: vec![column(2, "c2"), column(0, "c0")],
+            schema: cols(&["c2", "c0"]),
+        };
+        let parent = pruned_parent(root, &[1, 2, 3]);
+        for id in [1, 2, 3] {
+            assert_eq!(child_columns(&parent, id), ["c0", "c2"], "child {id}");
+        }
+        assert_eq!(names_of(&parent.root), ["c2", "c0"]);
+        check_exchanges_and_unions(&parent.root, &parent);
+    }
+
+    #[test]
+    fn a_union_all_branch_that_needs_every_column_keeps_them() {
+        // DISTINCT compares whole rows, so its input cannot lose a
+        // column; the other branch can, and the two must still line up.
+        let union = LogicalPlan::UnionAll {
+            inputs: vec![
+                exchange(1),
+                LogicalPlan::Distinct {
+                    input: Box::new(exchange(2)),
+                },
+            ],
+        };
+        let root = LogicalPlan::Projection {
+            input: Box::new(union),
+            exprs: vec![column(3, "c3")],
+            schema: cols(&["c3"]),
+        };
+        let parent = pruned_parent(root, &[1, 2]);
+        assert_eq!(child_columns(&parent, 1), ["c3"]);
+        assert_eq!(child_columns(&parent, 2), ["c0", "c1", "c2", "c3"]);
+        assert_eq!(names_of(&parent.root), ["c3"]);
+        check_exchanges_and_unions(&parent.root, &parent);
+    }
+
+    #[test]
+    fn computed_branches_under_a_distinct_ask_for_only_the_columns_they_read() {
+        // UNION (distinct) of two computed branches, as in TPC-DS q75:
+        // DISTINCT needs every column of the union, but each branch reads
+        // only part of what its child produces.
+        let greater = |left: usize, right: usize| PlanExpr::BinaryOp {
+            left: Box::new(column(left, &format!("c{left}"))),
+            op: arneb_sql_parser::ast::BinaryOp::Gt,
+            right: Box::new(column(right, &format!("c{right}"))),
+            span: None,
+        };
+        let branch = |id: u32, left: usize, right: usize| LogicalPlan::Projection {
+            input: Box::new(exchange(id)),
+            exprs: vec![greater(left, right), column(2, "c2")],
+            schema: cols(&["x", "c2"]),
+        };
+        let root = LogicalPlan::Distinct {
+            input: Box::new(LogicalPlan::UnionAll {
+                inputs: vec![
+                    branch(1, 1, 3),
+                    LogicalPlan::Distinct {
+                        input: Box::new(LogicalPlan::UnionAll {
+                            inputs: vec![branch(2, 0, 1)],
+                        }),
+                    },
+                ],
+            }),
+        };
+        let parent = pruned_parent(root, &[1, 2]);
+        assert_eq!(child_columns(&parent, 1), ["c1", "c2", "c3"]);
+        assert_eq!(child_columns(&parent, 2), ["c0", "c1", "c2"]);
+        assert_eq!(names_of(&parent.root), ["x", "c2"]);
+        check_exchanges_and_unions(&parent.root, &parent);
+    }
+
+    #[test]
+    fn an_aggregate_under_a_window_asks_its_child_for_only_what_it_reads() {
+        // TPC-DS q44's shape: the window's fragment aggregates what a scan
+        // fragment sends, and reads one of its four columns.
+        let root = LogicalPlan::Window {
+            input: Box::new(LogicalPlan::Aggregate {
+                input: Box::new(exchange(1)),
+                group_by: vec![column(1, "c1")],
+                aggr_exprs: vec![],
+                schema: cols(&["c1"]),
+            }),
+            functions: vec![arneb_planner::WindowFunctionDef {
+                name: "ROW_NUMBER".into(),
+                args: vec![],
+                partition_by: vec![column(0, "c1")],
+                order_by: vec![],
+                rows_frame: false,
+                output_name: "rn".into(),
+            }],
+        };
+        let parent = pruned_parent(root, &[1]);
+        assert_eq!(child_columns(&parent, 1), ["c1"]);
+        let output: Vec<String> = parent
+            .root
+            .schema()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(output, ["c1", "rn"]);
+    }
+
+    #[test]
+    fn a_union_all_read_for_its_row_count_keeps_one_column_per_branch() {
+        // `SELECT 1 FROM (a UNION ALL b)`: no column is read, but each
+        // branch must still send one so its batches carry a row count.
+        let union = LogicalPlan::UnionAll {
+            inputs: vec![exchange(1), exchange(2)],
+        };
+        let root = LogicalPlan::Projection {
+            input: Box::new(union),
+            exprs: vec![PlanExpr::Literal {
+                value: arneb_common::types::ScalarValue::Int64(1),
+                span: None,
+            }],
+            schema: cols(&["one"]),
+        };
+        let parent = pruned_parent(root, &[1, 2]);
+        assert_eq!(child_columns(&parent, 1).len(), 1);
+        assert_eq!(child_columns(&parent, 2).len(), 1);
+        assert_eq!(names_of(&parent.root), ["one"]);
+        check_exchanges_and_unions(&parent.root, &parent);
+    }
+
+    // -----------------------------------------------------------------
     // A plan that reads no column of its input (#258).
     //
     // Measured at TPC-H SF1 with a coordinator and one worker:
@@ -707,6 +927,10 @@ mod tests {
         /// planned, optimized, fragmented and pruned as `coordinator.rs`
         /// does.
         async fn pruned_fragments(sql: &str) -> PlanFragment {
+            pruned_fragments_on(sql, 1).await
+        }
+
+        async fn pruned_fragments_on(sql: &str, workers: usize) -> PlanFragment {
             let catalog = catalog();
             let stmt = arneb_sql_parser::parse(sql).expect("parse");
             let (plan, ctx) = QueryPlanner::new(&catalog)
@@ -719,7 +943,7 @@ mod tests {
             let mut root = PlanFragmenter::new()
                 .with_broadcast_threshold(Some(100 * 1024 * 1024))
                 .with_stats(Some(ctx.catalog_stats.clone()))
-                .with_worker_count(1)
+                .with_worker_count(workers)
                 .fragment(plan);
             prune_fragment_tree(&mut root);
             root
@@ -849,6 +1073,70 @@ mod tests {
                 read[0].len(),
                 read[0]
             );
+        }
+
+        /// What every scan reads, each sorted, for comparing as a set.
+        fn sorted_reads(root: &PlanFragment) -> Vec<Vec<String>> {
+            let mut read = all_columns_read(root);
+            for columns in &mut read {
+                columns.sort();
+            }
+            read.sort();
+            read
+        }
+
+        #[tokio::test]
+        async fn a_window_over_an_aggregate_reads_only_the_aggregates_columns() {
+            // TPC-DS q44's shape: rank() over a grouped subquery.
+            let sql = "SELECT l_suppkey, rank() OVER (ORDER BY q DESC) FROM \
+                 (SELECT l_suppkey, sum(l_quantity) AS q FROM lineitem GROUP BY l_suppkey) t";
+            for workers in [1, 2] {
+                let root = pruned_fragments_on(sql, workers).await;
+                assert_eq!(
+                    sorted_reads(&root),
+                    [vec!["l_quantity", "l_suppkey"]],
+                    "{workers} workers"
+                );
+                for schema in all_exchanges(&root) {
+                    assert!(
+                        !schema.is_empty() && schema.len() <= 2,
+                        "{workers} workers: {schema:?}"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_window_keeps_the_columns_only_it_reads() {
+            // The outer query reads l_suppkey and the rank; the window still
+            // needs its partition and order columns.
+            let root = pruned_fragments(
+                "SELECT l_suppkey FROM (SELECT l_suppkey, rank() OVER \
+                 (PARTITION BY l_partkey ORDER BY l_quantity) AS r FROM lineitem) t WHERE r = 1",
+            )
+            .await;
+            assert_eq!(
+                sorted_reads(&root),
+                [vec!["l_partkey", "l_quantity", "l_suppkey"]]
+            );
+        }
+
+        #[tokio::test]
+        async fn intersect_and_except_read_only_their_own_columns() {
+            for op in ["INTERSECT", "EXCEPT"] {
+                let root = pruned_fragments(&format!(
+                    "SELECT l_suppkey FROM lineitem {op} SELECT l_partkey FROM lineitem"
+                ))
+                .await;
+                assert_eq!(
+                    sorted_reads(&root),
+                    [vec!["l_partkey"], vec!["l_suppkey"]],
+                    "{op}"
+                );
+                for schema in all_exchanges(&root) {
+                    assert_eq!(schema.len(), 1, "{op}: {schema:?}");
+                }
+            }
         }
 
         #[tokio::test]

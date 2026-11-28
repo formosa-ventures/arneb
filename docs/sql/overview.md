@@ -90,9 +90,15 @@ evaluates it. [`TRY`](/sql/functions#try) turns any of these into `NULL`.
 |---|---|---|
 | `22003` | `NUMERIC_VALUE_OUT_OF_RANGE` (19) | `CAST(300 AS TINYINT)`, `CAST(infinity() AS INTEGER)`, an INTEGER `+` that overflows, a DECIMAL result too wide for its type |
 | `22003` | `INVALID_CAST_ARGUMENT` (9) | `CAST(nan() AS INTEGER)`: PostgreSQL calls it out of range, Trino an invalid cast argument (`Cannot cast double NaN to integer`) |
-| `22P02` | `INVALID_CAST_ARGUMENT` (9) | `CAST('abc' AS INTEGER)` |
+| `22P02` | `INVALID_CAST_ARGUMENT` (9) | `CAST('abc' AS INTEGER)`, and a numeric string too large for the type, `CAST('99999999999' AS INTEGER)` (see below) |
 | `22007` | `INVALID_CAST_ARGUMENT` (9) | `CAST('2024-13-45' AS DATE)` |
 | `22012` | `DIVISION_BY_ZERO` (8) | `x / 0`, `x % 0` on integers |
+
+A string that is a number too large for the target type is `22P02` here,
+where PostgreSQL reports `22003`. The cast library gives the same error for a
+string that does not parse and one that parses but does not fit, so Arneb
+cannot tell them apart. Trino reports both as `INVALID_CAST_ARGUMENT`, as
+Arneb does.
 
 ## Further Reading
 

@@ -156,6 +156,19 @@ const CASES: &[(&str, &str, i64, &str)] = &[
         19,
         "NUMERIC_VALUE_OUT_OF_RANGE",
     ),
+    // A string whose text reads like the NaN error is still a bad string.
+    (
+        "SELECT CAST('a NaN to b' AS INTEGER)",
+        "22P02",
+        9,
+        "INVALID_CAST_ARGUMENT",
+    ),
+    (
+        "SELECT CAST(s || ' NaN to b' AS INTEGER) FROM d",
+        "22P02",
+        9,
+        "INVALID_CAST_ARGUMENT",
+    ),
     ("SELECT i % z FROM d", "22012", 8, "DIVISION_BY_ZERO"),
     (
         "SELECT CAST(big AS DECIMAL(5, 0)) FROM d",

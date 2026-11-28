@@ -346,7 +346,7 @@ impl DataErrorKind {
         to: &arrow::datatypes::DataType,
         err: &arrow::error::ArrowError,
     ) -> Self {
-        if crate::numeric_cast::is_nan_cast_error(err) {
+        if crate::numeric_cast::is_nan_cast_error(from, to, err) {
             Self::NanToInteger
         } else {
             Self::of_cast(from, to)

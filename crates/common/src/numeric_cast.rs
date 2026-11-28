@@ -99,13 +99,32 @@ fn out_of_range(value: impl std::fmt::Display, target: &DataType) -> ArrowError 
     ArrowError::CastError(format!("value {value} is out of range for {target}"))
 }
 
-/// Start of the error a NaN cast to an integer raises; see [`is_nan_cast_error`].
-const NAN_CAST: &str = "Cannot cast ";
+/// The error a NaN cast from the float type `source` (its SQL name) to the
+/// integer type `target` raises, worded as Trino's.
+fn nan_cast_message(source: &str, target: &DataType) -> String {
+    format!("Cannot cast {source} NaN to {}", sql_integer_name(target))
+}
 
-/// Whether `err` is a NaN cast to an integer type failing. Trino reports
+/// Whether `err` is a NaN failing a cast from `from` to `to`. Trino reports
 /// that as an invalid cast argument, unlike a value out of range.
-pub fn is_nan_cast_error(err: &ArrowError) -> bool {
-    matches!(err, ArrowError::CastError(m) if m.starts_with(NAN_CAST) && m.contains(" NaN to "))
+///
+/// Only a float-to-integer cast can fail that way, and the message must be
+/// exactly the one [`cast_fractional_to_integer`] raises for it, so the text
+/// of a value in another cast's error (a string holding `" NaN to "`) never
+/// changes the outcome.
+pub fn is_nan_cast_error(from: &DataType, to: &DataType, err: &ArrowError) -> bool {
+    let source = match from {
+        DataType::Float32 => "real",
+        DataType::Float64 => "double",
+        _ => return false,
+    };
+    if !matches!(
+        to,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    ) {
+        return false;
+    }
+    matches!(err, ArrowError::CastError(m) if *m == nan_cast_message(source, to))
 }
 
 /// The SQL name of an integer target, as Trino's messages use it.
@@ -132,10 +151,7 @@ fn rounded_float(
         return if options.safe {
             Ok(None)
         } else if value.is_nan() {
-            Err(ArrowError::CastError(format!(
-                "{NAN_CAST}{source} NaN to {}",
-                sql_integer_name(target)
-            )))
+            Err(ArrowError::CastError(nan_cast_message(source, target)))
         } else {
             Err(out_of_range(value, target))
         };
@@ -282,7 +298,10 @@ mod tests {
         };
         let nan64: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN]));
         let err = cast_fractional_to_integer(&nan64, &DataType::Int32, &strict).unwrap_err();
-        assert!(is_nan_cast_error(&err), "{err}");
+        assert!(
+            is_nan_cast_error(&DataType::Float64, &DataType::Int32, &err),
+            "{err}"
+        );
         assert!(
             err.to_string()
                 .contains("Cannot cast double NaN to integer"),
@@ -291,18 +310,59 @@ mod tests {
         let nan32: ArrayRef = Arc::new(Float32Array::from(vec![f32::NAN]));
         let err = cast_fractional_to_integer(&nan32, &DataType::Int8, &strict).unwrap_err();
         assert!(
+            is_nan_cast_error(&DataType::Float32, &DataType::Int8, &err),
+            "{err}"
+        );
+        assert!(
             err.to_string().contains("Cannot cast real NaN to tinyint"),
             "{err}"
         );
         for inf in [f64::INFINITY, f64::NEG_INFINITY] {
             let array: ArrayRef = Arc::new(Float64Array::from(vec![inf]));
             let err = cast_fractional_to_integer(&array, &DataType::Int64, &strict).unwrap_err();
-            assert!(!is_nan_cast_error(&err), "{err}");
+            assert!(
+                !is_nan_cast_error(&DataType::Float64, &DataType::Int64, &err),
+                "{err}"
+            );
             assert!(err.to_string().contains("out of range"), "{err}");
         }
         let finite: ArrayRef = Arc::new(Float64Array::from(vec![1e20]));
         let err = cast_fractional_to_integer(&finite, &DataType::Int32, &strict).unwrap_err();
-        assert!(!is_nan_cast_error(&err), "{err}");
+        assert!(
+            !is_nan_cast_error(&DataType::Float64, &DataType::Int32, &err),
+            "{err}"
+        );
+    }
+
+    /// A string cast's error quotes the value, so it can hold `" NaN to "`;
+    /// only a float-to-integer cast with the exact NaN message counts.
+    #[test]
+    fn a_string_holding_nan_text_is_not_a_nan_cast() {
+        let quoted = ArrowError::CastError(
+            "Cannot cast string 'a NaN to b' to value of Int32 type".to_string(),
+        );
+        assert!(!is_nan_cast_error(
+            &DataType::Utf8,
+            &DataType::Int32,
+            &quoted
+        ));
+        let nan = ArrowError::CastError(nan_cast_message("double", &DataType::Int32));
+        assert!(!is_nan_cast_error(&DataType::Utf8, &DataType::Int32, &nan));
+        assert!(!is_nan_cast_error(
+            &DataType::Float64,
+            &DataType::Utf8,
+            &nan
+        ));
+        assert!(!is_nan_cast_error(
+            &DataType::Float64,
+            &DataType::Int32,
+            &quoted
+        ));
+        assert!(is_nan_cast_error(
+            &DataType::Float64,
+            &DataType::Int32,
+            &nan
+        ));
     }
 
     #[test]

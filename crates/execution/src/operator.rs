@@ -108,6 +108,15 @@ pub trait ExecutionPlan: Any + Send + Sync + Debug {
         false
     }
 
+    /// Whether `execute(partition)` may be called again for a partition it
+    /// has already produced, and returns the same rows. A scan re-reads its
+    /// source. An exchange read cannot be repeated (a remote partition is
+    /// served once), so the default is `false`; an operator that falls back
+    /// to a second pass over its input must check this first.
+    fn can_reexecute(&self) -> bool {
+        false
+    }
+
     /// Peak bytes the operator has reserved for its build/hash/group
     /// state during execution. Trino-aligned with `LocalMemoryContext.
     /// setBytes()` — see `HashBuilderOperator.java:329` for the build
@@ -1097,6 +1106,10 @@ impl ExecutionPlan for ScanExec {
         true
     }
 
+    fn can_reexecute(&self) -> bool {
+        true
+    }
+
     fn output_partitioning(&self) -> crate::partitioning::Partitioning {
         // One output partition per source partition this task owns. With the
         // multi-worker stride (scan_task_count > 1) the task owns only its
@@ -1282,6 +1295,10 @@ impl ExecutionPlan for ProjectionExec {
         self.input.is_leaf_scan_subtree()
     }
 
+    fn can_reexecute(&self) -> bool {
+        self.input.can_reexecute()
+    }
+
     async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream, ExecutionError> {
         let input_stream = self.input.execute(partition).await?;
         let exprs = self.exprs.clone();
@@ -1349,6 +1366,10 @@ impl ExecutionPlan for FilterExec {
 
     fn is_leaf_scan_subtree(&self) -> bool {
         self.input.is_leaf_scan_subtree()
+    }
+
+    fn can_reexecute(&self) -> bool {
+        self.input.can_reexecute()
     }
 
     async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream, ExecutionError> {

@@ -3182,6 +3182,10 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                 let parallel_final = (parallel_final_agg_enabled()
                     || self.force_parallel_final_agg)
                     && n_group > 0
+                    // A GROUP BY with no functions gets a parallel final
+                    // step only under a join (the q97 shape, validated at
+                    // SF30). A standalone DISTINCT keeps its final step at
+                    // the root: that case has not been measured.
                     && (!group_by_only || self.join_child)
                     && ((self.join_child
                         && input_frags.len() == 1

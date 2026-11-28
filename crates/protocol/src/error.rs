@@ -41,6 +41,7 @@ pub fn arneb_error_to_pg_error_with_source(
                 PlanError::UnsupportedExpression { .. } | PlanError::InvalidExpression { .. } => {
                     "42601"
                 }
+                PlanError::Data { kind, .. } => data_error_sqlstate(*kind),
                 PlanError::InternalError(_) => "XX000",
                 // io_error, class 58 ("system error", external to the
                 // server): retryable, and not 08xxx, which drivers read as
@@ -57,6 +58,9 @@ pub fn arneb_error_to_pg_error_with_source(
         // A query over its memory limit is `out_of_memory`, which clients
         // can tell apart from an internal error (admission-control D3).
         e if arneb_common::error::is_resource_exhausted(e) => ("53200".to_string(), e.to_string()),
+        ArnebError::Execution(e @ arneb_common::error::ExecutionError::Data { kind, .. }) => {
+            (data_error_sqlstate(*kind).to_string(), e.to_string())
+        }
         ArnebError::Execution(e) => ("XX000".to_string(), e.to_string()),
         ArnebError::Connector(e) => ("58030".to_string(), e.to_string()),
         ArnebError::Catalog(e @ arneb_common::error::CatalogError::AccessDenied(_)) => {
@@ -75,6 +79,20 @@ pub fn arneb_error_to_pg_error_with_source(
         sqlstate,
         message,
     )))
+}
+
+/// PostgreSQL's SQLSTATE for a data error (class 22), as PostgreSQL itself
+/// reports the same failure: `'abc'::int` is `22P02`, `300::int2` fits but
+/// `70000::int2` is `22003`, `'x'::date` is `22007`, `1/0` is `22012`.
+fn data_error_sqlstate(kind: arneb_common::error::DataErrorKind) -> &'static str {
+    use arneb_common::error::DataErrorKind;
+    match kind {
+        DataErrorKind::NumericValueOutOfRange | DataErrorKind::NanToInteger => "22003",
+        DataErrorKind::InvalidTextRepresentation => "22P02",
+        DataErrorKind::InvalidDatetimeFormat => "22007",
+        DataErrorKind::DivisionByZero => "22012",
+        _ => "22000",
+    }
 }
 
 #[cfg(test)]

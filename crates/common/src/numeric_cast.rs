@@ -16,7 +16,9 @@ use arrow::error::ArrowError;
 /// As in Trino, a finite value whose *rounded* result is outside the target
 /// range is an error (so `CAST(127.5 AS TINYINT)` fails rather than
 /// returning 127), whatever `options.safe` says. `options.safe` only decides
-/// what NaN and ±Infinity become: NULL when safe, an error otherwise.
+/// what NaN and ±Infinity become: NULL when safe, an error otherwise. A NaN
+/// error is worded as Trino's (`Cannot cast double NaN to integer`), and
+/// [`is_nan_cast_error`] tells it from an out-of-range one.
 pub fn cast_fractional_to_integer(
     array: &ArrayRef,
     target: &DataType,
@@ -35,7 +37,7 @@ pub fn cast_fractional_to_integer(
             .iter()
             .map(|value| {
                 value
-                    .map(|v| rounded_float(v as f64, min, max, target, options))
+                    .map(|v| rounded_float(v as f64, "real", min, max, target, options))
                     .transpose()
                     .map(Option::flatten)
             })
@@ -45,7 +47,7 @@ pub fn cast_fractional_to_integer(
             .iter()
             .map(|value| {
                 value
-                    .map(|v| rounded_float(v, min, max, target, options))
+                    .map(|v| rounded_float(v, "double", min, max, target, options))
                     .transpose()
                     .map(Option::flatten)
             })
@@ -97,9 +99,49 @@ fn out_of_range(value: impl std::fmt::Display, target: &DataType) -> ArrowError 
     ArrowError::CastError(format!("value {value} is out of range for {target}"))
 }
 
+/// The error a NaN cast from the float type `source` (its SQL name) to the
+/// integer type `target` raises, worded as Trino's.
+fn nan_cast_message(source: &str, target: &DataType) -> String {
+    format!("Cannot cast {source} NaN to {}", sql_integer_name(target))
+}
+
+/// Whether `err` is a NaN failing a cast from `from` to `to`. Trino reports
+/// that as an invalid cast argument, unlike a value out of range.
+///
+/// Only a float-to-integer cast can fail that way, and the message must be
+/// exactly the one [`cast_fractional_to_integer`] raises for it, so the text
+/// of a value in another cast's error (a string holding `" NaN to "`) never
+/// changes the outcome.
+pub fn is_nan_cast_error(from: &DataType, to: &DataType, err: &ArrowError) -> bool {
+    let source = match from {
+        DataType::Float32 => "real",
+        DataType::Float64 => "double",
+        _ => return false,
+    };
+    if !matches!(
+        to,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    ) {
+        return false;
+    }
+    matches!(err, ArrowError::CastError(m) if *m == nan_cast_message(source, to))
+}
+
+/// The SQL name of an integer target, as Trino's messages use it.
+fn sql_integer_name(target: &DataType) -> &'static str {
+    match target {
+        DataType::Int8 => "tinyint",
+        DataType::Int16 => "smallint",
+        DataType::Int32 => "integer",
+        _ => "bigint",
+    }
+}
+
 /// Round a float; `Ok(None)` is a NULL result (NaN/Infinity under a safe cast).
+/// `source` is the SQL name of the float type, for the NaN message.
 fn rounded_float(
     value: f64,
+    source: &str,
     min: i64,
     max: i64,
     target: &DataType,
@@ -108,10 +150,10 @@ fn rounded_float(
     if !value.is_finite() {
         return if options.safe {
             Ok(None)
+        } else if value.is_nan() {
+            Err(ArrowError::CastError(nan_cast_message(source, target)))
         } else {
-            Err(ArrowError::CastError(format!(
-                "cannot cast {value} to {target}"
-            )))
+            Err(out_of_range(value, target))
         };
     }
     let rounded = value.round();
@@ -244,6 +286,83 @@ mod tests {
         let got = cast(array.clone(), DataType::Int32, true).unwrap();
         assert_eq!(values(&got), vec![None, None, None, Some(3)]);
         assert!(cast(array, DataType::Int32, false).is_err());
+    }
+
+    /// Trino: NaN is an invalid cast argument, worded after the source and
+    /// target types; ±Infinity is out of range.
+    #[test]
+    fn nan_and_infinity_fail_differently() {
+        let strict = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
+        let nan64: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN]));
+        let err = cast_fractional_to_integer(&nan64, &DataType::Int32, &strict).unwrap_err();
+        assert!(
+            is_nan_cast_error(&DataType::Float64, &DataType::Int32, &err),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("Cannot cast double NaN to integer"),
+            "{err}"
+        );
+        let nan32: ArrayRef = Arc::new(Float32Array::from(vec![f32::NAN]));
+        let err = cast_fractional_to_integer(&nan32, &DataType::Int8, &strict).unwrap_err();
+        assert!(
+            is_nan_cast_error(&DataType::Float32, &DataType::Int8, &err),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("Cannot cast real NaN to tinyint"),
+            "{err}"
+        );
+        for inf in [f64::INFINITY, f64::NEG_INFINITY] {
+            let array: ArrayRef = Arc::new(Float64Array::from(vec![inf]));
+            let err = cast_fractional_to_integer(&array, &DataType::Int64, &strict).unwrap_err();
+            assert!(
+                !is_nan_cast_error(&DataType::Float64, &DataType::Int64, &err),
+                "{err}"
+            );
+            assert!(err.to_string().contains("out of range"), "{err}");
+        }
+        let finite: ArrayRef = Arc::new(Float64Array::from(vec![1e20]));
+        let err = cast_fractional_to_integer(&finite, &DataType::Int32, &strict).unwrap_err();
+        assert!(
+            !is_nan_cast_error(&DataType::Float64, &DataType::Int32, &err),
+            "{err}"
+        );
+    }
+
+    /// A string cast's error quotes the value, so it can hold `" NaN to "`;
+    /// only a float-to-integer cast with the exact NaN message counts.
+    #[test]
+    fn a_string_holding_nan_text_is_not_a_nan_cast() {
+        let quoted = ArrowError::CastError(
+            "Cannot cast string 'a NaN to b' to value of Int32 type".to_string(),
+        );
+        assert!(!is_nan_cast_error(
+            &DataType::Utf8,
+            &DataType::Int32,
+            &quoted
+        ));
+        let nan = ArrowError::CastError(nan_cast_message("double", &DataType::Int32));
+        assert!(!is_nan_cast_error(&DataType::Utf8, &DataType::Int32, &nan));
+        assert!(!is_nan_cast_error(
+            &DataType::Float64,
+            &DataType::Utf8,
+            &nan
+        ));
+        assert!(!is_nan_cast_error(
+            &DataType::Float64,
+            &DataType::Int32,
+            &quoted
+        ));
+        assert!(is_nan_cast_error(
+            &DataType::Float64,
+            &DataType::Int32,
+            &nan
+        ));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arneb_common::error::{ArnebError, ExecutionError};
+use arneb_common::error::{ArnebError, DataErrorKind, ExecutionError};
 use arneb_rpc::{
     BufferKind, ExchangeClient, FlightState, OutputBuffer, TaskFailure, TaskStatusResponse,
 };
@@ -95,4 +95,64 @@ async fn tag_like_text_does_not_make_a_memory_failure() {
         matches!(err, ExecutionError::InvalidOperation(_)),
         "expected InvalidOperation, got {err:?}"
     );
+}
+
+/// A data error (a failed cast on the worker) reaches the consumer as
+/// `ExecutionError::Data` with its kind and the worker's message, on both
+/// failure paths, so the client gets its SQLSTATE.
+fn assert_data_error(err: &ExecutionError) {
+    match err {
+        ExecutionError::Data { kind, message } => {
+            assert_eq!(*kind, DataErrorKind::InvalidTextRepresentation);
+            assert_eq!(message, "Cannot cast string 'abc' to value of Int32 type");
+        }
+        other => panic!("expected a data error, got {other:?}"),
+    }
+}
+
+fn cast_failure() -> TaskFailure {
+    TaskFailure::from_execution_error(
+        "task q.t",
+        &ExecutionError::Data {
+            kind: DataErrorKind::InvalidTextRepresentation,
+            message: "Cannot cast string 'abc' to value of Int32 type".into(),
+        },
+    )
+}
+
+#[tokio::test]
+async fn failed_task_status_keeps_a_data_error() {
+    let mut state = FlightState::new();
+    state.set_task_status_callback(Arc::new(|_| {
+        Some(TaskStatusResponse::Failed(cast_failure()))
+    }));
+    let addr = start(state).await;
+    let err = match ExchangeClient::new(&addr).fetch_partition("q.t", 0).await {
+        Ok(_) => panic!("fetch should fail"),
+        Err(e) => e,
+    };
+    assert_data_error(&err);
+}
+
+#[tokio::test]
+async fn mid_stream_failure_keeps_a_data_error() {
+    let state = FlightState::new();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let buf = OutputBuffer::single(4, schema);
+    let failure = buf.failure_handle();
+    state.register_partitioned_buffer("q.t".into(), buf);
+    *failure.lock().unwrap() = Some(cast_failure());
+    if let Some(BufferKind::Partitioned(buf)) = state.get_buffer("q.t") {
+        buf.lock().await.close();
+    }
+    let addr = start(state).await;
+
+    let err = match ExchangeClient::new(&addr).fetch_partition("q.t", 0).await {
+        Err(e) => e,
+        Ok(mut stream) => match stream.next().await {
+            Some(Err(ArnebError::Execution(e))) => e,
+            other => panic!("expected an execution error, got {other:?}"),
+        },
+    };
+    assert_data_error(&err);
 }

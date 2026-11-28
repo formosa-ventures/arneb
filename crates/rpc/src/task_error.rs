@@ -16,10 +16,16 @@
 //!   that transport failure is not a memory limit;
 //! - operators re-raising it keep the variant
 //!   (`ExecutionError::upstream`), and the next hop starts over.
+//!
+//! A data error (`ExecutionError::Data`: a failed cast, an overflow, a
+//! division by zero) travels the same way so the client gets its SQLSTATE:
+//! gRPC `INTERNAL`, as for any task failure, with its
+//! [`DataErrorKind::tag`] under [`CLASS_KEY`] and its message unwrapped. A
+//! consumer older than the marker sees an ordinary task failure.
 
 use std::fmt;
 
-use arneb_common::error::{ArnebError, ExecutionError};
+use arneb_common::error::{ArnebError, DataErrorKind, ExecutionError};
 use arrow_flight::error::FlightError;
 use tonic::metadata::MetadataValue;
 use tonic::{Code, Status};
@@ -34,7 +40,15 @@ const CLASS_RESOURCE_EXHAUSTED: &str = "resource-exhausted";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskFailure {
     message: String,
-    resource_exhausted: bool,
+    class: FailureClass,
+}
+
+/// The part of a task failure's type the consumer restores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureClass {
+    Other,
+    ResourceExhausted,
+    Data(DataErrorKind),
 }
 
 impl TaskFailure {
@@ -42,7 +56,7 @@ impl TaskFailure {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            resource_exhausted: false,
+            class: FailureClass::Other,
         }
     }
 
@@ -50,7 +64,15 @@ impl TaskFailure {
     pub fn resource_exhausted(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            resource_exhausted: true,
+            class: FailureClass::ResourceExhausted,
+        }
+    }
+
+    /// A data error of `kind`; `message` is what the client will see.
+    pub fn data(kind: DataErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            class: FailureClass::Data(kind),
         }
     }
 
@@ -67,6 +89,7 @@ impl TaskFailure {
     pub fn from_execution_error(context: &str, err: &ExecutionError) -> Self {
         match err {
             ExecutionError::ResourceExhausted(msg) => Self::resource_exhausted(msg.clone()),
+            ExecutionError::Data { kind, message } => Self::data(*kind, message.clone()),
             other => Self::new(format!("{context}: {other}")),
         }
     }
@@ -78,34 +101,44 @@ impl TaskFailure {
 
     /// Whether this is a memory-limit failure.
     pub fn is_resource_exhausted(&self) -> bool {
-        self.resource_exhausted
+        self.class == FailureClass::ResourceExhausted
     }
 
     /// The status a consumer gets for this failure: `RESOURCE_EXHAUSTED`
-    /// with the message unchanged, or `INTERNAL` with `context: message`.
+    /// with the message unchanged, `INTERNAL` marked with the data error's
+    /// kind and the message unchanged, or `INTERNAL` with `context: message`.
     pub(crate) fn to_status(&self, context: impl fmt::Display) -> Status {
-        if self.resource_exhausted {
-            let mut status = Status::resource_exhausted(self.message.clone());
-            status.metadata_mut().insert(
-                CLASS_KEY,
-                MetadataValue::from_static(CLASS_RESOURCE_EXHAUSTED),
-            );
-            status
-        } else {
-            Status::internal(format!("{context}: {}", self.message))
-        }
+        let (mut status, class) = match self.class {
+            FailureClass::ResourceExhausted => (
+                Status::resource_exhausted(self.message.clone()),
+                CLASS_RESOURCE_EXHAUSTED,
+            ),
+            FailureClass::Data(kind) => (Status::internal(self.message.clone()), kind.tag()),
+            FailureClass::Other => {
+                return Status::internal(format!("{context}: {}", self.message));
+            }
+        };
+        status
+            .metadata_mut()
+            .insert(CLASS_KEY, MetadataValue::from_static(class));
+        status
     }
 }
 
 impl TaskFailure {
     /// The error a coordinator raises for this failure: `ResourceExhausted`
-    /// with the worker's message for a memory-limit failure, else
-    /// `InvalidOperation("{context}: message")`.
+    /// with the worker's message for a memory-limit failure, `Data` with
+    /// its kind for a data error, else `InvalidOperation("{context}: message")`.
     pub fn into_execution_error(self, context: impl fmt::Display) -> ExecutionError {
-        if self.resource_exhausted {
-            ExecutionError::ResourceExhausted(self.message)
-        } else {
-            ExecutionError::InvalidOperation(format!("{context}: {}", self.message))
+        match self.class {
+            FailureClass::ResourceExhausted => ExecutionError::ResourceExhausted(self.message),
+            FailureClass::Data(kind) => ExecutionError::Data {
+                kind,
+                message: self.message,
+            },
+            FailureClass::Other => {
+                ExecutionError::InvalidOperation(format!("{context}: {}", self.message))
+            }
         }
     }
 }
@@ -124,6 +157,11 @@ pub struct TaskFailureReport {
     /// Whether it is a memory or spill limit failure (`ResourceExhausted`).
     #[serde(default)]
     pub resource_exhausted: bool,
+    /// A data error's [`DataErrorKind::tag`], so the client gets its
+    /// SQLSTATE. Absent from an older worker, whose report then reads as
+    /// an ordinary failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_kind: Option<String>,
 }
 
 impl TaskFailureReport {
@@ -137,15 +175,24 @@ impl TaskFailureReport {
             query_id,
             task_id: task_id.into(),
             message: failure.message.clone(),
-            resource_exhausted: failure.resource_exhausted,
+            resource_exhausted: failure.is_resource_exhausted(),
+            data_kind: match failure.class {
+                FailureClass::Data(kind) => Some(kind.tag().to_string()),
+                _ => None,
+            },
         }
     }
 
     /// The reported failure.
     pub fn failure(&self) -> TaskFailure {
+        let data = self.data_kind.as_deref().and_then(DataErrorKind::from_tag);
         TaskFailure {
             message: self.message.clone(),
-            resource_exhausted: self.resource_exhausted,
+            class: match (self.resource_exhausted, data) {
+                (true, _) => FailureClass::ResourceExhausted,
+                (false, Some(kind)) => FailureClass::Data(kind),
+                (false, None) => FailureClass::Other,
+            },
         }
     }
 
@@ -211,14 +258,31 @@ impl RemoteFailure for FlightError {
 
 /// Error for a remote failure seen by the consumer: `ResourceExhausted`
 /// (with the worker's message) for a memory-limit failure the producer
-/// sent, else `InvalidOperation("{context}: …")`.
+/// sent, `Data` for a data error it sent, else
+/// `InvalidOperation("{context}: …")`.
 pub(crate) fn remote_error(context: String, failure: &impl RemoteFailure) -> ExecutionError {
     match failure.status() {
         Some(status) if is_memory_limit(status) => {
             ExecutionError::ResourceExhausted(status.message().to_owned())
         }
-        _ => ExecutionError::InvalidOperation(format!("{context}: {}", failure.describe())),
+        Some(status) => match data_error_kind(status) {
+            Some(kind) => ExecutionError::Data {
+                kind,
+                message: status.message().to_owned(),
+            },
+            None => ExecutionError::InvalidOperation(format!("{context}: {}", failure.describe())),
+        },
+        None => ExecutionError::InvalidOperation(format!("{context}: {}", failure.describe())),
     }
+}
+
+/// The kind of a data error the producer sent as an `INTERNAL` status.
+fn data_error_kind(status: &Status) -> Option<DataErrorKind> {
+    if status.code() != Code::Internal {
+        return None;
+    }
+    let tag = status.metadata().get(CLASS_KEY)?.to_str().ok()?;
+    DataErrorKind::from_tag(tag)
 }
 
 /// A `RESOURCE_EXHAUSTED` the producer sent for a memory-limit failure,
@@ -273,6 +337,33 @@ mod tests {
                 .unwrap()
                 .resource_exhausted
         );
+    }
+
+    /// A data error reported straight to the coordinator keeps its kind,
+    /// so the client gets its SQLSTATE, not a generic internal error.
+    #[test]
+    fn a_data_error_report_round_trips_with_its_kind() {
+        let query_id = arneb_common::QueryId::new();
+        let failure = TaskFailure::data(
+            DataErrorKind::NumericValueOutOfRange,
+            "value 3000000000 is out of range for Int32",
+        );
+        let report = TaskFailureReport::new(query_id, "q.2.1", &failure);
+        let back = TaskFailureReport::decode(&report.encode()).unwrap();
+        assert_eq!(back.failure(), failure);
+        assert!(matches!(
+            back.failure().into_execution_error("task q.2.1 failed"),
+            ExecutionError::Data {
+                kind: DataErrorKind::NumericValueOutOfRange,
+                message,
+            } if message == "value 3000000000 is out of range for Int32"
+        ));
+        // A kind this coordinator does not know reads as an ordinary failure.
+        let unknown = TaskFailureReport {
+            data_kind: Some("from-a-newer-worker".to_string()),
+            ..report
+        };
+        assert_eq!(unknown.failure().class, FailureClass::Other);
     }
 
     #[test]

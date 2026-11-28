@@ -238,7 +238,7 @@ async fn a_literal_out_of_smallint_or_tinyint_range_fails_at_plan_time() {
         "SELECT CAST('x' AS SMALLINT)",
     ] {
         let err = run(sql).await.unwrap_err();
-        assert!(err.contains("invalid literal"), "{sql}: {err}");
+        assert!(err.contains("cannot cast literal"), "{sql}: {err}");
     }
 }
 

@@ -336,11 +336,16 @@ pub const PG_TYPES: &[PgType] = &[
     },
 ];
 
+/// The built-in type with `oid`, if Arneb reports one.
+pub fn pg_type(oid: i64) -> Option<&'static PgType> {
+    PG_TYPES.iter().find(|t| t.oid == oid)
+}
+
 /// `format_type(type_oid, typmod)`: the SQL name of a type, with the
 /// precision and scale of a `numeric` or the length of a `varchar` taken
 /// from `typmod`, and `???` for an unknown oid, as in PostgreSQL.
 pub fn format_type(oid: i64, typmod: Option<i64>) -> String {
-    let Some(ty) = PG_TYPES.iter().find(|t| t.oid == oid) else {
+    let Some(ty) = pg_type(oid) else {
         return "???".to_string();
     };
     match (ty.oid, typmod) {

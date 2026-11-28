@@ -74,6 +74,23 @@ struct PlanningContext {
 }
 
 impl PlanningContext {
+    /// The columns `SELECT *` expands to, with their index: every column in
+    /// scope except the planner's own (window results, set-returning
+    /// function output, select-list subqueries) and the right-hand copies
+    /// of `JOIN ... USING` columns.
+    fn star_columns(&self) -> impl Iterator<Item = (usize, &ColumnInfo)> {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter(|(i, (q, _))| {
+                !matches!(
+                    q.as_deref(),
+                    Some(WINDOW_QUALIFIER | SRF_QUALIFIER | SELECT_SUBQUERY_QUALIFIER)
+                ) && !self.merged.contains(i)
+            })
+            .map(|(i, (_, col))| (i, col))
+    }
+
     fn new() -> Self {
         Self {
             columns: Vec::new(),
@@ -2996,14 +3013,7 @@ impl<'a> QueryPlanner<'a> {
                 }
                 ast::SelectItem::Wildcard => {
                     // Expand * to all columns (not the window results)
-                    for (i, (q, col)) in ctx.columns.iter().enumerate() {
-                        if q.as_deref() == Some(WINDOW_QUALIFIER)
-                            || q.as_deref() == Some(SRF_QUALIFIER)
-                            || q.as_deref() == Some(SELECT_SUBQUERY_QUALIFIER)
-                            || ctx.merged.contains(&i)
-                        {
-                            continue;
-                        }
+                    for (i, col) in ctx.star_columns() {
                         exprs.push(PlanExpr::Column {
                             index: i,
                             name: col.name.clone(),
@@ -3163,14 +3173,7 @@ impl<'a> QueryPlanner<'a> {
                     }
                 }
                 ast::SelectItem::Wildcard => {
-                    for (i, (q, col)) in ctx.columns.iter().enumerate() {
-                        if q.as_deref() == Some(WINDOW_QUALIFIER)
-                            || q.as_deref() == Some(SRF_QUALIFIER)
-                            || q.as_deref() == Some(SELECT_SUBQUERY_QUALIFIER)
-                            || ctx.merged.contains(&i)
-                        {
-                            continue;
-                        }
+                    for (i, col) in ctx.star_columns() {
                         exprs.push(PlanExpr::Column {
                             index: i,
                             name: col.name.clone(),

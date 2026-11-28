@@ -104,6 +104,7 @@ enum KeyStorage {
     /// `RowConverter`. `keys[group_id] = GroupKey` (Vec<ScalarValue>).
     Generic {
         keys: Vec<GroupKey>,
+        payload_bytes: usize,
         /// Arrow type of each key column, captured at storage selection so
         /// an all-NULL key column materialises as a typed NULL array.
         types: Vec<ArrowDataType>,
@@ -308,7 +309,7 @@ impl GroupByHash {
     /// pool-pressure exchange spill (D2) can balance, instead of silently
     /// growing past the cgroup and OOM-killing the worker.
     pub(crate) fn heap_bytes(&self) -> usize {
-        let table = self.table.capacity() * std::mem::size_of::<u32>();
+        let table = self.table.allocation_size();
         let storage = match &self.storage {
             KeyStorage::Uninit => 0,
             KeyStorage::Bigint {
@@ -320,10 +321,8 @@ impl GroupByHash {
                 let radix_table_bytes = radix_tables
                     .as_ref()
                     .map(|tables| {
-                        tables
-                            .iter()
-                            .map(|t| t.capacity() * std::mem::size_of::<(i64, u32)>())
-                            .sum::<usize>()
+                        tables.capacity() * size_of::<hashbrown::HashTable<(i64, u32)>>()
+                            + tables.iter().map(|t| t.allocation_size()).sum::<usize>()
                     })
                     .unwrap_or(0);
                 let prefetch_table_bytes = prefetch_table
@@ -343,9 +342,15 @@ impl GroupByHash {
                     + ranges.capacity() * std::mem::size_of::<(u32, u32)>()
                     + hashes.capacity() * std::mem::size_of::<u64>()
             }
-            // GroupKey is a Vec<ScalarValue>; estimate a flat ~32 B/group
-            // (this fallback path is rare — RowConverter covers most types).
-            KeyStorage::Generic { keys, .. } => keys.capacity() * 32,
+            KeyStorage::Generic {
+                keys,
+                types,
+                payload_bytes,
+            } => {
+                keys.capacity() * size_of::<GroupKey>()
+                    + types.capacity() * size_of::<ArrowDataType>()
+                    + payload_bytes
+            }
         };
         table + storage
     }
@@ -417,11 +422,96 @@ impl GroupByHash {
                 hashes,
                 group_cols,
             ),
-            KeyStorage::Generic { keys, .. } => {
-                get_group_ids_generic(&self.state, &mut self.table, keys, group_cols)
-            }
+            KeyStorage::Generic {
+                keys,
+                payload_bytes,
+                ..
+            } => get_group_ids_generic(
+                &self.state,
+                &mut self.table,
+                keys,
+                payload_bytes,
+                group_cols,
+            ),
             KeyStorage::Uninit => unreachable!(),
         }
+    }
+
+    /// Probe existing groups using the same encoding and hash as admission.
+    pub(crate) fn lookup_group_ids(
+        &self,
+        group_cols: &[ArrayRef],
+    ) -> Result<Vec<Option<u32>>, ExecutionError> {
+        let n = group_cols.first().map_or(0, |c| c.len());
+        if group_cols.iter().any(|c| c.len() != n) {
+            return Err(ExecutionError::InvalidOperation(
+                "GroupByHash::lookup_group_ids: group cols have mismatched lengths".into(),
+            ));
+        }
+        Ok(match &self.storage {
+            KeyStorage::Uninit => vec![None; n],
+            KeyStorage::Bigint {
+                keys,
+                null_group_id,
+                prefetch_table,
+                radix_tables,
+            } => {
+                let arr = group_cols[0].as_primitive::<Int64Type>();
+                arr.iter()
+                    .map(|value| {
+                        let Some(value) = value else {
+                            return *null_group_id;
+                        };
+                        let hash = self.state.hash_one(value);
+                        if let Some(table) = prefetch_table {
+                            table.find(hash, value, keys)
+                        } else if let Some(tables) = radix_tables {
+                            tables[bigint_radix_partition(hash)]
+                                .find(hash, |&(key, _)| key == value)
+                                .map(|entry| entry.1)
+                        } else {
+                            self.table
+                                .find(hash, |&id| keys[id as usize] == value)
+                                .copied()
+                        }
+                    })
+                    .collect()
+            }
+            KeyStorage::FlatRow {
+                converter,
+                buffer,
+                ranges,
+                ..
+            } => {
+                let rows = converter.convert_columns(group_cols)?;
+                rows.iter()
+                    .map(|row| {
+                        let bytes = row.as_ref();
+                        self.table
+                            .find(self.state.hash_one(bytes), |&id| {
+                                let (start, len) = ranges[id as usize];
+                                &buffer[start as usize..start as usize + len as usize] == bytes
+                            })
+                            .copied()
+                    })
+                    .collect()
+            }
+            KeyStorage::Generic { keys, .. } => {
+                let typed = group_cols
+                    .iter()
+                    .map(TypedGroupCol::from_array)
+                    .collect::<Result<Vec<_>, _>>()?;
+                (0..n)
+                    .map(|row| {
+                        self.table
+                            .find(hash_typed_row(&self.state, &typed, row), |&id| {
+                                typed_row_eq_key(&typed, row, &keys[id as usize])
+                            })
+                            .copied()
+                    })
+                    .collect()
+            }
+        })
     }
 
     /// Materialise the group-key column(s) as Arrow arrays. One
@@ -431,21 +521,34 @@ impl GroupByHash {
     /// each `Vec<ScalarValue>` slice via
     /// [`crate::operator::scalars_to_array`].
     pub(crate) fn build_group_arrays(&self) -> Result<Vec<ArrayRef>, ExecutionError> {
+        self.build_group_range(0..self.num_groups())
+    }
+
+    pub(crate) fn build_group_range(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> Result<Vec<ArrayRef>, ExecutionError> {
         match &self.storage {
             KeyStorage::Uninit => Ok(vec![]),
             KeyStorage::Bigint {
                 keys,
                 null_group_id,
                 ..
-            } => Ok(vec![build_bigint_array(keys, *null_group_id)]),
+            } => Ok(vec![build_bigint_array(
+                &keys[range.clone()],
+                null_group_id
+                    .map(|id| id as usize)
+                    .filter(|id| range.contains(id))
+                    .map(|id| (id - range.start) as u32),
+            )]),
             KeyStorage::FlatRow {
                 converter,
                 parser,
                 buffer,
                 ranges,
                 ..
-            } => build_flat_arrays(converter, parser, buffer, ranges),
-            KeyStorage::Generic { keys, types } => build_generic_arrays(keys, types),
+            } => build_flat_arrays(converter, parser, buffer, &ranges[range]),
+            KeyStorage::Generic { keys, types, .. } => build_generic_arrays(&keys[range], types),
         }
     }
 }
@@ -497,6 +600,7 @@ fn pick_storage(
 ) -> KeyStorage {
     if group_cols.is_empty() {
         return KeyStorage::Generic {
+            payload_bytes: 0,
             keys: Vec::new(),
             types: Vec::new(),
         };
@@ -536,6 +640,7 @@ fn pick_storage(
     }
 
     KeyStorage::Generic {
+        payload_bytes: 0,
         keys: vec_with_capacity_hint(capacity_hint),
         types: group_cols.iter().map(|c| c.data_type().clone()).collect(),
     }
@@ -736,6 +841,20 @@ impl BigintPrefetchTable {
                 self.buckets[slot] = group_id;
                 self.len += 1;
                 return;
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
+    fn find(&self, hash: u64, value: i64, keys: &[i64]) -> Option<u32> {
+        let mut slot = hash as usize & self.mask;
+        loop {
+            let id = self.buckets[slot];
+            if id == Self::EMPTY {
+                return None;
+            }
+            if keys[id as usize] == value {
+                return Some(id);
             }
             slot = (slot + 1) & self.mask;
         }
@@ -1059,6 +1178,7 @@ fn get_group_ids_generic(
     state: &RandomState,
     table: &mut hashbrown::HashTable<u32>,
     keys: &mut Vec<GroupKey>,
+    payload_bytes: &mut usize,
     group_cols: &[ArrayRef],
 ) -> Result<Vec<u32>, ExecutionError> {
     let n_rows = group_cols.first().map(|c| c.len()).unwrap_or(0);
@@ -1088,6 +1208,11 @@ fn get_group_ids_generic(
                 for col in group_cols {
                     values.push(extract_scalar(col, row)?);
                 }
+                *payload_bytes += values.capacity() * size_of::<ScalarValue>()
+                    + values
+                        .iter()
+                        .map(crate::aggregate::scalar_heap_bytes)
+                        .sum::<usize>();
                 keys.push(GroupKey(values));
                 v.insert(id);
                 id
@@ -1923,5 +2048,62 @@ mod tests {
             agg_presize_adaptive_enabled(),
             "ARNEB_AGG_PRESIZE_ADAPTIVE must ship on; set it to 0 to opt out"
         );
+    }
+
+    /// Looking groups up never admits new ones: known keys (NULL included, and the
+    /// same key repeated) map to their admitted ids, unknown keys to `None`, and
+    /// the table neither gains groups nor grows. Covers each key storage.
+    #[test]
+    fn lookup_finds_admitted_groups_without_admitting_new_ones() {
+        let int64 = |v: Vec<Option<i64>>| vec![Arc::new(Int64Array::from(v)) as ArrayRef];
+        let int32 = |v: Vec<Option<i32>>| vec![Arc::new(Int32Array::from(v)) as ArrayRef];
+        let multi = |a: Vec<Option<i32>>, b: Vec<Option<&str>>| {
+            vec![
+                Arc::new(Int32Array::from(a)) as ArrayRef,
+                Arc::new(StringArray::from(b)) as ArrayRef,
+            ]
+        };
+        let cases: Vec<(Vec<ArrayRef>, Vec<ArrayRef>)> = vec![
+            (
+                int64(vec![Some(7), None, Some(-3)]),
+                int64(vec![Some(-3), Some(8), None, Some(7), Some(-3)]),
+            ),
+            (
+                int32(vec![Some(7), None, Some(-3)]),
+                int32(vec![Some(-3), Some(8), None, Some(7), Some(-3)]),
+            ),
+            (
+                multi(
+                    vec![Some(7), None, Some(7)],
+                    vec![Some("a"), Some("a"), None],
+                ),
+                multi(
+                    vec![Some(7), Some(7), None, Some(7), Some(7)],
+                    vec![None, Some("b"), Some("a"), Some("a"), None],
+                ),
+            ),
+        ];
+        let builders: Vec<fn() -> GroupByHash> = vec![
+            || GroupByHash::with_radix_agg(false),
+            || GroupByHash::with_radix_agg(true),
+            || GroupByHash::with_agg_prefetch_for_test(true),
+        ];
+        for (admitted, probe) in &cases {
+            for build in &builders {
+                let mut gbh = build();
+                let ids = gbh.get_group_ids(admitted).unwrap();
+                let (groups, bytes) = (gbh.num_groups(), gbh.heap_bytes());
+                // probe rows: [admitted[2], unknown, admitted[1], admitted[0], admitted[2]]
+                let found = gbh.lookup_group_ids(probe).unwrap();
+                assert_eq!(
+                    found,
+                    vec![Some(ids[2]), None, Some(ids[1]), Some(ids[0]), Some(ids[2])],
+                    "{:?}",
+                    admitted[0].data_type()
+                );
+                assert_eq!(gbh.num_groups(), groups);
+                assert_eq!(gbh.heap_bytes(), bytes);
+            }
+        }
     }
 }

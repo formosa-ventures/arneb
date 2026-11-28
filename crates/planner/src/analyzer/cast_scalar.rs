@@ -74,6 +74,37 @@ pub fn cast_scalar(value: &ScalarValue, target: &DataType) -> Result<ScalarValue
             values,
         });
     }
+    let cast = cast_to_array(value, target)?;
+    array_element_to_scalar(&cast, 0, target).map_err(|e| PlanError::InvalidLiteral {
+        message: format!("cannot extract cast result for {value} as {target}: {e}"),
+        location: None,
+    })
+}
+
+/// Whether [`cast_scalar`] can produce a literal of type `target`.
+/// `SMALLINT`, `TINYINT` and `Decimal64` have no [`ScalarValue`] of their
+/// own, so a cast to them stays a cast (checked by [`check_cast`]).
+pub fn folds_to_scalar(target: &DataType) -> bool {
+    !matches!(
+        target,
+        DataType::Int8 | DataType::Int16 | DataType::Decimal64 { .. }
+    )
+}
+
+/// Checks that `value` casts to `target` without producing it, so a cast
+/// the planner cannot fold (see [`folds_to_scalar`]) still fails at plan
+/// time when the literal does not fit, as a folded one would.
+pub fn check_cast(value: &ScalarValue, target: &DataType) -> Result<(), PlanError> {
+    if &value.data_type() == target || matches!(value, ScalarValue::Null) {
+        return Ok(());
+    }
+    cast_to_array(value, target).map(|_| ())
+}
+
+/// Strict (`safe: false`) Arrow cast of a literal to a one-element array,
+/// so parse failures and out-of-range values become errors rather than
+/// silent nulls.
+fn cast_to_array(value: &ScalarValue, target: &DataType) -> Result<ArrayRef, PlanError> {
     let source_array =
         scalar_to_single_element_array(value).map_err(|e| PlanError::InvalidLiteral {
             message: format!("cannot build array for literal {value}: {e}"),
@@ -84,7 +115,7 @@ pub fn cast_scalar(value: &ScalarValue, target: &DataType) -> Result<ScalarValue
         safe: false,
         ..Default::default()
     };
-    let cast = cast_fractional_to_integer(&source_array, &target_arrow, &options)
+    cast_fractional_to_integer(&source_array, &target_arrow, &options)
         .and_then(|result| match result {
             Some(result) => Ok(result),
             None => cast_with_options(&source_array, &target_arrow, &options),
@@ -92,11 +123,7 @@ pub fn cast_scalar(value: &ScalarValue, target: &DataType) -> Result<ScalarValue
         .map_err(|e| PlanError::InvalidLiteral {
             message: format!("cannot cast literal {value} to {target}: {e}"),
             location: None,
-        })?;
-    array_element_to_scalar(&cast, 0, target).map_err(|e| PlanError::InvalidLiteral {
-        message: format!("cannot extract cast result for {value} as {target}: {e}"),
-        location: None,
-    })
+        })
 }
 
 /// Build a single-element Arrow array from a `ScalarValue`. Mirror
@@ -385,5 +412,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PlanError::InvalidLiteral { .. }));
+    }
+
+    #[test]
+    fn narrow_integer_targets_do_not_fold_but_are_checked() {
+        for target in [DataType::Int8, DataType::Int16] {
+            assert!(!folds_to_scalar(&target));
+            assert!(check_cast(&ScalarValue::Int64(5), &target).is_ok());
+            assert!(check_cast(&ScalarValue::Null, &target).is_ok());
+        }
+        assert!(matches!(
+            check_cast(&ScalarValue::Int64(70_000), &DataType::Int16),
+            Err(PlanError::InvalidLiteral { .. })
+        ));
+        assert!(matches!(
+            check_cast(&ScalarValue::Int64(300), &DataType::Int8),
+            Err(PlanError::InvalidLiteral { .. })
+        ));
+        assert!(matches!(
+            check_cast(&ScalarValue::Utf8("x".into()), &DataType::Int16),
+            Err(PlanError::InvalidLiteral { .. })
+        ));
+        assert!(folds_to_scalar(&DataType::Int32));
     }
 }

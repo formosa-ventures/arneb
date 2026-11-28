@@ -1,6 +1,6 @@
 # File Connector
 
-The file connector reads CSV and Parquet files from the local filesystem.
+The file connector reads CSV and Parquet files from the local filesystem or an object store (`s3://`, `gs://`, `az://`; see [Object Storage](/connectors/object-store)).
 
 ## Parquet Files
 
@@ -25,9 +25,23 @@ format = "parquet"
 
 Parquet files support all pushdown optimizations:
 
-- **Filter pushdown** — row group pruning based on column statistics
-- **Projection pushdown** — only requested columns are read from the file
-- **Limit pushdown** — stops reading after the required number of rows
+- **Filter pushdown**: row groups whose column statistics rule out a filter are skipped, and the remaining rows are filtered as they are decoded. This covers comparisons of a column with a literal, `IN` lists of literals, and the key sets a join learns at run time (dynamic filters). A filter on a column after a struct or map column is matched to the right leaf column. Filters still run above the scan as well, so a filter the reader cannot apply never changes the result.
+- **Projection pushdown**: only requested columns are read from the file.
+- **Limit pushdown**: stops reading after the required number of rows.
+
+### Parallel Reads
+
+A Parquet file is read as several splits, so one file can use every core
+of a node and, in a cluster, every worker:
+
+- The split count is the scan parallelism of the node that plans the query
+  (its core count), capped so that each split covers at least 100,000
+  rows. A smaller file, or one whose row count is unknown, is one split.
+- When the file has at least as many row groups as splits, each split reads
+  whole row groups, so no row group is read twice. Otherwise the file is cut
+  into equal row ranges.
+- Each split reserves memory for the largest row group it reads, not for
+  the whole file.
 
 ### Example
 

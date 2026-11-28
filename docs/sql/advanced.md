@@ -190,6 +190,22 @@ EXCEPT
 SELECT customer_id FROM orders_2024;
 ```
 
+The column types of the two inputs are unified (for example `INTEGER` and
+`DECIMAL(2, 1)` become a `DECIMAL`), and a query over a set operation in a
+subquery sees the unified type.
+
+### VALUES
+
+`VALUES` builds rows from literal expressions, as a query of its own or in
+`FROM`. Its columns are named `_col0`, `_col1`, ... as in Trino; rename them
+with a table alias. The rows get a common column type the way `UNION ALL`
+inputs do, and every row must have the same number of columns.
+
+```sql
+SELECT id, name FROM (VALUES (1, 'a'), (2, 'b')) AS v(id, name);
+VALUES (1), (2);
+```
+
 ## GROUP BY with HAVING
 
 `HAVING` filters groups after aggregation, unlike `WHERE` which filters rows before aggregation.

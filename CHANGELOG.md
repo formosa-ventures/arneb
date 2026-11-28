@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.2.3](https://github.com/formosa-ventures/arneb/compare/v0.2.2...v0.2.3) (2026-11-27)
+
+
+### Features
+
+* **postgresql:** push down single-table aggregates ([#319](https://github.com/formosa-ventures/arneb/issues/319)) ([9808b3a](https://github.com/formosa-ventures/arneb/commit/9808b3a33cf6bceb6afc3858c836b10b759ad979))
+* **protocol:** G6 stage 2b-2 — Metabase over pgwire ([#277](https://github.com/formosa-ventures/arneb/issues/277)) ([f0b6380](https://github.com/formosa-ventures/arneb/commit/f0b63809e2a77ef1cb12e574826b07dbfdc746e7))
+* **protocol:** SQLAlchemy reflection over pgwire (G6 2b-1, part 2/2) ([#276](https://github.com/formosa-ventures/arneb/issues/276)) ([08bef06](https://github.com/formosa-ventures/arneb/commit/08bef069d66d70cc36ee290d032fb8b2744392ec))
+
+
+### Bug Fixes
+
+* account percentile state in the memory pool; privilege checks without a session user ([#310](https://github.com/formosa-ventures/arneb/issues/310)) ([d62677b](https://github.com/formosa-ventures/arneb/commit/d62677be3f97829685051e030f1a42f0a2430403))
+* **cluster:** run the root stage's heavy work on a worker, not the coordinator ([#306](https://github.com/formosa-ventures/arneb/issues/306)) ([e576180](https://github.com/formosa-ventures/arneb/commit/e576180ff3d88e746d4c59a60ff1a06d0a15d665))
+* **cluster:** serve Flight on its own control runtime ([#294](https://github.com/formosa-ventures/arneb/issues/294)) ([f8dfe85](https://github.com/formosa-ventures/arneb/commit/f8dfe85af5835e3fc87ebaa449b8566d665fbfda))
+* **execution:** reserve DISTINCT aggregate state against the memory pool ([#285](https://github.com/formosa-ventures/arneb/issues/285)) ([d4eba42](https://github.com/formosa-ventures/arneb/commit/d4eba42e3bcbfac3b876346ff35a554044c61a59))
+* **protocol:** bind Extended Query parameters in a single tokenizer pass ([#284](https://github.com/formosa-ventures/arneb/issues/284)) ([10ad168](https://github.com/formosa-ventures/arneb/commit/10ad168e73f5c144ecc91cc6f0a19c01acbe57f8))
+* **sql:** strict run-time casts, SMALLINT/TINYINT literals, FROM (VALUES) ([#286](https://github.com/formosa-ventures/arneb/issues/286)) ([24c8398](https://github.com/formosa-ventures/arneb/commit/24c839818ddffda61b990e1cfc36fe735248ba8a))
+
+
+### Performance Improvements
+
+* **connectors:** prune and push filters into registered Parquet files ([#296](https://github.com/formosa-ventures/arneb/issues/296)) ([7771909](https://github.com/formosa-ventures/arneb/commit/77719097443f7ec6cdf5600ee6384c66a2bce617))
+* **connectors:** split a Parquet file by whole row groups when it has enough ([#311](https://github.com/formosa-ventures/arneb/issues/311)) ([78376f7](https://github.com/formosa-ventures/arneb/commit/78376f78f0004ec113ad0fc2b8b9977c37b73db5))
+* **connectors:** split a single Parquet file into row-range partitions ([#291](https://github.com/formosa-ventures/arneb/issues/291)) ([febd9f4](https://github.com/formosa-ventures/arneb/commit/febd9f4260db2cbb5424a5e95f3e1b1e48333535))
+
 ## [0.2.2](https://github.com/formosa-ventures/arneb/compare/v0.2.1...v0.2.2) (2026-11-23)
 
 

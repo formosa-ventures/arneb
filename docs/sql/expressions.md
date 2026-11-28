@@ -173,6 +173,28 @@ target type is an error, for example `CAST(2147483647.5e0 AS INTEGER)` or
 `CAST(DECIMAL '9223372036854775807.5' AS BIGINT)`; wrap the cast in [`TRY`](/sql/functions#try) to get
 `NULL` instead.
 
+Any cast the target type cannot hold is an error, whether the value is a
+literal or comes from a column: an integer out of range
+(`CAST(3000000000 AS INTEGER)`, `CAST(70000 AS SMALLINT)`), a string that is
+not a number or date (`CAST('abc' AS INTEGER)`, `CAST('1998-13-45' AS DATE)`),
+or NaN and infinity cast to an integer. `TRY(CAST(...))`, or its shorthand
+`TRY_CAST(x AS type)`, returns `NULL` for just the rows that fail.
+
+A cast is evaluated only on the rows the result depends on, where Arneb can
+tell which those are: the right side of `AND` / `OR` sees only the rows the
+left side leaves open, and a `CASE` branch or later `COALESCE` argument only
+the rows that reach it. In a `WHERE` over a single table, a conjunct that can
+fail on a row (a cast, function call or arithmetic over a column) runs after
+the conjuncts written before it, so
+`WHERE s <> 'n/a' AND CAST(s AS INTEGER) > 0` never casts `'n/a'`.
+
+This is not a promise about evaluation order. Trino documents none, and
+Arneb can still run a guard after the cast it guards: a conjunct that stays
+above a join (one on the outer side of an outer join, one over both sides, or
+a subquery) runs after a later conjunct pushed below the join, and a cast
+common to every branch of an `OR` is lifted out of the `OR` and runs on its
+own. Where the order matters, put the guard in a `CASE`, or use `TRY_CAST`.
+
 ## BETWEEN
 
 Test whether a value falls within a range (inclusive).

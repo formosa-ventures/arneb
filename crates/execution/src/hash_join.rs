@@ -2061,6 +2061,17 @@ impl ExecutionPlan for HashJoinExec {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static BUILD_ROW_BITMAPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn build_row_bitmap(rows: usize) -> Vec<bool> {
+    #[cfg(test)]
+    BUILD_ROW_BITMAPS.with(|count| count.set(count.get() + 1));
+    vec![false; rows]
+}
+
 impl HashJoinExec {
     fn join_type_label(&self) -> &'static str {
         match self.join_type {
@@ -2100,6 +2111,10 @@ impl HashJoinExec {
         let probe_exec = Arc::new(self.probe_driver());
 
         let inner = async_stream::try_stream! {
+            let mut right_matched = build_row_bitmap(right_batch.num_rows());
+            let mut pending = Vec::new();
+            let mut pending_rows = 0;
+            let mut emitted = false;
             while let Some(batch_res) = left_stream.next().await {
                 let left_batch = batch_res.map_err(|e| {
                     ExecutionError::upstream("hash join streaming probe left stream", e)
@@ -2107,8 +2122,36 @@ impl HashJoinExec {
                 if left_batch.num_rows() == 0 {
                     continue;
                 }
-                for out in probe_exec.probe(&left_batch, &right_batch, &hash_map)? {
-                    yield out;
+                if dict_probe_build_enabled() && matches!(probe_exec.join_type, ast::JoinType::Inner) {
+                    for out in probe_exec.probe_with_bitmap(
+                        &left_batch, &right_batch, &hash_map, true, &mut right_matched,
+                    )? {
+                        yield out;
+                    }
+                    continue;
+                }
+                let schema = probe_exec.build_output_schema(&left_batch, &right_batch);
+                for out in probe_one_left_batch(
+                    &left_batch, &right_batch, &hash_map, &probe_exec.left_keys,
+                    &probe_exec.right_keys, probe_exec.residual.as_ref(), probe_exec.join_type,
+                    &schema, &mut right_matched,
+                )? {
+                    pending_rows += out.num_rows();
+                    pending.push(out);
+                }
+                // Deliver the first match before waiting for another probe batch.
+                if (!emitted && pending_rows > 0) || pending_rows >= STREAMING_OUTPUT_TARGET_ROWS {
+                    for merged in flush_join_pending(&mut pending, &schema)? {
+                        yield merged;
+                    }
+                    emitted = true;
+                    pending_rows = 0;
+                }
+            }
+            if let Some(last) = pending.last() {
+                let schema = last.schema();
+                for merged in flush_join_pending(&mut pending, &schema)? {
+                    yield merged;
                 }
             }
         };
@@ -2267,7 +2310,9 @@ impl HashJoinExec {
         // Each join partition builds from one slice of the keys, so none of
         // them has the whole domain to publish cross-fragment (#192). Every
         // partition of the task reports under the same index and only the
-        // first report counts, so partition 0 publishes for all of them.
+        // first report counts, so partition 0 publishes `All` for all of
+        // them. This is the only cross-fragment publish on the per-partition
+        // path: its build paths below never publish a slice.
         if partition == 0 {
             self.publish_all_cross_fragment_dfs();
         }
@@ -2366,12 +2411,6 @@ impl HashJoinExec {
                     Some(compute::concat_batches(&rs, batches.iter())?)
                 };
 
-                // A1.7 (2026-05-27): non-Grace per-partition build
-                // path. Publish cross-fragment DFs here before probe
-                // runs so probe-side scans on the downstream stage
-                // can apply the filter.
-                self.emit_cross_fragment_dfs(right_combined.as_ref());
-
                 let left_combined = if left_batches.is_empty() {
                     None
                 } else if left_batches.len() == 1 {
@@ -2439,11 +2478,6 @@ impl HashJoinExec {
                 right_batches.iter(),
             )?)
         };
-
-        // A1.7 (2026-05-27): non-Grace per-partition no-spill build
-        // path (residual / LEFT joins). Publish before probe so the
-        // downstream consumer scan can apply the filter.
-        self.emit_cross_fragment_dfs(right_combined.as_ref());
 
         let left_stream = self.left.execute(partition).await?;
         let left_batches = collect_stream(left_stream).await.map_err(|e| {
@@ -3432,10 +3466,10 @@ impl HashJoinExec {
 
     /// A1.7 (2026-05-27): publish a cross-fragment Domain to the
     /// coordinator for each declared `DynamicFilterProducer` from
-    /// the build side of this partition. Called from every build
-    /// path (build_state_inner, execute_per_partition's `Single`
-    /// arm, execute_per_partition_no_spill, execute_single_finish,
-    /// execute_single_no_spill). Gated on the feature flag +
+    /// the build side of this partition. Called from the shared-build
+    /// paths (build_state_inner, execute_single_finish,
+    /// execute_single_no_spill); the copartitioned per-partition path
+    /// publishes `All` instead. Gated on the feature flag +
     /// publisher presence + left_filterable + `ARNEB_DISABLE_DF`
     /// kill-switch.
     ///
@@ -3445,20 +3479,29 @@ impl HashJoinExec {
     /// time out on an empty-result query).
     /// True when `emit_cross_fragment_dfs` will publish this join's filters.
     fn publishes_cross_fragment_dfs(&self) -> bool {
-        self.dynamic_filtering_enabled
-            && !self.is_hash_copartitioned()
-            && matches!(self.join_type, ast::JoinType::Inner | ast::JoinType::Right)
-            && std::env::var_os("ARNEB_DISABLE_DF").is_none()
-            && !self.dynamic_filter_producers.is_empty()
+        matches!(self.join_type, ast::JoinType::Inner | ast::JoinType::Right)
             && broadcast_df_enabled()
-            && self.dynamic_filter_publisher.is_some()
+            && self.df_publisher().is_some()
+    }
+
+    /// The cross-fragment publisher, when this join has filters to publish:
+    /// dynamic filtering is on, `ARNEB_DISABLE_DF` is unset, the plan gave
+    /// it producers and the task wired a publisher.
+    fn df_publisher(&self) -> Option<&crate::DynamicFilterPublisherRef> {
+        if !self.dynamic_filtering_enabled
+            || self.dynamic_filter_producers.is_empty()
+            || std::env::var_os("ARNEB_DISABLE_DF").is_some()
+        {
+            return None;
+        }
+        self.dynamic_filter_publisher.as_ref()
     }
 
     fn emit_cross_fragment_dfs(&self, right_combined: Option<&RecordBatch>) {
         if !self.publishes_cross_fragment_dfs() {
             return;
         }
-        let Some(publisher) = &self.dynamic_filter_publisher else {
+        let Some(publisher) = self.df_publisher() else {
             return;
         };
         let domains: Vec<(arneb_common::DynamicFilterId, arneb_common::Domain)> =
@@ -3933,15 +3976,7 @@ impl HashJoinExec {
     /// fragment InList path uses. Each producer's `build_index` is
     /// looked up in `right_keys` to find the matching collector slot.
     fn publish_grace_cross_fragment_dfs(&self, domains_per_slot: &[arneb_common::Domain]) {
-        let df_disabled = std::env::var_os("ARNEB_DISABLE_DF").is_some();
-        if !self.dynamic_filtering_enabled
-            || self.is_hash_copartitioned()
-            || df_disabled
-            || self.dynamic_filter_producers.is_empty()
-        {
-            return;
-        }
-        let Some(publisher) = &self.dynamic_filter_publisher else {
+        let Some(publisher) = self.df_publisher() else {
             return;
         };
         let mut domains: Vec<(arneb_common::DynamicFilterId, arneb_common::Domain)> =
@@ -3985,16 +4020,9 @@ impl HashJoinExec {
     /// partition index. The coordinator resolves a filter once each task has
     /// reported, so a partial slice would become the whole filter and the
     /// probe-side scans would drop rows. The per-partition path publishes
-    /// this instead, and the slice-publishing paths skip copartitioned joins.
+    /// this instead, and never reaches the slice-publishing helpers.
     fn publish_all_cross_fragment_dfs(&self) {
-        let df_disabled = std::env::var_os("ARNEB_DISABLE_DF").is_some();
-        if !self.dynamic_filtering_enabled
-            || df_disabled
-            || self.dynamic_filter_producers.is_empty()
-        {
-            return;
-        }
-        let Some(publisher) = &self.dynamic_filter_publisher else {
+        let Some(publisher) = self.df_publisher() else {
             return;
         };
         let publisher = publisher.clone();
@@ -4011,15 +4039,10 @@ impl HashJoinExec {
         probe_partition: u32,
         right_combined: &RecordBatch,
     ) {
-        let df_disabled = std::env::var_os("ARNEB_DISABLE_DF").is_some();
-        if !self.dynamic_filtering_enabled
-            || df_disabled
-            || self.dynamic_filter_producers.is_empty()
-            || !broadcast_df_enabled()
-        {
+        if !broadcast_df_enabled() {
             return;
         }
-        let Some(publisher) = &self.dynamic_filter_publisher else {
+        let Some(publisher) = self.df_publisher() else {
             return;
         };
         let task_idx = publisher.task_partition_idx();
@@ -4166,17 +4189,15 @@ impl HashJoinExec {
         // contract).
         let left_filterable = matches!(self.join_type, ast::JoinType::Inner | ast::JoinType::Right);
         let df_disabled = std::env::var_os("ARNEB_DISABLE_DF").is_some();
-        if left_filterable && !df_disabled && !df_collectors.is_empty() {
-            match probe_df {
-                ProbeDfInjection::Inject => {
-                    self.inject_grace_dynamic_filters(df_collectors, true);
-                }
-                // A copartitioned build publishes nothing cross-fragment:
-                // `publish_grace_cross_fragment_dfs` returns early for it.
-                ProbeDfInjection::Skip => {}
+        // A copartitioned build (`Skip`) holds one slice of the keys: it
+        // injects nothing into the shared probe subtree and publishes nothing
+        // cross-fragment (`execute_per_partition` already published `All`).
+        if left_filterable && !df_disabled && matches!(probe_df, ProbeDfInjection::Inject) {
+            if df_collectors.is_empty() {
+                self.publish_grace_cross_fragment_dfs(&[]);
+            } else {
+                self.inject_grace_dynamic_filters(df_collectors, true);
             }
-        } else if left_filterable && !df_disabled {
-            self.publish_grace_cross_fragment_dfs(&[]);
         }
 
         match build_result {
@@ -4566,7 +4587,7 @@ impl HashJoinExec {
                 tokio::task::spawn_blocking(move || -> Result<Vec<RecordBatch>, ExecutionError> {
                     // INNER/LEFT don't consult `right_matched`
                     // cross-batch — local throwaway per chunk.
-                    let mut right_matched = vec![false; n_right];
+                    let mut right_matched = build_row_bitmap(n_right);
                     let mut out = Vec::new();
                     for b in &chunk {
                         if b.num_rows() == 0 {
@@ -4734,7 +4755,7 @@ impl HashJoinExec {
             let mut probe_input_rows: u64 = 0;
             let mut output_rows: u64 = 0;
             let mut output_batches: u64 = 0;
-            let mut right_matched: Vec<bool> = vec![false; right_batch.num_rows()];
+            let mut right_matched = build_row_bitmap(right_batch.num_rows());
             let mut pending: Vec<RecordBatch> = Vec::new();
             let mut pending_rows: usize = 0;
 
@@ -4853,7 +4874,7 @@ impl HashJoinExec {
             let mut output_rows: u64 = 0;
             let mut output_batches: u64 = 0;
             // INNER/LEFT never read `right_matched` cross-batch — throwaway.
-            let mut right_matched: Vec<bool> = vec![false; right_rows as usize];
+            let mut right_matched = build_row_bitmap(right_rows as usize);
             let mut pending: Vec<RecordBatch> = Vec::new();
             let mut pending_rows: usize = 0;
 
@@ -5051,8 +5072,25 @@ impl HashJoinExec {
         hash_map: &JoinHashMap,
         dict_probe_build: bool,
     ) -> Result<Vec<RecordBatch>, ExecutionError> {
+        let mut right_matched = build_row_bitmap(right_batch.num_rows());
+        self.probe_with_bitmap(
+            left_batch,
+            right_batch,
+            hash_map,
+            dict_probe_build,
+            &mut right_matched,
+        )
+    }
+
+    fn probe_with_bitmap(
+        &self,
+        left_batch: &RecordBatch,
+        right_batch: &RecordBatch,
+        hash_map: &JoinHashMap,
+        dict_probe_build: bool,
+        right_matched: &mut [bool],
+    ) -> Result<Vec<RecordBatch>, ExecutionError> {
         let left_rows = left_batch.num_rows();
-        let right_rows = right_batch.num_rows();
 
         let output_schema = self.build_output_schema(left_batch, right_batch);
 
@@ -5106,7 +5144,6 @@ impl HashJoinExec {
         };
 
         let mut left_matched = vec![false; left_rows];
-        let mut right_matched = vec![false; right_rows];
         for &l in &left_indices {
             left_matched[l as usize] = true;
         }
@@ -5636,13 +5673,15 @@ fn probe_prefetch_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// Stream the shared Single-build probe side batch-by-batch. Default off;
-/// enabled with `ARNEB_STREAM_HASH_PROBE=1`.
+/// Stream the shared Single-build probe side batch-by-batch by default.
+/// Set `ARNEB_STREAM_HASH_PROBE` to `0` or an empty string to collect the whole probe side.
 #[cfg(not(test))]
 fn stream_hash_probe_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let enabled = std::env::var("ARNEB_STREAM_HASH_PROBE").is_ok_and(|v| v == "1");
+        let enabled = std::env::var("ARNEB_STREAM_HASH_PROBE")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
         tracing::info!(
             target: "arneb::config",
             knob = "ARNEB_STREAM_HASH_PROBE",
@@ -5655,7 +5694,9 @@ fn stream_hash_probe_enabled() -> bool {
 
 #[cfg(test)]
 fn stream_hash_probe_enabled() -> bool {
-    std::env::var("ARNEB_STREAM_HASH_PROBE").is_ok_and(|v| v == "1")
+    std::env::var("ARNEB_STREAM_HASH_PROBE")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(true)
 }
 
 /// Broadcast/single-build cross-fragment dynamic-filter publishing gate.
@@ -6991,7 +7032,7 @@ mod tests {
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,
     ) {
-        std::env::remove_var("ARNEB_STREAM_HASH_PROBE");
+        std::env::set_var("ARNEB_STREAM_HASH_PROBE", "0");
         let collect_join =
             hash_join_for_stream_probe_equivalence(Arc::clone(&left), Arc::clone(&right));
         let collect_batches = collect_stream(collect_join.execute(0).await.expect("execute off"))
@@ -7030,6 +7071,178 @@ mod tests {
         let _g = env_test_guard().await;
         let left = partitioned_left_source(vec![vec![vec![1, 2], vec![3, 4]], vec![vec![5]]]);
         run_stream_probe_equivalence_case(left, empty_right_source()).await;
+    }
+
+    /// The streaming probe of a shared Single build must not redo
+    /// O(build rows) work for every probe batch. Inner and Left joins never
+    /// read the matched-build-rows bitmap across batches, so at most one
+    /// bitmap sized to the build side may be allocated for the whole stream,
+    /// however many probe batches arrive. `BUILD_ROW_BITMAPS` counts, on
+    /// this thread, every allocation of state with one entry per build row
+    /// made while probing.
+    #[tokio::test]
+    async fn stream_probe_allocates_build_sized_state_once_per_stream() {
+        let _g = env_test_guard().await;
+        std::env::set_var("ARNEB_STREAM_HASH_PROBE", "1");
+        let build: Vec<i32> = (0..50_000).collect();
+        let probe_batches: Vec<Vec<i32>> = (0..40).map(|b| vec![b * 7, b * 7 + 1, -1]).collect();
+        for join_type in [ast::JoinType::Inner, ast::JoinType::Left] {
+            let mut join = hash_join_for_stream_probe_equivalence(
+                partitioned_left_source(vec![probe_batches.clone(), vec![vec![3]]]),
+                right_source_multi_batch(vec![build.clone()]),
+            );
+            join.join_type = join_type;
+            super::BUILD_ROW_BITMAPS.with(|c| c.set(0));
+            let batches = collect_stream(join.execute(0).await.expect("execute"))
+                .await
+                .expect("collect");
+            let allocations = super::BUILD_ROW_BITMAPS.with(|c| c.get());
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let expected = match join_type {
+                ast::JoinType::Inner => 80,
+                _ => 120,
+            };
+            assert_eq!(rows, expected, "{join_type:?} output rows");
+            assert!(
+                allocations == 1,
+                "{join_type:?}: {allocations} build-sized bitmaps for 40 probe batches"
+            );
+        }
+        std::env::remove_var("ARNEB_STREAM_HASH_PROBE");
+    }
+
+    mod stream_probe_default {
+        //! By default the shared Single-build probe streams: the join returns
+        //! output for a probe batch before its probe side has ended.
+        //! `ARNEB_STREAM_HASH_PROBE=0` turns that off again.
+
+        use super::*;
+
+        /// Probe partition 0 yields one batch (key 2, which matches the build
+        /// side), waits 200 ms, sets `ended` and ends; partition 1 ends
+        /// normally. A streaming join returns that batch's output before
+        /// `ended` is set; a join that collects its probe side first returns
+        /// it only after.
+        #[derive(Debug)]
+        struct SlowEndingProbeSource {
+            schema: Vec<ColumnInfo>,
+            ended: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        #[async_trait]
+        impl DataSource for SlowEndingProbeSource {
+            fn schema(&self) -> Vec<ColumnInfo> {
+                self.schema.clone()
+            }
+
+            fn partition_count(&self) -> usize {
+                2
+            }
+
+            async fn scan(
+                &self,
+                _ctx: &ScanContext,
+                partition: usize,
+            ) -> Result<SendableRecordBatchStream, ExecutionError> {
+                let schema = column_info_to_arrow_schema(&self.schema);
+                let batch =
+                    RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![2]))])
+                        .unwrap();
+                let first = futures::stream::iter(vec![Ok(batch)]);
+                let ended = Arc::clone(&self.ended);
+                let slow_end = futures::stream::once(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    ended.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+                .filter_map(|()| async { None });
+                let inner: std::pin::Pin<
+                    Box<dyn futures::Stream<Item = Result<RecordBatch, ExecutionError>> + Send>,
+                > = if partition == 0 {
+                    Box::pin(first.chain(slow_end))
+                } else {
+                    Box::pin(first)
+                };
+                Ok(Box::pin(AsyncBatchStream { schema, inner }))
+            }
+        }
+
+        fn slow_ending_left(ended: Arc<std::sync::atomic::AtomicBool>) -> Arc<dyn ExecutionPlan> {
+            Arc::new(ScanExec {
+                source: Arc::new(SlowEndingProbeSource {
+                    schema: vec![ColumnInfo {
+                        name: "id".into(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    }],
+                    ended,
+                }),
+                _table_name: "left_slow_ending".into(),
+                scan_context: ScanContext::default(),
+                dynamic_filters: Default::default(),
+                dynamic_filters_consumed: Vec::new(),
+                dynamic_filter_collector: None,
+                dynamic_filtering_enabled: false,
+                dynamic_filtering_wait_timeout: std::time::Duration::from_secs(10),
+                scan_task_index: 0,
+                scan_task_count: 1,
+            })
+        }
+
+        /// Runs probe partition 0 and reports whether its first output batch
+        /// (one row) arrived before the probe side ended.
+        fn first_output_before_probe_end(setting: Option<&'static str>) -> bool {
+            let _g = ENV_TEST_LOCK.blocking_lock();
+            match setting {
+                Some(value) => std::env::set_var("ARNEB_STREAM_HASH_PROBE", value),
+                None => std::env::remove_var("ARNEB_STREAM_HASH_PROBE"),
+            }
+            let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let before_end = runtime.block_on(async {
+                let join = hash_join_for_stream_probe_equivalence(
+                    slow_ending_left(Arc::clone(&ended)),
+                    right_source(),
+                );
+                let mut stream = join.execute(0).await.expect("execute");
+                while let Some(batch) = stream.next().await {
+                    let batch = batch.expect("batch");
+                    if batch.num_rows() > 0 {
+                        assert_eq!(batch.num_rows(), 1);
+                        return !ended.load(std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                panic!("the join returned no rows");
+            });
+            std::env::remove_var("ARNEB_STREAM_HASH_PROBE");
+            before_end
+        }
+
+        #[test]
+        fn streams_by_default() {
+            assert!(first_output_before_probe_end(None));
+        }
+
+        #[test]
+        fn streams_when_set_to_one() {
+            assert!(first_output_before_probe_end(Some("1")));
+        }
+
+        #[test]
+        fn zero_turns_streaming_off() {
+            // A join that collects its probe side first returns output only
+            // once that side has ended.
+            assert!(!first_output_before_probe_end(Some("0")));
+        }
+
+        #[test]
+        fn an_empty_value_turns_streaming_off() {
+            // Like the other default-on knobs (`ARNEB_PROBE_PREFETCH`), a set
+            // but empty value disables it.
+            assert!(!first_output_before_probe_end(Some("")));
+        }
     }
 
     #[tokio::test]

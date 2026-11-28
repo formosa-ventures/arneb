@@ -77,6 +77,14 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      # The PostgreSQL connector's live tests skip themselves unless this
+      # database is up (fixture: docker/postgres/init). Linux only: the
+      # macOS runners have no Docker.
+      - name: Start PostgreSQL
+        if: runner.os == 'Linux'
+        run: |
+          docker compose up -d --wait postgres
+          echo "ARNEB_TEST_POSTGRES_URL=postgresql://arneb:arneb@127.0.0.1:5433/arneb" >> "$GITHUB_ENV"
       - run: cargo nextest run
       - run: cargo test --doc
 

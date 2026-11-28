@@ -194,6 +194,16 @@ impl Drop for SpillLimitsOverride {
     }
 }
 
+/// Refuse every spill write on this thread until the guard drops, so a
+/// test can assert that an operator did not spill.
+#[cfg(test)]
+pub(crate) fn forbid_spill_writes_for_test() -> impl Drop {
+    override_spill_limits(SpillLimits {
+        min_free_bytes: 0,
+        max_bytes: Some(0),
+    })
+}
+
 /// Override this thread's spill limits until the guard drops.
 #[cfg(test)]
 fn override_spill_limits(limits: SpillLimits) -> SpillLimitsOverride {

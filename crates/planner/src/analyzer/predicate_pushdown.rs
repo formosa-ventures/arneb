@@ -30,8 +30,8 @@
 use std::collections::HashSet;
 
 use arneb_common::error::PlanError;
-use arneb_common::types::ColumnInfo;
 use arneb_common::types::ScalarValue;
+use arneb_common::types::{ColumnInfo, DataType};
 use arneb_sql_parser::ast::{BinaryOp, JoinType};
 
 use crate::analyzer::{AnalysisPass, AnalyzerContext};
@@ -504,6 +504,27 @@ fn try_push_into(
                 )),
             }
         }
+        // A stack of filters already on the scan holds earlier conjuncts (or
+        // an inner query's WHERE). A new conjunct that can fail on some row
+        // goes above the whole stack, not between it and the scan, so it
+        // runs after every conjunct already placed there: a guard such as
+        // `s <> 'n/a' AND CAST(s AS INTEGER) > 0` filters the rows before
+        // the cast sees them. A conjunct that cannot fail still goes below,
+        // where it was always placed. Filters do not change the schema, so
+        // the conjunct resolves against the scan's.
+        L::Filter { input, predicate }
+            if scan_under_filters(&input).is_some_and(|schema| {
+                rewrite_against(&conjunct, schema)
+                    .is_some_and(|resolved| can_fail_on_a_row(&resolved, schema))
+            }) =>
+        {
+            let schema = scan_under_filters(&input).expect("guarded by the match arm");
+            let resolved = rewrite_against(&conjunct, schema).expect("guarded by the match arm");
+            Ok(L::Filter {
+                input: Box::new(L::Filter { input, predicate }),
+                predicate: resolved,
+            })
+        }
         L::Filter { input, predicate } => match try_push_into(*input, conjunct) {
             Ok(p) => Ok(L::Filter {
                 input: Box::new(p),
@@ -767,6 +788,160 @@ fn constant_nullness(expr: &PlanExpr) -> Option<bool> {
     match expr {
         PlanExpr::Literal { value, .. } => Some(matches!(value, ScalarValue::Null)),
         PlanExpr::Cast { expr, .. } if constant_nullness(expr) == Some(true) => Some(true),
+        _ => None,
+    }
+}
+
+/// Whether evaluating `expr` over rows of `schema` can raise an error that
+/// depends on the row: a narrowing or parsing cast, a function call or
+/// arithmetic over a column. Such a conjunct must not run ahead of a guard
+/// written before it. A cast of a literal does not count (it fails for
+/// every row or none), nor does a widening cast, nor a scalar subquery
+/// (evaluated once, before the filter).
+fn can_fail_on_a_row(expr: &PlanExpr, schema: &[ColumnInfo]) -> bool {
+    use PlanExpr as E;
+    let fails = |e: &PlanExpr| can_fail_on_a_row(e, schema);
+    match expr {
+        E::Column { .. }
+        | E::Literal { .. }
+        | E::Parameter { .. }
+        | E::Wildcard
+        | E::ScalarSubquery { .. } => false,
+        E::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            let lossless =
+                static_type(inner, schema).is_some_and(|from| cast_cannot_fail(&from, data_type));
+            (references_a_column(inner) && !lossless) || fails(inner)
+        }
+        E::Function { args, .. } => args.iter().any(references_a_column) || args.iter().any(fails),
+        E::BinaryOp {
+            left, op, right, ..
+        } => {
+            let arithmetic = matches!(
+                op,
+                BinaryOp::Plus
+                    | BinaryOp::Minus
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Modulo
+            );
+            (arithmetic && (references_a_column(left) || references_a_column(right)))
+                || fails(left)
+                || fails(right)
+        }
+        E::UnaryOp { expr, .. } | E::IsNull { expr, .. } | E::IsNotNull { expr, .. } => fails(expr),
+        E::Between {
+            expr, low, high, ..
+        } => fails(expr) || fails(low) || fails(high),
+        E::InList { expr, list, .. } => fails(expr) || list.iter().any(fails),
+        E::Array { elements, .. } => elements.iter().any(fails),
+        E::ArrayContains { expr, array, .. } => fails(expr) || fails(array),
+        // An index out of range is NULL and an unknown field a plan-time
+        // error, so only the operands can fail on a row.
+        E::ArrayElement(pair) => fails(&pair.0) || fails(&pair.1),
+        E::GetField(pair) => fails(&pair.0),
+        E::CaseExpr {
+            operand,
+            when_clauses,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(fails)
+                || when_clauses.iter().any(|(w, t)| fails(w) || fails(t))
+                || else_result.as_deref().is_some_and(fails)
+        }
+    }
+}
+
+fn static_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType> {
+    match expr {
+        PlanExpr::Column { index, .. } => schema.get(*index).map(|c| c.data_type.clone()),
+        PlanExpr::Cast { data_type, .. } => Some(data_type.clone()),
+        _ => None,
+    }
+}
+
+/// Whether every value of `from` has a value in `to`: the widening casts
+/// type coercion adds (INTEGER to BIGINT or DECIMAL, a wider DECIMAL) and
+/// any cast to a string.
+fn cast_cannot_fail(from: &DataType, to: &DataType) -> bool {
+    use DataType as T;
+    let int_digits = |t: &T| match t {
+        T::Int8 => Some(3),
+        T::Int16 => Some(5),
+        T::Int32 => Some(10),
+        T::Int64 => Some(19),
+        _ => None,
+    };
+    let decimal = |t: &T| match t {
+        T::Decimal128 { precision, scale } | T::Decimal64 { precision, scale } => {
+            Some((*precision as i32, *scale as i32))
+        }
+        _ => None,
+    };
+    if from == to || matches!(to, T::Utf8 | T::LargeUtf8) {
+        return true;
+    }
+    match (int_digits(from), int_digits(to)) {
+        (Some(f), Some(t)) => return f <= t,
+        (Some(_), None) if matches!(to, T::Float32 | T::Float64) => return true,
+        _ => {}
+    }
+    match (int_digits(from), decimal(from), decimal(to)) {
+        (Some(digits), _, Some((p, s))) => digits <= p - s,
+        (_, Some((fp, fs)), Some((tp, ts))) => ts >= fs && tp - ts >= fp - fs,
+        _ => false,
+    }
+}
+
+fn references_a_column(expr: &PlanExpr) -> bool {
+    use PlanExpr as E;
+    match expr {
+        E::Column { .. } => true,
+        E::Literal { .. } | E::Parameter { .. } | E::Wildcard => false,
+        E::ScalarSubquery { .. } => false,
+        E::Cast { expr, .. }
+        | E::UnaryOp { expr, .. }
+        | E::IsNull { expr, .. }
+        | E::IsNotNull { expr, .. } => references_a_column(expr),
+        E::BinaryOp { left, right, .. } => references_a_column(left) || references_a_column(right),
+        E::Function { args, .. } => args.iter().any(references_a_column),
+        E::Between {
+            expr, low, high, ..
+        } => references_a_column(expr) || references_a_column(low) || references_a_column(high),
+        E::InList { expr, list, .. } => {
+            references_a_column(expr) || list.iter().any(references_a_column)
+        }
+        E::Array { elements, .. } => elements.iter().any(references_a_column),
+        E::ArrayContains { expr, array, .. } => {
+            references_a_column(expr) || references_a_column(array)
+        }
+        E::ArrayElement(pair) => references_a_column(&pair.0) || references_a_column(&pair.1),
+        E::GetField(pair) => references_a_column(&pair.0),
+        E::CaseExpr {
+            operand,
+            when_clauses,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(references_a_column)
+                || when_clauses
+                    .iter()
+                    .any(|(w, t)| references_a_column(w) || references_a_column(t))
+                || else_result.as_deref().is_some_and(references_a_column)
+        }
+    }
+}
+
+/// The schema of the `TableScan` under `plan` when `plan` is that scan or a
+/// stack of `Filter`s over it.
+fn scan_under_filters(plan: &LogicalPlan) -> Option<&[ColumnInfo]> {
+    match plan {
+        LogicalPlan::TableScan { schema, .. } => Some(schema),
+        LogicalPlan::Filter { input, .. } => scan_under_filters(input),
         _ => None,
     }
 }
@@ -1639,6 +1814,63 @@ mod tests {
             properties: Default::default(),
             dynamic_filters_consumed: Vec::new(),
         }
+    }
+
+    /// A conjunct that can fail on a row (a narrowing cast) runs after the
+    /// guard written before it; a widening cast cannot fail and is still
+    /// pushed down to the scan.
+    #[test]
+    fn a_conjunct_that_can_fail_runs_after_the_guard_before_it() {
+        let cast = |data_type: DataType| PlanExpr::Cast {
+            expr: Box::new(col("b", 1)),
+            data_type,
+            span: None,
+        };
+        let guard = eq(col("a", 0), lit_i32(1));
+        let narrowing = eq(cast(DataType::Int8), lit_i32(1));
+        let widening = eq(cast(DataType::Int64), lit_i32(1));
+        let filter = LogicalPlan::Filter {
+            input: Box::new(scan("t", &["a", "b"])),
+            predicate: and(and(guard.clone(), narrowing.clone()), widening.clone()),
+        };
+        // Top-down: the filter that runs last comes first.
+        let mut order = Vec::new();
+        let mut node = push_down(filter);
+        while let LogicalPlan::Filter { input, predicate } = node {
+            order.push(predicate);
+            node = *input;
+        }
+        assert!(matches!(node, LogicalPlan::TableScan { .. }));
+        assert_eq!(order, vec![narrowing, guard, widening]);
+    }
+
+    /// With two guards already stacked on the scan, the failing conjunct
+    /// still runs after both of them, not between them.
+    #[test]
+    fn a_conjunct_that_can_fail_runs_after_every_guard_before_it() {
+        let narrowing = eq(
+            PlanExpr::Cast {
+                expr: Box::new(col("b", 1)),
+                data_type: DataType::Int8,
+                span: None,
+            },
+            lit_i32(1),
+        );
+        let first = eq(col("a", 0), lit_i32(1));
+        let second = eq(col("a", 0), lit_i32(2));
+        let filter = LogicalPlan::Filter {
+            input: Box::new(scan("t", &["a", "b"])),
+            predicate: and(and(first.clone(), second.clone()), narrowing.clone()),
+        };
+        let mut order = Vec::new();
+        let mut node = push_down(filter);
+        while let LogicalPlan::Filter { input, predicate } = node {
+            order.push(predicate);
+            node = *input;
+        }
+        assert!(matches!(node, LogicalPlan::TableScan { .. }));
+        assert_eq!(order.first(), Some(&narrowing));
+        assert_eq!(order.len(), 3);
     }
 
     #[test]

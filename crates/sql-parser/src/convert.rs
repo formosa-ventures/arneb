@@ -296,9 +296,70 @@ fn convert_set_expr(expr: sp::SetExpr) -> Result<ast::QueryBody, ParseError> {
                 right: Box::new(r),
             })
         }
+        sp::SetExpr::Values(values) => convert_values(values),
         other => Err(ParseError::UnsupportedFeature(format!(
             "query body: {other}"
         ))),
+    }
+}
+
+/// `VALUES (a, b), (c, d)` as a query body: a `UNION ALL` of one-row
+/// `SELECT`s whose columns are named `_col0`, `_col1`, ... as in Trino
+/// (rename them with a table alias, `AS v(x, y)`). The `UNION ALL` gives
+/// the rows a common type the way the set operation does. It is built as a
+/// balanced tree so a long `VALUES` list does not nest deeply.
+fn convert_values(values: sp::Values) -> Result<ast::QueryBody, ParseError> {
+    let width = values.rows.first().map_or(0, |row| row.content.len());
+    if width == 0 {
+        return Err(ParseError::InvalidSyntax(
+            "VALUES needs at least one row with at least one column".to_string(),
+        ));
+    }
+    let rows = values
+        .rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            if row.content.len() != width {
+                return Err(ParseError::InvalidSyntax(format!(
+                    "VALUES row {} has {} columns, expected {width}",
+                    i + 1,
+                    row.content.len()
+                )));
+            }
+            let projection = row
+                .content
+                .into_iter()
+                .enumerate()
+                .map(|(c, expr)| {
+                    Ok(ast::SelectItem::ExprWithAlias {
+                        expr: convert_expr(expr)?,
+                        alias: format!("_col{c}"),
+                    })
+                })
+                .collect::<Result<Vec<_>, ParseError>>()?;
+            Ok(ast::QueryBody::Select(ast::SelectBody {
+                distinct: false,
+                projection,
+                from: Vec::new(),
+                selection: None,
+                group_by: Vec::new(),
+                having: None,
+            }))
+        })
+        .collect::<Result<Vec<_>, ParseError>>()?;
+    Ok(union_all_balanced(rows))
+}
+
+fn union_all_balanced(mut rows: Vec<ast::QueryBody>) -> ast::QueryBody {
+    if rows.len() == 1 {
+        return rows.pop().expect("one row");
+    }
+    let right = rows.split_off(rows.len() / 2);
+    ast::QueryBody::SetOperation {
+        op: ast::SetOperator::UnionAll,
+        left: Box::new(union_all_balanced(rows)),
+        right: Box::new(union_all_balanced(right)),
     }
 }
 
@@ -668,29 +729,45 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             right,
         } => array_in_list(*left, *right, true, span),
         sp::Expr::Cast {
-            expr, data_type, ..
+            kind,
+            expr,
+            data_type,
+            ..
         } => {
             let e = convert_expr(*expr)?;
             // `'name'::regclass` / `::regtype` are resolved by the planner
             // (pg-catalog-tables).
-            if let Some(reg) = ["regclass", "regtype"]
+            let cast = if let Some(reg) = ["regclass", "regtype"]
                 .into_iter()
                 .find(|reg| is_custom_type(&data_type, reg))
             {
-                return Ok(ast::Expr::Function {
+                ast::Expr::Function {
                     order_by: vec![],
                     name: reg.to_string(),
                     args: vec![ast::FunctionArg::Unnamed(e)],
                     distinct: false,
                     span,
-                });
+                }
+            } else {
+                ast::Expr::Cast {
+                    expr: Box::new(e),
+                    data_type: convert_data_type(data_type)?,
+                    span,
+                }
+            };
+            // `TRY_CAST(x AS t)` (and BigQuery's `SAFE_CAST`) is Trino's
+            // `TRY(CAST(x AS t))`: a value the target cannot hold is NULL.
+            // The same holds for `TRY_CAST(x AS regclass)`.
+            match kind {
+                sp::CastKind::TryCast | sp::CastKind::SafeCast => Ok(ast::Expr::Function {
+                    name: "TRY".to_string(),
+                    args: vec![ast::FunctionArg::Unnamed(cast)],
+                    distinct: false,
+                    order_by: Vec::new(),
+                    span,
+                }),
+                sp::CastKind::Cast | sp::CastKind::DoubleColon => Ok(cast),
             }
-            let dt = convert_data_type(data_type)?;
-            Ok(ast::Expr::Cast {
-                expr: Box::new(e),
-                data_type: dt,
-                span,
-            })
         }
         // Typed string literals (`DATE '...'`, `TIMESTAMP '...'`, `TIME '...'`)
         // parse as Expr::TypedString in sqlparser-rs. Lower them to casts,

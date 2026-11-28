@@ -63,6 +63,11 @@ pub const HAVING_AGGREGATE_SELECTIVITY: f64 = 0.05;
 pub trait ColumnStatsLookup {
     /// Returns the stats for `column`, or `None` if no information is known.
     fn lookup(&self, column: &str) -> Option<ColumnStatistics>;
+
+    /// Resolves a bound column by position when the input layout is known.
+    fn lookup_at(&self, column: &str, _index: usize) -> Option<ColumnStatistics> {
+        self.lookup(column)
+    }
 }
 
 /// Lookup that always returns `None`. Useful for unit tests of fallback
@@ -111,23 +116,8 @@ fn estimate(predicate: &PlanExpr, lookup: &dyn ColumnStatsLookup) -> f64 {
         // Unary minus / plus on a boolean is nonsensical; fall back.
         PlanExpr::UnaryOp { .. } => DEFAULT_UNKNOWN_SELECTIVITY,
 
-        PlanExpr::IsNull { expr, .. } => match column_name(expr) {
-            Some(name) => lookup
-                .lookup(name)
-                .and_then(|c| c.null_fraction)
-                .unwrap_or(DEFAULT_NULL_SELECTIVITY),
-            None => DEFAULT_NULL_SELECTIVITY,
-        },
-        PlanExpr::IsNotNull { expr, .. } => {
-            let null_frac = match column_name(expr) {
-                Some(name) => lookup
-                    .lookup(name)
-                    .and_then(|c| c.null_fraction)
-                    .unwrap_or(DEFAULT_NULL_SELECTIVITY),
-                None => DEFAULT_NULL_SELECTIVITY,
-            };
-            1.0 - null_frac
-        }
+        PlanExpr::IsNull { expr, .. } => null_fraction(expr, lookup),
+        PlanExpr::IsNotNull { expr, .. } => 1.0 - null_fraction(expr, lookup),
 
         PlanExpr::Between {
             expr,
@@ -395,11 +385,22 @@ fn is_aggregate_function_call(expr: &PlanExpr) -> bool {
 }
 
 fn column_name(expr: &PlanExpr) -> Option<&str> {
+    column_ref(expr).map(|(name, _)| name)
+}
+
+fn null_fraction(expr: &PlanExpr, lookup: &dyn ColumnStatsLookup) -> f64 {
+    column_ref(expr)
+        .and_then(|(name, index)| lookup.lookup_at(name, index))
+        .and_then(|stats| stats.null_fraction)
+        .unwrap_or(DEFAULT_NULL_SELECTIVITY)
+}
+
+fn column_ref(expr: &PlanExpr) -> Option<(&str, usize)> {
     match expr {
-        PlanExpr::Column { name, .. } => Some(name.as_str()),
+        PlanExpr::Column { name, index, .. } => Some((name, *index)),
         // A `Cast` over a column is still a column reference for
         // selectivity purposes.
-        PlanExpr::Cast { expr, .. } => column_name(expr),
+        PlanExpr::Cast { expr, .. } => column_ref(expr),
         _ => None,
     }
 }

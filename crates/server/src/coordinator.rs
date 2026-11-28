@@ -1974,10 +1974,21 @@ mod tests {
     /// Runs `with_query_retry` over scripted attempts: each one either
     /// loses `worker-2` and fails, or fails without losing a worker, or
     /// succeeds. Returns the result and the number of runs.
+    /// What one attempt of a scripted query does.
+    #[derive(Clone, Copy)]
+    enum Step {
+        /// Loses `worker-2` and fails with a transport error.
+        Lose,
+        /// Fails with a SQL error.
+        Error,
+        /// Succeeds.
+        Ok,
+    }
+
     async fn run_script(
         retry: Option<QueryRetry>,
         registry: &arneb_scheduler::NodeRegistry,
-        script: &[&str],
+        script: &[Step],
     ) -> (Result<u32, String>, usize) {
         let runs = std::sync::atomic::AtomicUsize::new(0);
         let result = with_query_retry(retry, registry, || {
@@ -1985,14 +1996,14 @@ mod tests {
             let step = script[n.min(script.len() - 1)];
             async move {
                 match step {
-                    "lose" => {
+                    Step::Lose => {
                         registry.mark_dead("worker-2", "transport failure during query");
                         Err(failure(
                             "worker 'worker-2' (http://w2:9090) failed: broken pipe",
                         ))
                     }
-                    "error" => Err(failure("division by zero")),
-                    _ => Ok(n as u32),
+                    Step::Error => Err(failure("division by zero")),
+                    Step::Ok => Ok(n as u32),
                 }
             }
         })
@@ -2004,7 +2015,7 @@ mod tests {
     #[tokio::test]
     async fn retry_off_returns_the_first_failure() {
         let registry = two_worker_registry();
-        let (result, runs) = run_script(None, &registry, &["lose", "ok"]).await;
+        let (result, runs) = run_script(None, &registry, &[Step::Lose, Step::Ok]).await;
         assert!(result.unwrap_err().contains("worker 'worker-2'"));
         assert_eq!(runs, 1);
     }
@@ -2012,7 +2023,7 @@ mod tests {
     #[tokio::test]
     async fn a_lost_worker_reruns_the_query_on_the_rest() {
         let registry = two_worker_registry();
-        let (result, runs) = run_script(quick_retry(4), &registry, &["lose", "ok"]).await;
+        let (result, runs) = run_script(quick_retry(4), &registry, &[Step::Lose, Step::Ok]).await;
         assert_eq!(result, Ok(1));
         assert_eq!(runs, 2);
         let active: Vec<_> = registry
@@ -2026,7 +2037,7 @@ mod tests {
     #[tokio::test]
     async fn a_failure_without_a_lost_worker_is_not_retried() {
         let registry = two_worker_registry();
-        let (result, runs) = run_script(quick_retry(4), &registry, &["error", "ok"]).await;
+        let (result, runs) = run_script(quick_retry(4), &registry, &[Step::Error, Step::Ok]).await;
         assert_eq!(result.unwrap_err(), "invalid operation: division by zero");
         assert_eq!(runs, 1);
     }
@@ -2059,7 +2070,7 @@ mod tests {
     async fn no_retry_when_no_worker_is_left() {
         let registry = arneb_scheduler::NodeRegistry::new(30);
         registry.heartbeat("worker-2".into(), "http://w2:9090".into(), 256);
-        let (result, runs) = run_script(quick_retry(4), &registry, &["lose", "ok"]).await;
+        let (result, runs) = run_script(quick_retry(4), &registry, &[Step::Lose, Step::Ok]).await;
         assert!(result.is_err());
         assert_eq!(runs, 1);
     }

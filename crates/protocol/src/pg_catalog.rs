@@ -428,7 +428,7 @@ fn column_type(dt: &DataType) -> (i64, i64) {
 }
 
 fn type_len(oid: i64) -> i64 {
-    PG_TYPES.iter().find(|t| t.oid == oid).map_or(-1, |t| t.len)
+    pg_oid::pg_type(oid).map_or(-1, |t| t.len)
 }
 
 /// How `information_schema.columns` describes a column type: `data_type`,
@@ -442,10 +442,7 @@ fn info_schema_type(dt: &DataType) -> (String, String, Cell, Cell, Cell, Cell) {
     let data_type = match dt {
         DataType::List(_) => "ARRAY".to_string(),
         DataType::Char(_) => "character".to_string(),
-        _ => PG_TYPES
-            .iter()
-            .find(|t| t.oid == oid)
-            .map_or_else(|| udt_name.clone(), |t| t.sql_name.to_string()),
+        _ => pg_oid::pg_type(oid).map_or_else(|| udt_name.clone(), |t| t.sql_name.to_string()),
     };
     let none = || Cell::Int(None);
     let (length, precision, scale, datetime) = match dt {

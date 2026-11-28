@@ -13,6 +13,40 @@ use arrow::datatypes;
 use crate::fast_hash::FastHashSet;
 use crate::group_key::GroupKey;
 
+// Vec::resize uses amortized growth when the requested length exceeds capacity.
+fn vec_bytes<T>(values: &Vec<T>, groups: usize) -> usize {
+    let size = size_of::<T>();
+    let capacity = values.capacity();
+    if groups <= capacity {
+        capacity * size
+    } else {
+        let minimum = if size == 1 {
+            8
+        } else if size <= 1024 {
+            4
+        } else {
+            1
+        };
+        groups.max(capacity.saturating_mul(2)).max(minimum) * size
+    }
+}
+
+pub(crate) fn scalar_heap_bytes(value: &ScalarValue) -> usize {
+    match value {
+        ScalarValue::Utf8(s) => s.capacity(),
+        ScalarValue::Binary(b) => b.capacity(),
+        ScalarValue::Timestamp {
+            timezone: Some(s), ..
+        } => s.capacity(),
+        ScalarValue::List { element, values } => {
+            size_of_val(element.as_ref())
+                + vec_bytes(values, 0)
+                + values.iter().map(scalar_heap_bytes).sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
 /// A batch-aware aggregate accumulator that owns the per-group state for
 /// **one** aggregate function across **all** groups.
 ///
@@ -28,6 +62,19 @@ use crate::group_key::GroupKey;
 /// Used by `HashAggregateExec` for non-DISTINCT aggregates. DISTINCT
 /// still uses the legacy `Accumulator` path in v1.
 pub trait GroupedAccumulator: Send + Sync {
+    /// Heap bytes after ensuring capacity for this many groups (zero measures current state).
+    fn heap_bytes(&self, groups: usize) -> usize;
+
+    /// Project state after this batch, including payloads retained by add_input.
+    fn batch_heap_bytes(
+        &self,
+        groups: usize,
+        _ids: &[u32],
+        _values: &ArrayRef,
+    ) -> Result<usize, ExecutionError> {
+        Ok(self.heap_bytes(groups))
+    }
+
     /// Grow internal per-group state to at least `num_groups` slots.
     ///
     /// `HashAggregateExec` calls this once per batch with the current
@@ -49,15 +96,6 @@ pub trait GroupedAccumulator: Send + Sync {
 
     /// Number of groups for which this accumulator has reserved state.
     fn num_groups(&self) -> usize;
-
-    /// Approximate heap bytes held beyond the fixed per-group state that
-    /// the operator already estimates, for memory accounting. Accumulators
-    /// whose per-group state has a fixed size keep the default 0; one that
-    /// keeps input values must report them. Must be cheap: the aggregate
-    /// operators call it after every batch.
-    fn heap_bytes(&self) -> usize {
-        0
-    }
 
     /// Merge `other`'s state into `self`, mapping each `g` in
     /// `0..other.num_groups()` through `group_remap` (so
@@ -611,6 +649,10 @@ struct GroupedVarianceAccumulator {
 }
 
 impl GroupedAccumulator for GroupedVarianceAccumulator {
+    fn heap_bytes(&self, groups: usize) -> usize {
+        vec_bytes(&self.states, groups)
+    }
+
     fn ensure_capacity(&mut self, n: usize) {
         self.states.resize(n, VarianceState::default());
     }
@@ -815,6 +857,13 @@ enum OrdScalar {
 }
 
 impl OrdScalar {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Utf8(s) | Self::Timestamp(_, _, Some(s)) => s.capacity(),
+            _ => 0,
+        }
+    }
+
     fn to_scalar(&self) -> ScalarValue {
         match self {
             // `ScalarValue` has no 8/16-bit integer; `scalars_to_array`
@@ -870,6 +919,21 @@ impl Ord for OrdScalar {
             (OrdScalar::Timestamp(a, _, _), OrdScalar::Timestamp(b, _, _)) => a.cmp(b),
             _ => std::cmp::Ordering::Equal, // mismatched types — shouldn't happen
         }
+    }
+}
+
+fn ord_input_payload_bytes(values: &ArrayRef) -> usize {
+    match values.data_type() {
+        datatypes::DataType::Utf8 => values
+            .as_string::<i32>()
+            .iter()
+            .flatten()
+            .map(str::len)
+            .sum(),
+        datatypes::DataType::Timestamp(_, Some(zone)) => {
+            zone.len() * (values.len() - values.null_count())
+        }
+        _ => 0,
     }
 }
 
@@ -1169,6 +1233,10 @@ pub(crate) struct GroupedBoolAndAccumulator {
 }
 
 impl GroupedAccumulator for GroupedBoolAndAccumulator {
+    fn heap_bytes(&self, groups: usize) -> usize {
+        vec_bytes(&self.state, groups)
+    }
+
     fn ensure_capacity(&mut self, n: usize) {
         if self.state.len() < n {
             self.state.resize(n, None);
@@ -1476,13 +1544,57 @@ impl Accumulator for ArrayAggAccumulator {
 /// Per-group `array_agg`.
 #[derive(Debug, Default)]
 pub(crate) struct GroupedArrayAggAccumulator {
+    payload_bytes: usize,
     shape: Option<ArrayAggShape>,
     groups: Vec<ArrayAggBuffer>,
-    /// Sum of the groups' buffered bytes, so `heap_bytes` stays O(1).
-    bytes: usize,
+}
+
+impl GroupedArrayAggAccumulator {
+    fn push_row(&mut self, group: usize, row: ArrayAggRow) {
+        let rows = &mut self.groups[group].rows;
+        self.payload_bytes += vec_bytes(&row.keys, 0)
+            + row.keys.iter().map(scalar_heap_bytes).sum::<usize>()
+            + scalar_heap_bytes(&row.value);
+        let before = rows.capacity();
+        rows.push(row);
+        self.payload_bytes += (rows.capacity() - before) * size_of::<ArrayAggRow>();
+    }
 }
 
 impl GroupedAccumulator for GroupedArrayAggAccumulator {
+    fn heap_bytes(&self, groups: usize) -> usize {
+        vec_bytes(&self.groups, groups) + self.payload_bytes
+    }
+
+    fn batch_heap_bytes(
+        &self,
+        groups: usize,
+        ids: &[u32],
+        values: &ArrayRef,
+    ) -> Result<usize, ExecutionError> {
+        let (_, packed) = unpack_array_agg(values)?;
+        let mut counts = std::collections::HashMap::<u32, usize>::new();
+        let mut bytes = self.heap_bytes(groups);
+        for (i, &id) in ids.iter().enumerate() {
+            *counts.entry(id).or_default() += 1;
+            bytes += (packed.num_columns() - 1) * size_of::<ScalarValue>();
+            for col in packed.columns() {
+                bytes += scalar_heap_bytes(&crate::operator::extract_scalar(col, i)?);
+            }
+        }
+        for (id, count) in counts {
+            let rows = self.groups.get(id as usize).map(|g| &g.rows);
+            let cap = rows.map_or(0, Vec::capacity);
+            let needed = rows.map_or(0, Vec::len) + count;
+            let mut projected = cap;
+            while projected < needed {
+                projected = (projected * 2).max(4);
+            }
+            bytes += (projected - cap) * size_of::<ArrayAggRow>();
+        }
+        Ok(bytes)
+    }
+
     fn ensure_capacity(&mut self, n: usize) {
         if self.groups.len() < n {
             self.groups.resize_with(n, ArrayAggBuffer::default);
@@ -1495,12 +1607,13 @@ impl GroupedAccumulator for GroupedArrayAggAccumulator {
         let cols = packed.columns();
         for (i, &g) in group_ids.iter().enumerate() {
             let scalar = |c: &ArrayRef| crate::operator::extract_scalar(c, i);
-            let row = ArrayAggRow {
-                value: scalar(&cols[0])?,
-                keys: cols[1..].iter().map(scalar).collect::<Result<_, _>>()?,
-            };
-            self.bytes += row.bytes();
-            self.groups[g as usize].push(row);
+            self.push_row(
+                g as usize,
+                ArrayAggRow {
+                    value: scalar(&cols[0])?,
+                    keys: cols[1..].iter().map(scalar).collect::<Result<_, _>>()?,
+                },
+            );
         }
         Ok(())
     }
@@ -1537,13 +1650,11 @@ impl GroupedAccumulator for GroupedArrayAggAccumulator {
             if self.groups.len() <= dest {
                 self.groups.resize_with(dest + 1, ArrayAggBuffer::default);
             }
-            self.bytes += self.groups[dest].extend_from(buf);
+            for row in &buf.rows {
+                self.push_row(dest, row.clone());
+            }
         }
         Ok(())
-    }
-
-    fn heap_bytes(&self) -> usize {
-        self.bytes
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1604,13 +1715,10 @@ fn percentile_value_bytes(value: &ScalarValue) -> usize {
     std::mem::size_of::<ScalarValue>() + crate::group_key::scalar_heap_bytes(value)
 }
 
-/// Appends row `row`'s value of `packed` to `out` unless it is NULL, and
-/// returns the bytes it added (see [`percentile_value_bytes`]).
-fn push_percentile_value(
-    out: &mut Vec<ScalarValue>,
+fn percentile_value(
     packed: &arrow::array::StructArray,
     row: usize,
-) -> Result<usize, ExecutionError> {
+) -> Result<Option<ScalarValue>, ExecutionError> {
     let col = packed.column(0);
     if col.is_valid(row) {
         // `ScalarValue` has no TINYINT/SMALLINT: keep them as INTEGER (a
@@ -1624,11 +1732,10 @@ fn push_percentile_value(
             )),
             _ => crate::operator::extract_scalar(col, row)?,
         };
-        let bytes = percentile_value_bytes(&value);
-        out.push(value);
-        return Ok(bytes);
+        Ok(Some(value))
+    } else {
+        Ok(None)
     }
-    Ok(0)
 }
 
 fn scalar_to_f64(v: &ScalarValue) -> Result<f64, ExecutionError> {
@@ -1717,7 +1824,10 @@ impl Accumulator for PercentileAccumulator {
             self.shape = shape;
         }
         for row in 0..packed.len() {
-            self.bytes += push_percentile_value(&mut self.values, packed, row)?;
+            if let Some(value) = percentile_value(packed, row)? {
+                self.bytes += percentile_value_bytes(&value);
+                self.values.push(value);
+            }
         }
         Ok(())
     }
@@ -1756,25 +1866,64 @@ impl Accumulator for PercentileAccumulator {
 /// Per-group `percentile_cont` / `percentile_disc`.
 #[derive(Debug)]
 pub(crate) struct GroupedPercentileAccumulator {
+    payload_bytes: usize,
     continuous: bool,
     shape: Option<PercentileShape>,
     groups: Vec<Vec<ScalarValue>>,
-    /// Sum of the groups' buffered bytes, so `heap_bytes` stays O(1).
-    bytes: usize,
 }
 
 impl GroupedPercentileAccumulator {
     fn new(continuous: bool) -> Self {
         Self {
+            payload_bytes: 0,
             continuous,
             shape: None,
             groups: Vec::new(),
-            bytes: 0,
         }
+    }
+
+    fn push_value(&mut self, group: usize, value: ScalarValue) {
+        let values = &mut self.groups[group];
+        let before = values.capacity();
+        self.payload_bytes += scalar_heap_bytes(&value);
+        values.push(value);
+        self.payload_bytes += (values.capacity() - before) * size_of::<ScalarValue>();
     }
 }
 
 impl GroupedAccumulator for GroupedPercentileAccumulator {
+    fn heap_bytes(&self, groups: usize) -> usize {
+        vec_bytes(&self.groups, groups) + self.payload_bytes
+    }
+
+    fn batch_heap_bytes(
+        &self,
+        groups: usize,
+        ids: &[u32],
+        values: &ArrayRef,
+    ) -> Result<usize, ExecutionError> {
+        let (_, packed) = unpack_percentile(values)?;
+        let mut counts = std::collections::HashMap::<u32, usize>::new();
+        let mut bytes = self.heap_bytes(groups);
+        for (row, &id) in ids.iter().enumerate() {
+            if let Some(value) = percentile_value(packed, row)? {
+                *counts.entry(id).or_default() += 1;
+                bytes += scalar_heap_bytes(&value);
+            }
+        }
+        for (id, count) in counts {
+            let values = self.groups.get(id as usize);
+            let capacity = values.map_or(0, Vec::capacity);
+            let needed = values.map_or(0, Vec::len) + count;
+            let mut projected = capacity;
+            while projected < needed {
+                projected = (projected * 2).max(4);
+            }
+            bytes += (projected - capacity) * size_of::<ScalarValue>();
+        }
+        Ok(bytes)
+    }
+
     fn ensure_capacity(&mut self, n: usize) {
         if self.groups.len() < n {
             self.groups.resize_with(n, Vec::new);
@@ -1787,7 +1936,9 @@ impl GroupedAccumulator for GroupedPercentileAccumulator {
             self.shape = shape;
         }
         for (row, &g) in group_ids.iter().enumerate() {
-            self.bytes += push_percentile_value(&mut self.groups[g as usize], packed, row)?;
+            if let Some(value) = percentile_value(packed, row)? {
+                self.push_value(g as usize, value);
+            }
         }
         Ok(())
     }
@@ -1824,14 +1975,11 @@ impl GroupedAccumulator for GroupedPercentileAccumulator {
             if self.groups.len() <= dest {
                 self.groups.resize_with(dest + 1, Vec::new);
             }
-            self.groups[dest].extend(values.iter().cloned());
+            for value in values {
+                self.push_value(dest, value.clone());
+            }
         }
-        self.bytes += other.bytes;
         Ok(())
-    }
-
-    fn heap_bytes(&self) -> usize {
-        self.bytes
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1870,6 +2018,10 @@ impl GroupedCountAccumulator {
 }
 
 impl GroupedAccumulator for GroupedCountAccumulator {
+    fn heap_bytes(&self, groups: usize) -> usize {
+        vec_bytes(&self.counts, groups)
+    }
+
     fn ensure_capacity(&mut self, n: usize) {
         if self.counts.len() < n {
             self.counts.resize(n, 0);
@@ -1959,6 +2111,13 @@ impl GroupedSumAccumulator {
 }
 
 impl GroupedAccumulator for GroupedSumAccumulator {
+    fn heap_bytes(&self, groups: usize) -> usize {
+        vec_bytes(&self.sums_i64, groups)
+            + vec_bytes(&self.sums_f64, groups)
+            + vec_bytes(&self.sums_decimal, groups)
+            + vec_bytes(&self.has_values, groups)
+    }
+
     fn ensure_capacity(&mut self, n: usize) {
         if self.sums_i64.len() < n {
             self.sums_i64.resize(n, 0);
@@ -2156,6 +2315,30 @@ impl GroupedAvgAccumulator {
 }
 
 impl GroupedAccumulator for GroupedAvgAccumulator {
+    fn heap_bytes(&self, groups: usize) -> usize {
+        vec_bytes(&self.sums, groups)
+            + vec_bytes(&self.counts, groups)
+            + vec_bytes(
+                &self.decimal_sums,
+                if self.decimal.is_some() { groups } else { 0 },
+            )
+    }
+
+    fn batch_heap_bytes(
+        &self,
+        groups: usize,
+        _ids: &[u32],
+        values: &ArrayRef,
+    ) -> Result<usize, ExecutionError> {
+        let mut bytes = self.heap_bytes(groups);
+        if self.decimal.is_none()
+            && matches!(values.data_type(), datatypes::DataType::Decimal128(..))
+        {
+            bytes += vec_bytes(&self.decimal_sums, groups);
+        }
+        Ok(bytes)
+    }
+
     fn ensure_capacity(&mut self, n: usize) {
         if self.sums.len() < n {
             self.sums.resize(n, 0.0);
@@ -2321,6 +2504,7 @@ impl GroupedAccumulator for GroupedAvgAccumulator {
 /// MIN(col), per-group state using the existing `OrdScalar` enum.
 #[derive(Debug, Default)]
 pub struct GroupedMinAccumulator {
+    payload_bytes: usize,
     state: Vec<Option<OrdScalar>>,
 }
 
@@ -2332,6 +2516,19 @@ impl GroupedMinAccumulator {
 }
 
 impl GroupedAccumulator for GroupedMinAccumulator {
+    fn heap_bytes(&self, groups: usize) -> usize {
+        vec_bytes(&self.state, groups) + self.payload_bytes
+    }
+
+    fn batch_heap_bytes(
+        &self,
+        groups: usize,
+        _ids: &[u32],
+        values: &ArrayRef,
+    ) -> Result<usize, ExecutionError> {
+        Ok(self.heap_bytes(groups) + ord_input_payload_bytes(values))
+    }
+
     fn ensure_capacity(&mut self, n: usize) {
         if self.state.len() < n {
             self.state.resize(n, None);
@@ -2346,11 +2543,13 @@ impl GroupedAccumulator for GroupedMinAccumulator {
             }
             let val = extract_ordscalar(values, i)?;
             let g = g as usize;
+            self.payload_bytes -= self.state[g].as_ref().map_or(0, OrdScalar::heap_bytes);
             self.state[g] = Some(match self.state[g].take() {
                 Some(current) if val < current => val,
                 Some(current) => current,
                 None => val,
             });
+            self.payload_bytes += self.state[g].as_ref().map_or(0, OrdScalar::heap_bytes);
         }
         Ok(())
     }
@@ -2385,11 +2584,13 @@ impl GroupedAccumulator for GroupedMinAccumulator {
             if self.state.len() <= dest {
                 self.state.resize(dest + 1, None);
             }
+            self.payload_bytes -= self.state[dest].as_ref().map_or(0, OrdScalar::heap_bytes);
             self.state[dest] = Some(match self.state[dest].take() {
                 Some(current) if o < &current => o.clone(),
                 Some(current) => current,
                 None => o.clone(),
             });
+            self.payload_bytes += self.state[dest].as_ref().map_or(0, OrdScalar::heap_bytes);
         }
         Ok(())
     }
@@ -2402,6 +2603,7 @@ impl GroupedAccumulator for GroupedMinAccumulator {
 /// MAX(col), per-group state.
 #[derive(Debug, Default)]
 pub struct GroupedMaxAccumulator {
+    payload_bytes: usize,
     state: Vec<Option<OrdScalar>>,
 }
 
@@ -2413,6 +2615,19 @@ impl GroupedMaxAccumulator {
 }
 
 impl GroupedAccumulator for GroupedMaxAccumulator {
+    fn heap_bytes(&self, groups: usize) -> usize {
+        vec_bytes(&self.state, groups) + self.payload_bytes
+    }
+
+    fn batch_heap_bytes(
+        &self,
+        groups: usize,
+        _ids: &[u32],
+        values: &ArrayRef,
+    ) -> Result<usize, ExecutionError> {
+        Ok(self.heap_bytes(groups) + ord_input_payload_bytes(values))
+    }
+
     fn ensure_capacity(&mut self, n: usize) {
         if self.state.len() < n {
             self.state.resize(n, None);
@@ -2427,11 +2642,13 @@ impl GroupedAccumulator for GroupedMaxAccumulator {
             }
             let val = extract_ordscalar(values, i)?;
             let g = g as usize;
+            self.payload_bytes -= self.state[g].as_ref().map_or(0, OrdScalar::heap_bytes);
             self.state[g] = Some(match self.state[g].take() {
                 Some(current) if val > current => val,
                 Some(current) => current,
                 None => val,
             });
+            self.payload_bytes += self.state[g].as_ref().map_or(0, OrdScalar::heap_bytes);
         }
         Ok(())
     }
@@ -2466,11 +2683,13 @@ impl GroupedAccumulator for GroupedMaxAccumulator {
             if self.state.len() <= dest {
                 self.state.resize(dest + 1, None);
             }
+            self.payload_bytes -= self.state[dest].as_ref().map_or(0, OrdScalar::heap_bytes);
             self.state[dest] = Some(match self.state[dest].take() {
                 Some(current) if o > &current => o.clone(),
                 Some(current) => current,
                 None => o.clone(),
             });
+            self.payload_bytes += self.state[dest].as_ref().map_or(0, OrdScalar::heap_bytes);
         }
         Ok(())
     }
@@ -2503,6 +2722,10 @@ impl GroupedBoolOrAccumulator {
 }
 
 impl GroupedAccumulator for GroupedBoolOrAccumulator {
+    fn heap_bytes(&self, groups: usize) -> usize {
+        vec_bytes(&self.state, groups)
+    }
+
     fn ensure_capacity(&mut self, n: usize) {
         if self.state.len() < n {
             self.state.resize(n, None);
@@ -2865,12 +3088,12 @@ mod tests {
         grouped.ensure_capacity(2);
         let ids: Vec<u32> = (0..50).map(|i| i % 2).collect();
         grouped.add_input(&ids, &packed).unwrap();
-        let after_input = GroupedAccumulator::heap_bytes(&grouped);
+        let after_input = GroupedAccumulator::heap_bytes(&grouped, 0);
         assert!(after_input >= 50 * 100);
         let mut merged = GroupedArrayAggAccumulator::default();
         merged.ensure_capacity(1);
         merged.merge_from(&grouped, &[0, 0]).unwrap();
-        assert_eq!(GroupedAccumulator::heap_bytes(&merged), after_input);
+        assert_eq!(GroupedAccumulator::heap_bytes(&merged, 0), after_input);
         single.reset();
         assert_eq!(Accumulator::heap_bytes(&single), 0);
     }
@@ -2898,12 +3121,13 @@ mod tests {
         grouped.ensure_capacity(2);
         let ids: Vec<u32> = (0..50).map(|i| i % 2).collect();
         grouped.add_input(&ids, &packed).unwrap();
-        let after_input = GroupedAccumulator::heap_bytes(&grouped);
-        assert_eq!(after_input, one);
+        // The grouped form counts allocated slots, so it reports at least
+        // what the values themselves take.
+        assert!(GroupedAccumulator::heap_bytes(&grouped, 2) >= one);
         let mut merged = GroupedPercentileAccumulator::new(true);
         merged.ensure_capacity(1);
         merged.merge_from(&grouped, &[0, 0]).unwrap();
-        assert_eq!(GroupedAccumulator::heap_bytes(&merged), after_input);
+        assert!(GroupedAccumulator::heap_bytes(&merged, 1) >= one);
     }
 
     #[test]
@@ -3105,6 +3329,52 @@ mod tests {
         assert_eq!(grouped.evaluate(1).unwrap(), want);
         assert_eq!(grouped.evaluate(0).unwrap(), ScalarValue::Null);
         assert!(create_accumulator("ARRAY_AGG", false, true).is_err());
+    }
+
+    /// Grouped percentiles keep every input value until the end, so they
+    /// report those values for memory accounting, and the projection made
+    /// before a batch is added covers what the batch then keeps.
+    #[test]
+    fn grouped_percentiles_report_the_values_they_keep() {
+        for name in ["PERCENTILE_CONT", "PERCENTILE_DISC"] {
+            let n = 10_000usize;
+            let values: ArrayRef = Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>()));
+            let fraction: ArrayRef = Arc::new(Float64Array::from(vec![0.5; n]));
+            let packed = pack_percentile_input(fraction, values, true).unwrap();
+            let ids: Vec<u32> = (0..n as u32).map(|i| i % 4).collect();
+            let kept = n * std::mem::size_of::<ScalarValue>();
+
+            let mut grouped = create_grouped_accumulator(name, false, false).unwrap();
+            grouped.ensure_capacity(4);
+            let empty = grouped.heap_bytes(0);
+            let projected = grouped.batch_heap_bytes(4, &ids, &packed).unwrap();
+            grouped.add_input(&ids, &packed).unwrap();
+            let after = grouped.heap_bytes(0);
+            assert!(after >= empty + kept, "{name}: {after} B for {kept} B kept");
+            assert!(
+                projected >= after,
+                "{name}: projected {projected} B, kept {after} B"
+            );
+
+            // Merged state carries the values with it.
+            let mut merged = create_grouped_accumulator(name, false, false).unwrap();
+            merged.ensure_capacity(1);
+            merged.merge_from(grouped.as_ref(), &[0, 0, 0, 0]).unwrap();
+            assert!(merged.heap_bytes(0) >= kept, "{name}: merged");
+
+            // The same batch delivered again is kept again.
+            let projected = grouped.batch_heap_bytes(4, &ids, &packed).unwrap();
+            grouped.add_input(&ids, &packed).unwrap();
+            let twice = grouped.heap_bytes(0);
+            assert!(
+                twice >= empty + 2 * kept,
+                "{name}: {twice} B after two batches"
+            );
+            assert!(
+                projected >= twice,
+                "{name}: projected {projected} B, kept {twice} B"
+            );
+        }
     }
 
     /// `percentile_cont` / `percentile_disc` follow PostgreSQL: NULLs are

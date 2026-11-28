@@ -42,16 +42,7 @@ impl GroupKey {
 }
 
 /// Heap bytes a [`ScalarValue`] owns beyond its inline size.
-pub(crate) fn scalar_heap_bytes(value: &ScalarValue) -> usize {
-    match value {
-        ScalarValue::Utf8(s) => s.capacity(),
-        ScalarValue::Binary(b) => b.capacity(),
-        ScalarValue::Timestamp {
-            timezone: Some(tz), ..
-        } => tz.capacity(),
-        _ => 0,
-    }
-}
+pub(crate) use crate::aggregate::scalar_heap_bytes;
 
 // Type tags. Most ScalarValue variants get a distinct one-byte tag
 // written before the payload so that cross-variant collisions are
